@@ -64,7 +64,8 @@ private interface MutationDslModel {
     ) {
         val escapedName: String = getEscapedFieldName(arg.name)
         val argName: String = arg.name
-        val kotlinType: String = arg.kmType(JavaName(pkg).asKmName, baseTypeMapper, isInput = true).kotlinTypeString
+        val inputPkg = pkg.replace(".dsl", ".grts")
+        val kotlinType: String = arg.kmType(JavaName(inputPkg).asKmName, baseTypeMapper, isInput = true).kotlinTypeString
     }
 }
 
@@ -118,7 +119,7 @@ class MutationDslBuilder internal constructor() {
     private fun serializeValue(value: Any?): String {
         return when (value) {
             null -> "null"
-            is String -> "\"${'$'}{value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+            is String -> ""${'"'}\"${'$'}{value.replace("\\\\", "\\\\\\\\").replace("\\"", "\\\\\\"")}\""${'"'}${'"'}
             is Boolean -> value.toString()
             is Number -> value.toString()
             is Enum\<*> -> value.name

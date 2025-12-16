@@ -78,7 +78,7 @@ class <mdl.className> internal constructor() {
 
 <mdl.scalarFields: { f |
     val <f.escapedName>: Unit
-        get() \{
+        get() {
             addField("<f.fieldName>")
         \}
 }; separator="\n">
@@ -106,7 +106,7 @@ class <mdl.className> internal constructor() {
     private fun serializeValue(value: Any?): String {
         return when (value) {
             null -> "null"
-            is String -> "\"${'$'}{value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+            is String -> ""${'"'}\"${'$'}{value.replace("\\\\", "\\\\\\\\").replace("\\"", "\\\\\\"")}\""${'"'}${'"'}
             is Boolean -> value.toString()
             is Number -> value.toString()
             is Enum\<*> -> value.name

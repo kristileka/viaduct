@@ -57,11 +57,14 @@ private interface QueryDslModel {
     ) {
         val escapedName: String = getEscapedFieldName(arg.name)
         val argName: String = arg.name
-        val kotlinType: String = arg.kmType(JavaName(pkg).asKmName, baseTypeMapper, isInput = true).kotlinTypeString.simplifyKotlinType()
+        private val inputTypesPackage = pkg.substringBeforeLast(".dsl") + ".grts"
+        val kotlinType: String = arg.kmType(
+            JavaName(inputTypesPackage).asKmName,
+            baseTypeMapper,
+            isInput = true
+        ).kotlinTypeString
     }
 }
-
-private fun String.simplifyKotlinType(): String = this.removePrefix("kotlin.")
 
 private val queryDslSTGroup = stTemplate(
     """
@@ -85,7 +88,7 @@ class QueryDslBuilder internal constructor() {
 
 <mdl.scalarFields: { f |
     val <f.escapedName>: Unit
-        get() \{
+        get() {
             addField("<f.fieldName>")
         \}
 }; separator="\n">
@@ -113,7 +116,7 @@ class QueryDslBuilder internal constructor() {
     private fun serializeValue(value: Any?): String {
         return when (value) {
             null -> "null"
-            is String -> "\"${'$'}{value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
+            is String -> ""${'"'}\"${'$'}{value.replace("\\\\", "\\\\\\\\").replace("\\"", "\\\\\\"")}\""${'"'}${'"'}
             is Boolean -> value.toString()
             is Number -> value.toString()
             is Enum\<*> -> value.name

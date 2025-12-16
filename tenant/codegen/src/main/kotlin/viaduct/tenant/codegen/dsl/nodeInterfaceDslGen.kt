@@ -46,7 +46,7 @@ class <mdl.interfaceName>DslBuilder internal constructor() {
     }
 
 <mdl.commonFields: { f |    val <f.escapedName>: Unit
-        get() \{
+        get() {
             addField("<f.fieldName>")
         \}
 }; separator="\n">

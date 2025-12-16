@@ -11,11 +11,12 @@ import viaduct.tenant.codegen.bytecode.config.kmType
 
 fun objectDslGen(
     pkg: String,
+    modelPackage: String,
     objectDef: ViaductSchema.Object,
     baseTypeMapper: BaseTypeMapper
 ) = STContents(
     objectDslSTGroup,
-    ObjectDslModelImpl(pkg, objectDef, baseTypeMapper)
+    ObjectDslModelImpl(pkg, modelPackage, objectDef, baseTypeMapper)
 )
 
 private interface ObjectDslModel {
@@ -30,14 +31,14 @@ private interface ObjectDslModel {
     }
 
     class ComplexFieldModel(
-        pkg: String,
+        modelPackage: String,
         fieldDef: ViaductSchema.Field,
         baseTypeMapper: BaseTypeMapper
     ) {
         val escapedName: String = getEscapedFieldName(fieldDef.name)
         val fieldName: String = fieldDef.name
         val parameters: List<ParameterModel> = fieldDef.args.map {
-            ParameterModel(pkg, it, baseTypeMapper)
+            ParameterModel(modelPackage, it, baseTypeMapper)
         }
         val returnTypeDef: ViaductSchema.TypeDef = fieldDef.type.baseTypeDef
         val needsSelection: Boolean = returnTypeDef is ViaductSchema.Object ||
@@ -51,17 +52,21 @@ private interface ObjectDslModel {
     }
 
     class ParameterModel(
-        pkg: String,
+        modelPackage: String,
         arg: ViaductSchema.HasDefaultValue,
         baseTypeMapper: BaseTypeMapper
     ) {
         val escapedName: String = getEscapedFieldName(arg.name)
         val argName: String = arg.name
-        val kotlinType: String = arg.kmType(JavaName(pkg).asKmName, baseTypeMapper, isInput = true).kotlinTypeString.simplifyKotlinType()
+        private val grtsPackage = modelPackage.replace(".dsl.model", ".grts")
+        val kotlinType: String = arg.kmType(JavaName(modelPackage).asKmName, baseTypeMapper, isInput = true).kotlinTypeString.replaceGlobalIdPackage(modelPackage, grtsPackage)
     }
 }
 
-private fun String.simplifyKotlinType(): String = this.removePrefix("kotlin.")
+private fun String.replaceGlobalIdPackage(modelPackage: String, grtsPackage: String): String {
+    // Replace GlobalID type parameters from model package to grts package
+    return this.replace("<$modelPackage.", "<$grtsPackage.")
+}
 
 private val objectDslSTGroup = stTemplate(
     """
@@ -112,8 +117,17 @@ class <mdl.className> internal constructor() {
             is Enum\<*> -> value.name
             is List\<*> -> "[" + value.joinToString(", ") { serializeValue(it) } + "]"
             else -> {
-                val inputData = value::class.java.getMethod("getInputData").invoke(value) as? Map\<*, *>
-                inputData?.let { serializeInputObject(it) } ?: value.toString()
+                // Try to get toInputData method (for DSL input models)
+                val toInputDataMethod = value::class.java.methods.find { it.name == "toInputData" }
+                if (toInputDataMethod != null) {
+                    val inputData = toInputDataMethod.invoke(value) as? Map\<*, *>
+                    inputData?.let { serializeInputObject(it) } ?: value.toString()
+                } else {
+                    // Fallback to getInputData for legacy GRTS support
+                    val getInputDataMethod = value::class.java.methods.find { it.name == "getInputData" }
+                    val inputData = getInputDataMethod?.invoke(value) as? Map\<*, *>
+                    inputData?.let { serializeInputObject(it) } ?: value.toString()
+                }
             }
         }
     }
@@ -129,6 +143,7 @@ class <mdl.className> internal constructor() {
 
 private class ObjectDslModelImpl(
     override val pkg: String,
+    private val modelPackage: String,
     objectDef: ViaductSchema.Object,
     baseTypeMapper: BaseTypeMapper
 ) : ObjectDslModel {
@@ -148,7 +163,7 @@ private class ObjectDslModelImpl(
             if (isScalar && !hasArgs) {
                 scalars.add(ObjectDslModel.ScalarFieldModel(field))
             } else {
-                complex.add(ObjectDslModel.ComplexFieldModel(pkg, field, baseTypeMapper))
+                complex.add(ObjectDslModel.ComplexFieldModel(modelPackage, field, baseTypeMapper))
             }
         }
 

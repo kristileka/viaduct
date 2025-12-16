@@ -10,10 +10,16 @@ class DslFilesBuilder(
     private val baseTypeMapper: BaseTypeMapper
 ) {
     private val packageDir: File = File(outputDir, pkg.replace('.', '/'))
+    private val modelPackage: String = pkg.replace(".dsl", ".dsl.model")
+    private val modelPackageDir: File = File(outputDir, modelPackage.replace('.', '/'))
 
     fun generate(schema: ViaductSchema) {
         packageDir.mkdirs()
+        modelPackageDir.mkdirs()
         val objectTypesNeedingBuilders = mutableSetOf<String>()
+
+        // Generate input models first (so they're available for query/mutation builders)
+        generateInputModels(schema)
 
         schema.types["Query"]?.let { queryType ->
             if (queryType is ViaductSchema.Object) {
@@ -41,17 +47,26 @@ class DslFilesBuilder(
 
     private fun generateQueryDsl(queryType: ViaductSchema.Object) {
         val dst = File(packageDir, "QueryDsl.kt")
-        queryDslGen(pkg, queryType, baseTypeMapper).write(dst)
+        queryDslGen(pkg, modelPackage, queryType, baseTypeMapper).write(dst)
     }
 
     private fun generateMutationDsl(mutationType: ViaductSchema.Object) {
         val dst = File(packageDir, "MutationDsl.kt")
-        mutationDslGen(pkg, mutationType, baseTypeMapper).write(dst)
+        mutationDslGen(pkg, modelPackage, mutationType, baseTypeMapper).write(dst)
     }
 
     private fun generateObjectDsl(objectType: ViaductSchema.Object) {
         val dst = File(packageDir, "${objectType.name}DslBuilder.kt")
-        objectDslGen(pkg, objectType, baseTypeMapper).write(dst)
+        objectDslGen(pkg, modelPackage, objectType, baseTypeMapper).write(dst)
+    }
+
+    private fun generateInputModels(schema: ViaductSchema) {
+        for ((typeName, typeDef) in schema.types) {
+            if (typeDef is ViaductSchema.Input) {
+                val dst = File(modelPackageDir, "${typeName}.kt")
+                inputDslGen(modelPackage, typeDef, baseTypeMapper).write(dst)
+            }
+        }
     }
 
     private fun generateNodeInterfaceSupport(

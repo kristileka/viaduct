@@ -11,11 +11,12 @@ import viaduct.tenant.codegen.bytecode.config.kmType
 
 fun mutationDslGen(
     pkg: String,
+    modelPackage: String,
     mutationDef: ViaductSchema.Object,
     baseTypeMapper: BaseTypeMapper
 ) = STContents(
     mutationDslSTGroup,
-    MutationDslModelImpl(pkg, mutationDef, baseTypeMapper)
+    MutationDslModelImpl(pkg, modelPackage, mutationDef, baseTypeMapper)
 )
 
 private interface MutationDslModel {
@@ -24,14 +25,14 @@ private interface MutationDslModel {
     val complexFields: List<ComplexFieldModel>
 
     class ScalarFieldModel(
-        pkg: String,
+        modelPackage: String,
         fieldDef: ViaductSchema.Field,
         baseTypeMapper: BaseTypeMapper
     ) {
         val escapedName: String = getEscapedFieldName(fieldDef.name)
         val fieldName: String = fieldDef.name
         val parameters: List<ParameterModel> = fieldDef.args.map {
-            ParameterModel(pkg, it, baseTypeMapper)
+            ParameterModel(modelPackage, it, baseTypeMapper)
         }
         val hasArgs: Boolean = fieldDef.args.isNotEmpty()
         // Pre-computed strings for the template
@@ -40,14 +41,14 @@ private interface MutationDslModel {
     }
 
     class ComplexFieldModel(
-        pkg: String,
+        modelPackage: String,
         fieldDef: ViaductSchema.Field,
         baseTypeMapper: BaseTypeMapper
     ) {
         val escapedName: String = getEscapedFieldName(fieldDef.name)
         val fieldName: String = fieldDef.name
         val parameters: List<ParameterModel> = fieldDef.args.map {
-            ParameterModel(pkg, it, baseTypeMapper)
+            ParameterModel(modelPackage, it, baseTypeMapper)
         }
         val returnTypeDef: ViaductSchema.TypeDef = fieldDef.type.baseTypeDef
         val selectionBuilderType: String = "${returnTypeDef.name}DslBuilder"
@@ -58,15 +59,20 @@ private interface MutationDslModel {
     }
 
     class ParameterModel(
-        pkg: String,
+        modelPackage: String,
         arg: ViaductSchema.HasDefaultValue,
         baseTypeMapper: BaseTypeMapper
     ) {
         val escapedName: String = getEscapedFieldName(arg.name)
         val argName: String = arg.name
-        val inputPkg = pkg.replace(".dsl", ".grts")
-        val kotlinType: String = arg.kmType(JavaName(inputPkg).asKmName, baseTypeMapper, isInput = true).kotlinTypeString
+        private val grtsPackage = modelPackage.replace(".dsl.model", ".grts")
+        val kotlinType: String = arg.kmType(JavaName(modelPackage).asKmName, baseTypeMapper, isInput = true).kotlinTypeString.replaceGlobalIdPackage(modelPackage, grtsPackage)
     }
+}
+
+private fun String.replaceGlobalIdPackage(modelPackage: String, grtsPackage: String): String {
+    // Replace GlobalID type parameters from model package to grts package
+    return this.replace("<$modelPackage.", "<$grtsPackage.")
 }
 
 private val mutationDslSTGroup = stTemplate(
@@ -125,8 +131,17 @@ class MutationDslBuilder internal constructor() {
             is Enum\<*> -> value.name
             is List\<*> -> "[" + value.joinToString(", ") { serializeValue(it) } + "]"
             else -> {
-                val inputData = value::class.java.getMethod("getInputData").invoke(value) as? Map\<*, *>
-                inputData?.let { serializeInputObject(it) } ?: value.toString()
+                // Try to get toInputData method (for DSL input models)
+                val toInputDataMethod = value::class.java.methods.find { it.name == "toInputData" }
+                if (toInputDataMethod != null) {
+                    val inputData = toInputDataMethod.invoke(value) as? Map\<*, *>
+                    inputData?.let { serializeInputObject(it) } ?: value.toString()
+                } else {
+                    // Fallback to getInputData for legacy GRTS support
+                    val getInputDataMethod = value::class.java.methods.find { it.name == "getInputData" }
+                    val inputData = getInputDataMethod?.invoke(value) as? Map\<*, *>
+                    inputData?.let { serializeInputObject(it) } ?: value.toString()
+                }
             }
         }
     }
@@ -142,6 +157,7 @@ class MutationDslBuilder internal constructor() {
 
 private class MutationDslModelImpl(
     override val pkg: String,
+    private val modelPackage: String,
     mutationDef: ViaductSchema.Object,
     baseTypeMapper: BaseTypeMapper
 ) : MutationDslModel {
@@ -157,9 +173,9 @@ private class MutationDslModelImpl(
             val isScalar = returnType is ViaductSchema.Scalar || returnType is ViaductSchema.Enum
 
             if (isScalar) {
-                scalars.add(MutationDslModel.ScalarFieldModel(pkg, field, baseTypeMapper))
+                scalars.add(MutationDslModel.ScalarFieldModel(modelPackage, field, baseTypeMapper))
             } else {
-                complex.add(MutationDslModel.ComplexFieldModel(pkg, field, baseTypeMapper))
+                complex.add(MutationDslModel.ComplexFieldModel(modelPackage, field, baseTypeMapper))
             }
         }
 

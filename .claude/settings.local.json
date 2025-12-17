@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find:*)",
+      "Bash(grep:*)",
+      "Bash(xargs grep:*)",
+      "Bash(./gradlew :tenant:codegen:test:*)",
+      "Bash(./gradlew :core:tenant:tenant-codegen:test:*)",
+      "Bash(cat:*)"
+    ]
+  }
+}

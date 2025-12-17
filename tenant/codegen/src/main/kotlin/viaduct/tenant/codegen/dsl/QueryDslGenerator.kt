@@ -19,7 +19,7 @@
  * type Query {
  *     greeting: String
  *     user(id: ID!): User
- *     users(filter: UserFilter): [User]
+ *     searchUsers(search: UserSearchInput!): [User]
  * }
  * ```
  *
@@ -31,13 +31,17 @@
  *         id
  *         name
  *     }
- *     users(filter = mapOf("name" to "Luke")) {
+ *     searchUsers {
+ *         search {
+ *             name = "Luke"
+ *         }
  *         id
+ *         name
  *     }
  * }
  * ```
  *
- * Input types are passed as `Map<String, Any?>` for idiomatic Kotlin DSL usage.
+ * Fields with input type arguments use specialized query builders for type-safe DSL usage.
  *
  * @see MutationDslGenerator for mutation generation
  * @see ObjectDslGenerator for nested object builder generation
@@ -94,6 +98,7 @@ private interface QueryDslModel {
 private class ScalarFieldModel(fieldDef: ViaductSchema.Field) {
     val escapedName: String = getEscapedFieldName(fieldDef.name)
     val fieldName: String = fieldDef.name
+    val graphqlType: String = fieldDef.type.toString()
 }
 
 /**
@@ -106,6 +111,7 @@ private class ComplexFieldModel(
 ) {
     val escapedName: String = getEscapedFieldName(fieldDef.name)
     val fieldName: String = fieldDef.name
+    val graphqlType: String = fieldDef.type.toString()
 
     val parameters: List<FieldParameterModel> = fieldDef.args.map {
         FieldParameterModel(it, pkg, baseTypeMapper)
@@ -115,14 +121,31 @@ private class ComplexFieldModel(
 
     val needsSelection: Boolean = returnTypeDef.requiresSelectionSet()
 
-    val selectionBuilderType: String? =
-        if (needsSelection) "${returnTypeDef.name}DslBuilder" else null
+    // Check if this field has input type arguments - if so, use specialized builder
+    val hasInputArgs: Boolean = fieldDef.args.any { it.type.baseTypeDef is ViaductSchema.Input }
+
+    // Use specialized query builder if has input args, otherwise use standard selection builder
+    val selectionBuilderType: String = if (hasInputArgs && needsSelection) {
+        getQueryFieldBuilderName(fieldDef.name)
+    } else if (needsSelection) {
+        "${returnTypeDef.name}DslBuilder"
+    } else {
+        ""
+    }
 
     val hasArgs: Boolean = fieldDef.args.isNotEmpty()
 
-    val parameterSignature: String = buildParameterSignature(parameters, includeAlias = true)
+    // For fields with input args, we don't pass args as function parameters anymore
+    val parameterSignature: String = if (hasInputArgs) {
+        "alias: String? = null"
+    } else {
+        buildParameterSignature(parameters, includeAlias = true)
+    }
 
     val parameterSerializers: String = buildParameterSerializers(parameters)
+
+    // Only serialize args inline if NOT using input builder pattern
+    val serializeArgsInline: Boolean = hasArgs && !hasInputArgs
 }
 
 // =============================================================================
@@ -172,6 +195,13 @@ private val QUERY_DSL_TEMPLATE = stTemplate(
 
 package <mdl.pkg>
 
+/**
+ * Creates a GraphQL query string using a type-safe DSL.
+ *
+ * @param name Optional operation name for the query
+ * @param block DSL block to define query fields
+ * @return The GraphQL query string
+ */
 fun query(name: String? = null, block: QueryDslBuilder.() -> Unit): String {
     val builder = QueryDslBuilder()
     builder.block()
@@ -179,6 +209,9 @@ fun query(name: String? = null, block: QueryDslBuilder.() -> Unit): String {
     return "query${'$'}operationName { ${'$'}{builder.build()} }"
 }
 
+/**
+ * DSL builder for constructing GraphQL queries.
+ */
 class QueryDslBuilder internal constructor() {
     private val fields = mutableListOf\<String>()
 
@@ -194,25 +227,29 @@ class QueryDslBuilder internal constructor() {
 }; separator="\n">
 
 <mdl.complexFields: { f |
-    fun <f.escapedName>(<f.parameterSignature><if(f.needsSelection)><if(f.hasArgs)>, <endif>block: <f.selectionBuilderType>.() -> Unit<endif>) {
+    fun <f.escapedName>(<f.parameterSignature><if(f.needsSelection)>, block: <f.selectionBuilderType>.() -> Unit<endif>) {
         val aliasPrefix = if (alias != null) alias + ": " else ""
-<if(f.hasArgs)>
-        val args = listOf(<f.parameterSerializers>).joinToString(", ")
-        val fieldStr = aliasPrefix + "<f.fieldName>(${'$'}args)"
-<else>
-        val fieldStr = aliasPrefix + "<f.fieldName>"
-<endif>
-<if(f.needsSelection)>
         val nestedBuilder = <f.selectionBuilderType>()
         nestedBuilder.block()
-        addField(fieldStr + " { " + nestedBuilder.build() + " \}")
+<if(f.hasInputArgs)>
+        val argsMap = nestedBuilder.buildArgs()
+        val argsStr = serializeArgsMap(argsMap)
+        val argsSection = if (argsStr.isNotEmpty()) "(${'$'}argsStr)" else ""
+        addField(aliasPrefix + "<f.fieldName>" + argsSection + " { " + nestedBuilder.build() + " \}")
+<elseif(f.serializeArgsInline)>
+        val args = listOf(<f.parameterSerializers>).joinToString(", ")
+        addField(aliasPrefix + "<f.fieldName>(${'$'}args) { " + nestedBuilder.build() + " \}")
 <else>
-        addField(fieldStr)
+        addField(aliasPrefix + "<f.fieldName> { " + nestedBuilder.build() + " \}")
 <endif>
     \}
 }; separator="\n">
 
     internal fun build(): String = fields.joinToString(" ")
+
+    private fun serializeArgsMap(args: Map\<String, Any?>): String {
+        return args.entries.joinToString(", ") { (k, v) -> "${'$'}k: ${'$'}{serializeValue(v)}" }
+    }
 
     private fun serializeValue(value: Any?): String {
         return when (value) {

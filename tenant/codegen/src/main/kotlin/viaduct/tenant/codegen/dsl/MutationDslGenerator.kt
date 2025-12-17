@@ -67,6 +67,7 @@ private class ScalarMutationFieldModel(
 ) {
     val escapedName: String = getEscapedFieldName(fieldDef.name)
     val fieldName: String = fieldDef.name
+    val graphqlType: String = fieldDef.type.toString()
 
     val parameters: List<FieldParameterModel> = fieldDef.args.map {
         FieldParameterModel(it, pkg, baseTypeMapper)
@@ -87,6 +88,7 @@ private class ComplexMutationFieldModel(
 ) {
     val escapedName: String = getEscapedFieldName(fieldDef.name)
     val fieldName: String = fieldDef.name
+    val graphqlType: String = fieldDef.type.toString()
 
     val parameters: List<FieldParameterModel> = fieldDef.args.map {
         FieldParameterModel(it, pkg, baseTypeMapper)
@@ -94,10 +96,29 @@ private class ComplexMutationFieldModel(
 
     private val returnTypeDef: ViaductSchema.TypeDef = fieldDef.type.baseTypeDef
 
-    val selectionBuilderType: String = "${returnTypeDef.name}DslBuilder"
+    // Check if this field has input type arguments - if so, use specialized builder
+    val hasInputArgs: Boolean = fieldDef.args.any { it.type.baseTypeDef is ViaductSchema.Input }
+
+    // Use specialized mutation builder if has input args, otherwise use standard selection builder
+    val selectionBuilderType: String = if (hasInputArgs) {
+        "${fieldDef.name.replaceFirstChar { it.uppercase() }}MutationBuilder"
+    } else {
+        "${returnTypeDef.name}DslBuilder"
+    }
+
     val hasArgs: Boolean = fieldDef.args.isNotEmpty()
-    val parameterSignature: String = buildParameterSignature(parameters, includeAlias = true)
+
+    // For fields with input args, we don't pass args as function parameters anymore
+    val parameterSignature: String = if (hasInputArgs) {
+        "alias: String? = null"
+    } else {
+        buildParameterSignature(parameters, includeAlias = true)
+    }
+
     val parameterSerializers: String = buildParameterSerializers(parameters)
+
+    // Only serialize args inline if NOT using input builder pattern
+    val serializeArgsInline: Boolean = hasArgs && !hasInputArgs
 }
 
 // =============================================================================
@@ -142,6 +163,13 @@ private val MUTATION_DSL_TEMPLATE = stTemplate(
 
 package <mdl.pkg>
 
+/**
+ * Creates a GraphQL mutation string using a type-safe DSL.
+ *
+ * @param name Optional operation name for the mutation
+ * @param block DSL block to define mutation fields
+ * @return The GraphQL mutation string
+ */
 fun mutation(name: String? = null, block: MutationDslBuilder.() -> Unit): String {
     val builder = MutationDslBuilder()
     builder.block()
@@ -149,6 +177,9 @@ fun mutation(name: String? = null, block: MutationDslBuilder.() -> Unit): String
     return "mutation${'$'}operationName { ${'$'}{builder.build()} }"
 }
 
+/**
+ * DSL builder for constructing GraphQL mutations.
+ */
 class MutationDslBuilder internal constructor() {
     private val fields = mutableListOf\<String>()
 
@@ -169,21 +200,29 @@ class MutationDslBuilder internal constructor() {
 }; separator="\n">
 
 <mdl.complexFields: { f |
-    fun <f.escapedName>(<f.parameterSignature><if(f.hasArgs)>, <endif>block: <f.selectionBuilderType>.() -> Unit) {
+    fun <f.escapedName>(<f.parameterSignature>, block: <f.selectionBuilderType>.() -> Unit) {
         val aliasPrefix = if (alias != null) alias + ": " else ""
-<if(f.hasArgs)>
-        val args = listOf(<f.parameterSerializers>).joinToString(", ")
-        val fieldStr = aliasPrefix + "<f.fieldName>(${'$'}args)"
-<else>
-        val fieldStr = aliasPrefix + "<f.fieldName>"
-<endif>
         val nestedBuilder = <f.selectionBuilderType>()
         nestedBuilder.block()
-        addField(fieldStr + " { " + nestedBuilder.build() + " \}")
+<if(f.hasInputArgs)>
+        val argsMap = nestedBuilder.buildArgs()
+        val argsStr = serializeArgsMap(argsMap)
+        val argsSection = if (argsStr.isNotEmpty()) "(${'$'}argsStr)" else ""
+        addField(aliasPrefix + "<f.fieldName>" + argsSection + " { " + nestedBuilder.build() + " \}")
+<elseif(f.serializeArgsInline)>
+        val args = listOf(<f.parameterSerializers>).joinToString(", ")
+        addField(aliasPrefix + "<f.fieldName>(${'$'}args) { " + nestedBuilder.build() + " \}")
+<else>
+        addField(aliasPrefix + "<f.fieldName> { " + nestedBuilder.build() + " \}")
+<endif>
     \}
 }; separator="\n">
 
     internal fun build(): String = fields.joinToString(" ")
+
+    private fun serializeArgsMap(args: Map\<String, Any?>): String {
+        return args.entries.joinToString(", ") { (k, v) -> "${'$'}k: ${'$'}{serializeValue(v)}" }
+    }
 
     private fun serializeValue(value: Any?): String {
         return when (value) {

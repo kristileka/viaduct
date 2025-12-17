@@ -185,7 +185,7 @@ class QueryDslGenTest {
         }
 
         @Test
-        fun `generates input type arguments as Map`() {
+        fun `generates input type arguments with specialized builder`() {
             val result = generateQueryDsl(
                 """
                 type Query {
@@ -200,8 +200,11 @@ class QueryDslGenTest {
                 """.trimIndent()
             ).toString()
 
+            // Fields with input args use specialized query builders
             assertTrue(result.contains("fun users("))
-            assertTrue(result.contains("filter: Map<String, Any?>"))
+            assertTrue(result.contains("alias: String? = null"))
+            assertTrue(result.contains("UsersQueryBuilder"))
+            assertTrue(result.contains("nestedBuilder.buildArgs()"))
         }
 
         @Test
@@ -269,6 +272,356 @@ class QueryDslGenTest {
             ).toString()
 
             assertTrue(result.contains("is Map<*, *>"))
+        }
+
+        @Test
+        fun `handles null serialization`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    hello: String
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("null -> \"null\""))
+        }
+
+        @Test
+        fun `handles String serialization with escaping`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    hello: String
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("is String"))
+            assertTrue(result.contains("replace"))
+        }
+
+        @Test
+        fun `handles Boolean serialization`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    hello: String
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("is Boolean"))
+        }
+
+        @Test
+        fun `handles Number serialization`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    hello: String
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("is Number"))
+        }
+
+        @Test
+        fun `handles Enum serialization`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    hello: String
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("is Enum<*>"))
+            assertTrue(result.contains(".name"))
+        }
+
+        @Test
+        fun `handles List serialization`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    hello: String
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("is List<*>"))
+        }
+    }
+
+    @Nested
+    @DisplayName("List Type Fields")
+    inner class ListTypeFieldTests {
+
+        @Test
+        fun `generates list scalar fields as properties`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    names: [String]
+                    ids: [ID]
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("val names: Unit"))
+            assertTrue(result.contains("val ids: Unit"))
+        }
+
+        @Test
+        fun `generates list object fields as functions`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    users: [User]
+                }
+                type User {
+                    id: ID
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("fun users("))
+            assertTrue(result.contains("block: UserDslBuilder.() -> Unit"))
+        }
+
+        @Test
+        fun `generates non-null list fields correctly`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    users: [User!]!
+                }
+                type User {
+                    id: ID
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("fun users("))
+        }
+    }
+
+    @Nested
+    @DisplayName("Multiple Arguments")
+    inner class MultipleArgumentsTests {
+
+        @Test
+        fun `generates function with multiple scalar arguments`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    search(query: String!, limit: Int, offset: Int): [Result]
+                }
+                type Result {
+                    id: ID
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("fun search("))
+            assertTrue(result.contains("query:"))
+            assertTrue(result.contains("limit:"))
+            assertTrue(result.contains("offset:"))
+        }
+
+        @Test
+        fun `generates function with mixed scalar and input arguments`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    search(filter: SearchFilter, limit: Int): [Result]
+                }
+                input SearchFilter {
+                    term: String
+                }
+                type Result {
+                    id: ID
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("fun search("))
+            // When there's an input arg, it uses specialized builder
+            assertTrue(result.contains("SearchQueryBuilder"))
+        }
+    }
+
+    @Nested
+    @DisplayName("Union Type Fields")
+    inner class UnionTypeFieldTests {
+
+        @Test
+        fun `generates union fields with builder block`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    searchResult: SearchResult
+                }
+                union SearchResult = User | Post
+                type User {
+                    id: ID
+                    name: String
+                }
+                type Post {
+                    id: ID
+                    title: String
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("fun searchResult("))
+            assertTrue(result.contains("block: SearchResultDslBuilder.() -> Unit"))
+        }
+    }
+
+    @Nested
+    @DisplayName("Nullable vs Non-Nullable Arguments")
+    inner class NullabilityTests {
+
+        @Test
+        fun `generates nullable argument types`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    user(id: ID): User
+                }
+                type User {
+                    id: ID
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("fun user("))
+            // Nullable ID should have ? in the type
+            assertTrue(result.contains("id: String?"))
+        }
+
+        @Test
+        fun `generates non-nullable argument types`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    user(id: ID!): User
+                }
+                type User {
+                    id: ID
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("fun user("))
+            assertTrue(result.contains("id: String,") || result.contains("id: String)"))
+        }
+    }
+
+    @Nested
+    @DisplayName("Alias Support")
+    inner class AliasTests {
+
+        @Test
+        fun `generates aliasPrefix in complex field builder`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    user: User
+                }
+                type User {
+                    id: ID
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("val aliasPrefix = if (alias != null) alias + \": \" else \"\""))
+        }
+
+        @Test
+        fun `uses aliasPrefix when building field string`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    user: User
+                }
+                type User {
+                    id: ID
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("addField(aliasPrefix +"))
+        }
+    }
+
+    @Nested
+    @DisplayName("SerializeArgsMap Generation")
+    inner class SerializeArgsMapTests {
+
+        @Test
+        fun `generates serializeArgsMap method`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    hello: String
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("private fun serializeArgsMap(args: Map<String, Any?>): String"))
+        }
+
+        @Test
+        fun `serializeArgsMap joins entries with comma`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    hello: String
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("joinToString(\", \")"))
+        }
+    }
+
+    @Nested
+    @DisplayName("Package Declaration")
+    inner class PackageTests {
+
+        @Test
+        fun `generates correct package declaration`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    hello: String
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("package ${TestPackages.DSL_PACKAGE}"))
+        }
+    }
+
+    @Nested
+    @DisplayName("File Suppress Annotation")
+    inner class SuppressAnnotationTests {
+
+        @Test
+        fun `generates file-level suppress annotation`() {
+            val result = generateQueryDsl(
+                """
+                type Query {
+                    hello: String
+                }
+                """.trimIndent()
+            ).toString()
+
+            assertTrue(result.contains("@file:Suppress(\"warnings\")"))
         }
     }
 }

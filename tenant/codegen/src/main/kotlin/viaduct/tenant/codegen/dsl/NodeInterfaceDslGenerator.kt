@@ -4,57 +4,6 @@
  * Generates type-safe Kotlin DSL builders for GraphQL Interface types,
  * supporting inline fragments for type-specific field selection.
  *
- * ## Generated Code Structure
- *
- * For each GraphQL Interface type, generates a `{InterfaceName}DslBuilder` class with:
- * - Common scalar/enum fields from the interface as Kotlin properties
- * - Fragment methods (`on{TypeName}`) for each implementing type
- * - Support for polymorphic queries on interface fields
- *
- * ## Usage Example
- *
- * Given this GraphQL schema:
- * ```graphql
- * interface Node {
- *     id: ID!
- * }
- * type User implements Node {
- *     id: ID!
- *     name: String
- * }
- * type Post implements Node {
- *     id: ID!
- *     title: String
- * }
- * ```
- *
- * The generated `NodeDslBuilder` allows:
- * ```kotlin
- * node(id = "123") {
- *     id  // Common field from interface
- *     onUser {
- *         name  // User-specific field
- *     }
- *     onPost {
- *         title  // Post-specific field
- *     }
- * }
- * ```
- *
- * Generates GraphQL:
- * ```graphql
- * node(id: "123") {
- *     id
- *     ... on User { name }
- *     ... on Post { title }
- * }
- * ```
- *
- * ## Field Selection
- *
- * Only common scalar/enum fields without arguments are exposed directly.
- * All type-specific fields must be accessed through fragment methods.
- *
  * @see ObjectDslGenerator for object builder generation
  * @see QueryDslGenerator for query-level generation
  */
@@ -138,10 +87,12 @@ private class ImplementingTypeModel(typeDef: ViaductSchema.Object) {
  *
  * @property fieldName The GraphQL field name
  * @property escapedName The Kotlin-safe property name
+ * @property graphqlType The GraphQL type string
  */
 private class CommonFieldModel(fieldDef: ViaductSchema.Field) {
     val fieldName: String = fieldDef.name
     val escapedName: String = getEscapedFieldName(fieldDef.name)
+    val graphqlType: String = fieldDef.type.toString()
 }
 
 // =============================================================================
@@ -198,6 +149,9 @@ private val NODE_INTERFACE_TEMPLATE = stTemplate(
 
 package <mdl.pkg>
 
+/**
+ * DSL builder for selecting fields from the `<mdl.interfaceName>` GraphQL interface.
+ */
 class <mdl.interfaceName>DslBuilder internal constructor() {
     private val fields = mutableListOf\<String>()
 

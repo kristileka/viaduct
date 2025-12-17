@@ -6,7 +6,12 @@
       "Bash(xargs grep:*)",
       "Bash(./gradlew :tenant:codegen:test:*)",
       "Bash(./gradlew :core:tenant:tenant-codegen:test:*)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(git show:*)",
+      "Bash(xargs cat:*)",
+      "Bash(./gradlew :core:shared:shared-codegen:compileKotlin:*)",
+      "Bash(./gradlew :core:tenant:tenant-codegen:compileKotlin:*)",
+      "Bash(./gradlew:*)"
     ]
   }
 }

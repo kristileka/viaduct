@@ -45,6 +45,7 @@ fun objectDslGen(
 
 private interface ObjectDslModel {
     val pkg: String
+    val typeName: String
     val className: String
     val scalarFields: List<ObjectScalarFieldModel>
     val complexFields: List<ObjectComplexFieldModel>
@@ -57,6 +58,7 @@ private interface ObjectDslModel {
 private class ObjectScalarFieldModel(fieldDef: ViaductSchema.Field) {
     val escapedName: String = getEscapedFieldName(fieldDef.name)
     val fieldName: String = fieldDef.name
+    val graphqlType: String = fieldDef.type.toString()
 }
 
 private class ObjectComplexFieldModel(
@@ -66,6 +68,7 @@ private class ObjectComplexFieldModel(
 ) {
     val escapedName: String = getEscapedFieldName(fieldDef.name)
     val fieldName: String = fieldDef.name
+    val graphqlType: String = fieldDef.type.toString()
 
     val parameters: List<FieldParameterModel> = fieldDef.args.map {
         FieldParameterModel(it, pkg, baseTypeMapper)
@@ -93,6 +96,7 @@ private class ObjectDslModelImpl(
     baseTypeMapper: BaseTypeMapper
 ) : ObjectDslModel {
 
+    override val typeName: String = objectDef.name
     override val className: String = "${objectDef.name}DslBuilder"
 
     override val scalarFields: List<ObjectScalarFieldModel>
@@ -128,10 +132,13 @@ private val OBJECT_DSL_TEMPLATE = stTemplate(
 
 package <mdl.pkg>
 
-class <mdl.className> internal constructor() {
-    private val fields = mutableListOf\<String>()
+/**
+ * DSL builder for selecting fields from the `<mdl.typeName>` GraphQL type.
+ */
+open class <mdl.className> internal constructor() {
+    protected val fields = mutableListOf\<String>()
 
-    private fun addField(name: String) {
+    protected fun addField(name: String) {
         fields.add(name)
     }
 
@@ -160,7 +167,7 @@ class <mdl.className> internal constructor() {
     \}
 }; separator="\n">
 
-    internal fun build(): String = fields.joinToString(" ")
+    internal open fun build(): String = fields.joinToString(" ")
 
     private fun serializeValue(value: Any?): String {
         return when (value) {

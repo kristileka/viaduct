@@ -39,7 +39,7 @@ class ViaductApplicationPlugin : Plugin<Project> {
 
             val generateGRTsTask = setupGenerateGRTsTask(appExt, assembleCentralSchemaTask)
 
-            // NEW: Generate DSL query builders
+            // DSL generation - only setup if enabled
             val generateDslTask = setupGenerateDslTask(appExt, assembleCentralSchemaTask)
 
             plugins.withId("java") {
@@ -50,12 +50,19 @@ class ViaductApplicationPlugin : Plugin<Project> {
                     addViaductTestFixtures(appExt.viaductTestFixtures.get())
                 }
 
-                // NEW: Add DSL sources to compilation
-                addDslSourcesToCompilation(generateDslTask)
+                // Add DSL sources to compilation only if enabled
+                afterEvaluate {
+                    if (appExt.enableDsl.get()) {
+                        addDslSourcesToCompilation(generateDslTask)
+                    }
+                }
             }
 
             configureIdeaIntegration(generateGRTsTask)
             setupConsumableConfigurationForGRT(generateGRTsTask.flatMap { it.archiveFile })
+
+            // Setup DSL configuration (always setup but only populated when enabled)
+            setupConsumableConfigurationForDsl(appExt, generateDslTask)
 
             this.dependencies.add("api", files(generateGRTsTask.flatMap { it.archiveFile }))
         }
@@ -120,7 +127,7 @@ class ViaductApplicationPlugin : Plugin<Project> {
         return generateGRTsTask
     }
 
-    /** NEW: Generate DSL query builder files. */
+    /** Generate DSL query builder files (experimental). */
     private fun Project.setupGenerateDslTask(
         appExt: ViaductApplicationExtension,
         assembleCentralSchemaTask: TaskProvider<AssembleCentralSchemaTask>,
@@ -134,9 +141,10 @@ class ViaductApplicationPlugin : Plugin<Project> {
                     dir.asFileTree.matching { include("**/*.graphqls") }.files
                 }
             })
-            dslPackageName.set("viaduct.api.dsl")
+            dslPackageName.set(appExt.dslPackageName)
             classpath.setFrom(pluginClasspath)
             mainClass.set(DSL_CODEGEN_MAIN_CLASS)
+            onlyIf { appExt.enableDsl.get() }
         }
 
         return generateDslTask
@@ -188,6 +196,27 @@ class ViaductApplicationPlugin : Plugin<Project> {
                 )
             }
             outgoing.artifact(artifact)
+        }
+    }
+
+    /** Setup consumable configuration for DSL classes (only active when enableDsl is true). */
+    private fun Project.setupConsumableConfigurationForDsl(
+        appExt: ViaductApplicationExtension,
+        generateDslTask: TaskProvider<GenerateDslFilesTask>
+    ) {
+        configurations.create(ViaductPluginCommon.Configs.DSL_CLASSES_OUTGOING).apply {
+            description = "Consumable configuration for generated DSL query builder classes (experimental)."
+            isCanBeConsumed = true
+            isCanBeResolved = false
+            attributes {
+                attribute(ViaductPluginCommon.VIADUCT_KIND, ViaductPluginCommon.Kind.DSL_CLASSES)
+            }
+            // Only add artifact if DSL is enabled
+            afterEvaluate {
+                if (appExt.enableDsl.get()) {
+                    outgoing.artifact(generateDslTask.flatMap { it.dslOutputDirectory })
+                }
+            }
         }
     }
 

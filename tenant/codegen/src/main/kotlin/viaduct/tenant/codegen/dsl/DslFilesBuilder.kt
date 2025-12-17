@@ -13,8 +13,10 @@
  * 2. **MutationDsl.kt** - Builder for GraphQL mutations (if schema has mutations)
  * 3. **{ObjectType}DslBuilder.kt** - Builders for each object type used in selections
  * 4. **{Interface}DslBuilder.kt** - Builders for interface types with fragment support
+ * 5. **{InputType}Builder.kt** - Builders for input types with DSL syntax
+ * 6. **{MutationField}MutationBuilder.kt** - Specialized builders for mutation fields
  *
- * Input types are passed as `Map<String, Any?>` for a more idiomatic Kotlin DSL experience.
+ * Input types are accessed via DSL functions within mutation builders.
  *
  * ## Output Directory Structure
  *
@@ -78,6 +80,8 @@ class DslFilesBuilder(
      * 3. Generates Mutation DSL (if schema has Mutation type)
      * 4. Generates Object DSL builders for all referenced types
      * 5. Generates Interface DSL builders with fragment support
+     * 6. Generates Input DSL builders for all input types
+     * 7. Generates Mutation Field builders for mutations with input args
      *
      * @param schema The GraphQL schema to generate DSL for
      */
@@ -85,20 +89,27 @@ class DslFilesBuilder(
         packageDir.mkdirs()
 
         val objectTypesNeedingBuilders = mutableSetOf<String>()
+        val inputTypesNeedingBuilders = mutableSetOf<String>()
+        val queryFieldsNeedingBuilders = mutableListOf<ViaductSchema.Field>()
+        val mutationFieldsNeedingBuilders = mutableListOf<ViaductSchema.Field>()
 
         // Generate Query DSL and collect needed object builders
         schema.types[QUERY_TYPE]?.let { queryType ->
             if (queryType is ViaductSchema.Object) {
                 generateQueryDsl(queryType)
-                collectNeededBuilders(queryType, objectTypesNeedingBuilders, schema)
+                collectNeededBuilders(queryType, objectTypesNeedingBuilders, inputTypesNeedingBuilders, schema)
+                // Collect query fields that need specialized builders
+                collectQueryFieldsWithInputs(queryType, queryFieldsNeedingBuilders)
             }
         }
 
-        // Generate Mutation DSL and collect needed object builders
+        // Generate Mutation DSL and collect needed object/input builders
         schema.types[MUTATION_TYPE]?.let { mutationType ->
             if (mutationType is ViaductSchema.Object) {
                 generateMutationDsl(mutationType)
-                collectNeededBuilders(mutationType, objectTypesNeedingBuilders, schema)
+                collectNeededBuilders(mutationType, objectTypesNeedingBuilders, inputTypesNeedingBuilders, schema)
+                // Collect mutation fields that need specialized builders
+                collectMutationFieldsWithInputs(mutationType, mutationFieldsNeedingBuilders)
             }
         }
 
@@ -107,6 +118,15 @@ class DslFilesBuilder(
 
         // Generate Interface DSL builders with fragment methods
         generateInterfaceBuilders(schema, objectTypesNeedingBuilders)
+
+        // Generate Input DSL builders for all input types
+        generateInputBuilders(inputTypesNeedingBuilders, schema)
+
+        // Generate specialized query field builders
+        generateQueryFieldBuilders(queryFieldsNeedingBuilders, schema)
+
+        // Generate specialized mutation field builders
+        generateMutationFieldBuilders(mutationFieldsNeedingBuilders, schema)
     }
 
     // =========================================================================
@@ -135,6 +155,32 @@ class DslFilesBuilder(
     private fun generateObjectDsl(objectType: ViaductSchema.Object) {
         val destination = File(packageDir, "${objectType.name}DslBuilder.kt")
         objectDslGen(pkg, objectType, baseTypeMapper).write(destination)
+    }
+
+    /**
+     * Generates a DSL builder for a specific GraphQL Input type.
+     */
+    private fun generateInputDsl(inputType: ViaductSchema.Input) {
+        val destination = File(packageDir, "${inputType.name}Builder.kt")
+        inputDslGen(pkg, inputType, baseTypeMapper).write(destination)
+    }
+
+    /**
+     * Generates a specialized builder for a mutation field with input arguments.
+     */
+    private fun generateMutationFieldDsl(field: ViaductSchema.Field, returnType: ViaductSchema.TypeDef) {
+        val builderName = getMutationFieldBuilderName(field.name)
+        val destination = File(packageDir, "$builderName.kt")
+        mutationFieldDslGen(pkg, field, returnType, baseTypeMapper).write(destination)
+    }
+
+    /**
+     * Generates a specialized builder for a query field with input arguments.
+     */
+    private fun generateQueryFieldDsl(field: ViaductSchema.Field, returnType: ViaductSchema.TypeDef) {
+        val builderName = getQueryFieldBuilderName(field.name)
+        val destination = File(packageDir, "$builderName.kt")
+        queryFieldDslGen(pkg, field, returnType, baseTypeMapper).write(destination)
     }
 
     // =========================================================================
@@ -184,38 +230,140 @@ class DslFilesBuilder(
         }
     }
 
+    /**
+     * Generates Input DSL builders for all input types in the collection.
+     */
+    private fun generateInputBuilders(
+        inputTypeNames: Set<String>,
+        schema: ViaductSchema
+    ) {
+        for (typeName in inputTypeNames) {
+            val typeDef = schema.types[typeName]
+            if (typeDef is ViaductSchema.Input) {
+                generateInputDsl(typeDef)
+            }
+        }
+    }
+
+    /**
+     * Generates specialized query field builders for fields with input arguments.
+     */
+    private fun generateQueryFieldBuilders(
+        queryFields: List<ViaductSchema.Field>,
+        schema: ViaductSchema
+    ) {
+        for (field in queryFields) {
+            val returnType = field.type.baseTypeDef
+            if (returnType.requiresSelectionSet()) {
+                generateQueryFieldDsl(field, returnType)
+            }
+        }
+    }
+
+    /**
+     * Generates specialized mutation field builders for fields with input arguments.
+     */
+    private fun generateMutationFieldBuilders(
+        mutationFields: List<ViaductSchema.Field>,
+        schema: ViaductSchema
+    ) {
+        for (field in mutationFields) {
+            val returnType = field.type.baseTypeDef
+            if (returnType.requiresSelectionSet()) {
+                generateMutationFieldDsl(field, returnType)
+            }
+        }
+    }
+
     // =========================================================================
     // Type Discovery Methods
     // =========================================================================
 
     /**
-     * Recursively collects all object types that need DSL builders.
+     * Recursively collects all object and input types that need DSL builders.
      *
      * Starting from a root type (Query or Mutation), traverses all fields
-     * to find Object, Interface, and Union types that will need builders
-     * for nested field selection.
+     * to find Object, Interface, Union, and Input types that will need builders.
      *
      * @param typeDef The type to scan for referenced types
-     * @param collectors The set to add discovered type names to
+     * @param objectCollectors The set to add discovered object type names to
+     * @param inputCollectors The set to add discovered input type names to
      * @param schema The schema for looking up type definitions
      */
     private fun collectNeededBuilders(
         typeDef: ViaductSchema.Object,
-        collectors: MutableSet<String>,
+        objectCollectors: MutableSet<String>,
+        inputCollectors: MutableSet<String>,
         schema: ViaductSchema
     ) {
         for (field in typeDef.fields) {
+            // Collect input types from field arguments
+            for (arg in field.args) {
+                collectInputTypes(arg.type.baseTypeDef, inputCollectors, schema)
+            }
+
+            // Collect object types from return types
             when (val returnType = field.type.baseTypeDef) {
                 is ViaductSchema.Object -> {
                     // Recursively collect from Object types, avoiding cycles
-                    if (!isRootType(returnType.name) && collectors.add(returnType.name)) {
-                        collectNeededBuilders(returnType, collectors, schema)
+                    if (!isRootType(returnType.name) && objectCollectors.add(returnType.name)) {
+                        collectNeededBuilders(returnType, objectCollectors, inputCollectors, schema)
                     }
                 }
                 is ViaductSchema.Interface, is ViaductSchema.Union -> {
                     // Interface and Union types need builders but don't recurse
-                    collectors.add(returnType.name)
+                    objectCollectors.add(returnType.name)
                 }
+            }
+        }
+    }
+
+    /**
+     * Recursively collects all input types referenced by a type definition.
+     */
+    private fun collectInputTypes(
+        typeDef: ViaductSchema.TypeDef,
+        inputCollectors: MutableSet<String>,
+        schema: ViaductSchema
+    ) {
+        if (typeDef is ViaductSchema.Input) {
+            if (inputCollectors.add(typeDef.name)) {
+                // Recursively collect nested input types
+                for (field in typeDef.fields) {
+                    collectInputTypes(field.type.baseTypeDef, inputCollectors, schema)
+                }
+            }
+        }
+    }
+
+    /**
+     * Collects query fields that have input type arguments and need specialized builders.
+     */
+    private fun collectQueryFieldsWithInputs(
+        queryType: ViaductSchema.Object,
+        queryFields: MutableList<ViaductSchema.Field>
+    ) {
+        for (field in queryType.fields) {
+            val hasInputArgs = field.args.any { it.type.baseTypeDef is ViaductSchema.Input }
+            val hasComplexReturnType = field.type.baseTypeDef.requiresSelectionSet()
+            if (hasInputArgs && hasComplexReturnType) {
+                queryFields.add(field)
+            }
+        }
+    }
+
+    /**
+     * Collects mutation fields that have input type arguments and need specialized builders.
+     */
+    private fun collectMutationFieldsWithInputs(
+        mutationType: ViaductSchema.Object,
+        mutationFields: MutableList<ViaductSchema.Field>
+    ) {
+        for (field in mutationType.fields) {
+            val hasInputArgs = field.args.any { it.type.baseTypeDef is ViaductSchema.Input }
+            val hasComplexReturnType = field.type.baseTypeDef.requiresSelectionSet()
+            if (hasInputArgs && hasComplexReturnType) {
+                mutationFields.add(field)
             }
         }
     }

@@ -56,9 +56,12 @@ fun String.replaceGlobalIdWithString(): String {
 }
 
 /**
- * Removes the "kotlin." prefix from type names for cleaner generated code.
+ * Simplifies Kotlin type names by removing common package prefixes.
+ * Handles both "kotlin." and "kotlin.collections." prefixes.
  */
-fun String.simplifyKotlinType(): String = this.removePrefix("kotlin.")
+fun String.simplifyKotlinType(): String = this
+    .replace("kotlin.collections.", "")
+    .replace("kotlin.", "")
 
 /**
  * Checks if a GraphQL type definition is a scalar or enum type.

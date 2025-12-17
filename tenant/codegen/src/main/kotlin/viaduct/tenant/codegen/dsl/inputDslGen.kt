@@ -32,7 +32,7 @@ private interface InputDslModel {
             JavaName(pkg).asKmName,
             baseTypeMapper,
             isInput = true
-        ).kotlinTypeString.simplifyKotlinType().replaceGlobalIdPackage(pkg)
+        ).kotlinTypeString.simplifyKotlinType().replaceGlobalIdWithString()
 
         // Check if field has a default value without throwing exception
         private val defaultValueResult: Pair<Boolean, Any?> = try {
@@ -70,12 +70,9 @@ private interface InputDslModel {
 
 private fun String.simplifyKotlinType(): String = this.removePrefix("kotlin.")
 
-private fun String.replaceGlobalIdPackage(modelPackage: String): String {
-    // Replace GlobalID type parameters from model package to grts package
-    // Example: viaduct.api.globalid.GlobalID<viaduct.api.dsl.model.Film>
-    // becomes: viaduct.api.globalid.GlobalID<viaduct.api.grts.Film>
-    val grtsPackage = modelPackage.replace(".dsl.model", ".grts")
-    return this.replace("<$modelPackage.", "<$grtsPackage.")
+private fun String.replaceGlobalIdWithString(): String {
+    val globalIdPattern = Regex("""viaduct\.api\.globalid\.GlobalID<[^>]+>""")
+    return this.replace(globalIdPattern, "String")
 }
 
 private val inputDslSTGroup = stTemplate(

@@ -59,13 +59,13 @@ private interface ObjectDslModel {
         val escapedName: String = getEscapedFieldName(arg.name)
         val argName: String = arg.name
         private val grtsPackage = modelPackage.replace(".dsl.model", ".grts")
-        val kotlinType: String = arg.kmType(JavaName(modelPackage).asKmName, baseTypeMapper, isInput = true).kotlinTypeString.replaceGlobalIdPackage(modelPackage, grtsPackage)
+        val kotlinType: String = arg.kmType(JavaName(modelPackage).asKmName, baseTypeMapper, isInput = true).kotlinTypeString.replaceGlobalIdWithString()
     }
 }
 
-private fun String.replaceGlobalIdPackage(modelPackage: String, grtsPackage: String): String {
-    // Replace GlobalID type parameters from model package to grts package
-    return this.replace("<$modelPackage.", "<$grtsPackage.")
+private fun String.replaceGlobalIdWithString(): String {
+    val globalIdPattern = Regex("""viaduct\.api\.globalid\.GlobalID<[^>]+>""")
+    return this.replace(globalIdPattern, "String")
 }
 
 private val objectDslSTGroup = stTemplate(
@@ -111,7 +111,7 @@ class <mdl.className> internal constructor() {
     private fun serializeValue(value: Any?): String {
         return when (value) {
             null -> "null"
-            is String -> ""${'"'}\"${'$'}{value.replace("\\\\", "\\\\\\\\").replace("\\"", "\\\\\\"")}\""${'"'}${'"'}
+            is String -> "\\"" + value.replace("\\\\", "\\\\\\\\").replace("\\"", "\\\\\\"") + "\\""
             is Boolean -> value.toString()
             is Number -> value.toString()
             is Enum\<*> -> value.name

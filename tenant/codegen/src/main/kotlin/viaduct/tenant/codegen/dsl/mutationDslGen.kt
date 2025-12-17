@@ -35,9 +35,11 @@ private interface MutationDslModel {
             ParameterModel(modelPackage, it, baseTypeMapper)
         }
         val hasArgs: Boolean = fieldDef.args.isNotEmpty()
-        // Pre-computed strings for the template
-        val parameterSignature: String = parameters.joinToString(", ") { "${it.escapedName}: ${it.kotlinType}" }
-        val parameterSerializers: String = parameters.joinToString(", ") { "\"${it.argName}: \" + serializeValue(${it.escapedName})" }
+        val parameterSignature: String = parameters.joinToString(", ") { "${it.escapedName}: ${it.kotlinType}" } +
+            (if (parameters.isNotEmpty()) ", " else "") + "alias: String? = null"
+        val parameterSerializers: String = parameters.joinToString(", ") {
+            "\"${it.argName}: \" + serializeValue(${it.escapedName})"
+        }
     }
 
     class ComplexFieldModel(
@@ -53,9 +55,11 @@ private interface MutationDslModel {
         val returnTypeDef: ViaductSchema.TypeDef = fieldDef.type.baseTypeDef
         val selectionBuilderType: String = "${returnTypeDef.name}DslBuilder"
         val hasArgs: Boolean = fieldDef.args.isNotEmpty()
-        // Pre-computed strings for the template
-        val parameterSignature: String = parameters.joinToString(", ") { "${it.escapedName}: ${it.kotlinType}" }
-        val parameterSerializers: String = parameters.joinToString(", ") { "\"${it.argName}: \" + serializeValue(${it.escapedName})" }
+        val parameterSignature: String = parameters.joinToString(", ") { "${it.escapedName}: ${it.kotlinType}" } +
+            (if (parameters.isNotEmpty()) ", " else "") + "alias: String? = null"
+        val parameterSerializers: String = parameters.joinToString(", ") {
+            "\"${it.argName}: \" + serializeValue(${it.escapedName})"
+        }
     }
 
     class ParameterModel(
@@ -97,26 +101,28 @@ class MutationDslBuilder internal constructor() {
 
 <mdl.scalarFields: { f |
     fun <f.escapedName>(<f.parameterSignature>) {
+        val aliasPrefix = if (alias != null) alias + ": " else ""
 <if(f.hasArgs)>
         val args = listOf(<f.parameterSerializers>).joinToString(", ")
-        addField("<f.fieldName>(${'$'}args)")
+        addField(aliasPrefix + "<f.fieldName>(${'$'}args)")
 <else>
-        addField("<f.fieldName>")
+        addField(aliasPrefix + "<f.fieldName>")
 <endif>
     \}
 }; separator="\n">
 
 <mdl.complexFields: { f |
     fun <f.escapedName>(<f.parameterSignature><if(f.hasArgs)>, <endif>block: <f.selectionBuilderType>.() -> Unit) {
+        val aliasPrefix = if (alias != null) alias + ": " else ""
 <if(f.hasArgs)>
         val args = listOf(<f.parameterSerializers>).joinToString(", ")
-        val fieldStr = "<f.fieldName>(${'$'}args)"
+        val fieldStr = aliasPrefix + "<f.fieldName>(${'$'}args)"
 <else>
-        val fieldStr = "<f.fieldName>"
+        val fieldStr = aliasPrefix + "<f.fieldName>"
 <endif>
         val nestedBuilder = <f.selectionBuilderType>()
         nestedBuilder.block()
-        addField("${'$'}fieldStr { ${'$'}{nestedBuilder.build()\} \}")
+        addField(fieldStr + " { " + nestedBuilder.build() + " \}")
     \}
 }; separator="\n">
 
@@ -131,13 +137,11 @@ class MutationDslBuilder internal constructor() {
             is Enum\<*> -> value.name
             is List\<*> -> "[" + value.joinToString(", ") { serializeValue(it) } + "]"
             else -> {
-                // Try to get toInputData method (for DSL input models)
                 val toInputDataMethod = value::class.java.methods.find { it.name == "toInputData" }
                 if (toInputDataMethod != null) {
                     val inputData = toInputDataMethod.invoke(value) as? Map\<*, *>
                     inputData?.let { serializeInputObject(it) } ?: value.toString()
                 } else {
-                    // Fallback to getInputData for legacy GRTS support
                     val getInputDataMethod = value::class.java.methods.find { it.name == "getInputData" }
                     val inputData = getInputDataMethod?.invoke(value) as? Map\<*, *>
                     inputData?.let { serializeInputObject(it) } ?: value.toString()

@@ -34,7 +34,6 @@ private interface QueryDslModel {
         fieldDef: ViaductSchema.Field,
         baseTypeMapper: BaseTypeMapper
     ) {
-
         val escapedName: String = getEscapedFieldName(fieldDef.name)
         val fieldName: String = fieldDef.name
         val parameters: List<ParameterModel> = fieldDef.args.map {
@@ -46,9 +45,12 @@ private interface QueryDslModel {
             returnTypeDef is ViaductSchema.Union
         val selectionBuilderType: String? = if (needsSelection) "${returnTypeDef.name}DslBuilder" else null
         val hasArgs: Boolean = fieldDef.args.isNotEmpty()
-        // Pre-computed strings for the template
-        val parameterSignature: String = parameters.joinToString(", ") { "${it.escapedName}: ${it.kotlinType}" }
-        val parameterSerializers: String = parameters.joinToString(", ") { "\"${it.argName}: \" + serializeValue(${it.escapedName})" }
+        val parameterSignature: String = parameters.joinToString(", ") { "${it.escapedName}: ${it.kotlinType}" } +
+            (if (parameters.isNotEmpty()) ", " else "") + "alias: String? = null"
+
+        val parameterSerializers: String = parameters.joinToString(", ") {
+            "\"${it.argName}: \" + serializeValue(${it.escapedName})"
+        }
     }
 
     class ParameterModel(
@@ -101,16 +103,17 @@ class QueryDslBuilder internal constructor() {
 
 <mdl.complexFields: { f |
     fun <f.escapedName>(<f.parameterSignature><if(f.needsSelection)><if(f.hasArgs)>, <endif>block: <f.selectionBuilderType>.() -> Unit<endif>) {
+        val aliasPrefix = if (alias != null) alias + ": " else ""
 <if(f.hasArgs)>
         val args = listOf(<f.parameterSerializers>).joinToString(", ")
-        val fieldStr = "<f.fieldName>(${'$'}args)"
+        val fieldStr = aliasPrefix + "<f.fieldName>(${'$'}args)"
 <else>
-        val fieldStr = "<f.fieldName>"
+        val fieldStr = aliasPrefix + "<f.fieldName>"
 <endif>
 <if(f.needsSelection)>
         val nestedBuilder = <f.selectionBuilderType>()
         nestedBuilder.block()
-        addField("${'$'}fieldStr { ${'$'}{nestedBuilder.build()\} \}")
+        addField(fieldStr + " { " + nestedBuilder.build() + " \}")
 <else>
         addField(fieldStr)
 <endif>
@@ -128,13 +131,11 @@ class QueryDslBuilder internal constructor() {
             is Enum\<*> -> value.name
             is List\<*> -> "[" + value.joinToString(", ") { serializeValue(it) } + "]"
             else -> {
-                // Try to get toInputData method (for DSL input models)
                 val toInputDataMethod = value::class.java.methods.find { it.name == "toInputData" }
                 if (toInputDataMethod != null) {
                     val inputData = toInputDataMethod.invoke(value) as? Map\<*, *>
                     inputData?.let { serializeInputObject(it) } ?: value.toString()
                 } else {
-                    // Fallback to getInputData for legacy GRTS support
                     val getInputDataMethod = value::class.java.methods.find { it.name == "getInputData" }
                     val inputData = getInputDataMethod?.invoke(value) as? Map\<*, *>
                     inputData?.let { serializeInputObject(it) } ?: value.toString()

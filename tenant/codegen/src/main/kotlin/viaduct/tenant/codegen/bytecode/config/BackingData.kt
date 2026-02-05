@@ -1,6 +1,5 @@
 package viaduct.tenant.codegen.bytecode.config
 
-import graphql.language.StringValue
 import kotlinx.metadata.KmType
 import kotlinx.metadata.isNullable
 import viaduct.codegen.utils.Km
@@ -24,21 +23,21 @@ val ViaductSchema.Record.codegenIncludedFields: Iterable<ViaductSchema.Field> ge
     fields.filter { !it.isBackingDataType }
 
 /** derive a BackingData instance from the AppliedDirective's, if one exists */
-val Iterable<ViaductSchema.AppliedDirective>.backingData: BackingData?
+val Iterable<ViaductSchema.AppliedDirective<*>>.backingData: BackingData?
     get() = firstNotNullOfOrNull { if (it.name == BackingData.name) BackingData.parse(it) else null }
 
 data class BackingData(val fqClass: String) {
     companion object {
         val name: String = "backingData"
 
-        fun parse(dir: ViaductSchema.AppliedDirective): BackingData {
+        fun parse(dir: ViaductSchema.AppliedDirective<*>): BackingData {
             require(dir.name == name)
-            return BackingData((dir.arguments["class"] as StringValue).value)
+            return BackingData((dir.arguments["class"] as ViaductSchema.StringLiteral).value)
         }
     }
 }
 
 /** create a KmType describing the customized BackingData */
-fun ViaductSchema.TypeExpr.backingDataType(): KmType {
+fun ViaductSchema.TypeExpr<*>.backingDataType(): KmType {
     return Km.ANY.asType().apply { isNullable = baseTypeNullable }
 }

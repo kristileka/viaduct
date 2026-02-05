@@ -14,20 +14,65 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.condition.EnabledIf
 import viaduct.graphql.schema.ViaductSchema
 
+/**
+ * A contract test suite that verifies the type structure of [ViaductSchema] implementations.
+ *
+ * While [ViaductSchemaContract] tests behavioral correctness, this class uses Kotlin reflection
+ * to verify that a [ViaductSchema] implementation has the proper **type structure**. Specifically,
+ * it ensures that:
+ *
+ * - All required nested classes exist (`Def`, `TypeDef`, `Field`, `Arg`, etc.)
+ * - The class hierarchy is correct (e.g., `TypeDef` extends `TopLevelDef`)
+ * - Return types are proper subtypes (e.g., `Field.containingDef` returns the implementation's
+ *   `Record` type, not just `ViaductSchema.Record`)
+ *
+ * This type-safety verification ensures that when you work with a specific implementation,
+ * you get back implementation-specific types that may have additional properties or methods.
+ *
+ * ## Usage
+ *
+ * To use this contract, create a test class that extends this abstract class:
+ *
+ * ```kotlin
+ * class MySchemaSubtypeContractTest : ViaductSchemaSubtypeContract() {
+ *     override fun getSchemaClass() = MySchema::class
+ * }
+ * ```
+ *
+ * JUnit will automatically discover and run all the `@Test` methods defined in this class.
+ *
+ * ## Optional Customization
+ *
+ * - Override [skipExtensionTests] to `true` if your implementation delegates extension
+ *   fields without wrapping them in implementation-specific types.
+ * - Override [classes] directly if your implementation uses non-standard nested class names.
+ *
+ * @see ViaductSchemaContract for complementary tests verifying behavioral correctness
+ */
 @Suppress("ktlint:standard:indent")
 abstract class ViaductSchemaSubtypeContract {
-    /** Override this with the ViaductSchema class you want to test. */
-    abstract fun getSchemaClass(): KClass<*>
+    /**
+     * Returns the [KClass] of the [ViaductSchema] implementation to test.
+     *
+     * Subclasses must override this to return their schema implementation class.
+     * The tests will use reflection to examine this class's nested types and
+     * verify they properly subtype [ViaductSchema]'s nested interfaces.
+     */
+    protected abstract fun getSchemaClass(): KClass<*>
 
-    /** If true, skips tests for `.extensions` fields, which are sometimes delegated
-     *  without being wrapped.
+    /**
+     * If true, skips tests for `.extensions` fields, which are sometimes delegated
+     * without being wrapped in implementation-specific types.
      */
     open val skipExtensionTests: Boolean = false
 
     private val missingClasses = mutableListOf<String>()
 
-    /** If your version of BridgeSchema doesn't implement its classes in the
-     *  standard manner, you can supply this table directly.
+    /**
+     * Map from [ViaductSchema] nested type names to this implementation's corresponding classes.
+     *
+     * Override this if your implementation doesn't follow the standard naming convention
+     * of having nested classes with the same names as [ViaductSchema]'s nested interfaces.
      */
     open val classes: Map<String, KClass<*>> =
         run {
@@ -69,11 +114,17 @@ abstract class ViaductSchemaSubtypeContract {
 
     @Test
     @EnabledIf("noMissingClasses")
-    fun `args of HasArgs are of the expected subtype`() {
-        assertIsSubtype(returnType("HasArgs.args").elementType(), "Arg") // args: Iterable<Args>
+    fun `args of Field are of the expected subtype`() {
+        assertIsSubtype(returnType("Field.args").elementType(), "Arg") // args: Iterable<Args>
     }
 
-    // From BridgeSchema
+    @Test
+    @EnabledIf("noMissingClasses")
+    fun `args of Directive are of the expected subtype`() {
+        assertIsSubtype(returnType("Directive.args").elementType(), "Arg") // args: Iterable<Args>
+    }
+
+    // From ViaductSchema
 
     @Test
     @EnabledIf("noMissingClasses")
@@ -108,18 +159,17 @@ abstract class ViaductSchemaSubtypeContract {
     @Test
     @EnabledIf("noMissingClasses")
     fun `Def class hierarchy is correct`() {
-        assertIsSubtype("Directive", "Def")
+        assertIsSubtype("TopLevelDef", "Def")
+        assertIsSubtype("Directive", "TopLevelDef")
+        assertIsSubtype("TypeDef", "TopLevelDef")
+
         assertIsSubtype("EnumValue", "Def")
-        assertIsSubtype("HasArgs", "Def")
+        assertIsSubtype("Field", "Def")
         assertIsSubtype("HasDefaultValue", "Def")
-        assertIsSubtype("TypeDef", "Def")
 
         assertIsSubtype("DirectiveArg", "HasDefaultValue")
         assertIsSubtype("FieldArg", "HasDefaultValue")
         assertIsSubtype("Field", "HasDefaultValue")
-
-        assertIsSubtype("Directive", "HasArgs")
-        assertIsSubtype("Field", "HasArgs")
 
         assertIsSubtype("DirectiveArg", "Arg")
         assertIsSubtype("FieldArg", "Arg")
@@ -228,17 +278,17 @@ abstract class ViaductSchemaSubtypeContract {
             assertIsSubtype(it.returnType, "Field", nullable = isNullable)
         }
 
-        assertIsSubtype(returnType("Record.supers").elementType(), "Interface") // supers: Iterable<Interface>
-        assertIsSubtype(returnType("Record.unions").elementType(), "Union") // unions: Iterable<Unions>
+        assertIsSubtype(returnType("OutputRecord.supers").elementType(), "Interface") // supers: Iterable<Interface>
+        assertIsSubtype(returnType("Object.unions").elementType(), "Union") // unions: Iterable<Union>
     }
 
     @Test
     @EnabledIf("noMissingClasses")
-    fun `elements of Record_supers are of the expected subtype`() = assertIsSubtype(returnType("Record.supers").elementType(), "Interface") // supers: Iterable<Interface>
+    fun `elements of OutputRecord_supers are of the expected subtype`() = assertIsSubtype(returnType("OutputRecord.supers").elementType(), "Interface") // supers: Iterable<Interface>
 
     @Test
     @EnabledIf("noMissingClasses")
-    fun `elements of Record_unions are of the expected subtype`() = assertIsSubtype(returnType("Record.unions").elementType(), "Union") // unions: Iterable<Union>
+    fun `elements of Object_unions are of the expected subtype`() = assertIsSubtype(returnType("Object.unions").elementType(), "Union") // unions: Iterable<Union>
 
     // None from Scalar
 
@@ -256,13 +306,52 @@ abstract class ViaductSchemaSubtypeContract {
 
     @Test
     @EnabledIf("noMissingClasses")
-    fun `baseTypeDef of TypeExpr is expected subtype`() = assertIsSubtype(returnType("TypeExpr.baseTypeDef"), "TypeDef")
+    fun `baseTypeDef of TypeExpr is expected subtype`() {
+        // When TypeExpr is shared from ViaductSchema, its baseTypeDef returns ViaductSchema.TypeDef,
+        // not the schema-specific TypeDef. Skip this test in that case.
+        if (classes["TypeExpr"] == ViaductSchema.TypeExpr::class) return
+        assertIsSubtype(returnType("TypeExpr.baseTypeDef"), "TypeDef")
+    }
 
     // From Union
 
     @Test
     @EnabledIf("noMissingClasses")
     fun `Union extensions have the expected subtype of Extension`() = assertExtensionsSubtypes("Union", "Object")
+
+    // From containingSchema
+
+    @Test
+    @EnabledIf("noMissingClasses")
+    fun `containingSchema of Directive returns schema implementation type`() = assertIsSubtype(returnType("Directive.containingSchema"), getSchemaClass().starProjectedType)
+
+    @Test
+    @EnabledIf("noMissingClasses")
+    fun `containingSchema of TypeDef returns schema implementation type`() = assertIsSubtype(returnType("TypeDef.containingSchema"), getSchemaClass().starProjectedType)
+
+    @Test
+    @EnabledIf("noMissingClasses")
+    fun `containingSchema of Scalar returns schema implementation type`() = assertIsSubtype(returnType("Scalar.containingSchema"), getSchemaClass().starProjectedType)
+
+    @Test
+    @EnabledIf("noMissingClasses")
+    fun `containingSchema of Enum returns schema implementation type`() = assertIsSubtype(returnType("Enum.containingSchema"), getSchemaClass().starProjectedType)
+
+    @Test
+    @EnabledIf("noMissingClasses")
+    fun `containingSchema of Union returns schema implementation type`() = assertIsSubtype(returnType("Union.containingSchema"), getSchemaClass().starProjectedType)
+
+    @Test
+    @EnabledIf("noMissingClasses")
+    fun `containingSchema of Interface returns schema implementation type`() = assertIsSubtype(returnType("Interface.containingSchema"), getSchemaClass().starProjectedType)
+
+    @Test
+    @EnabledIf("noMissingClasses")
+    fun `containingSchema of Object returns schema implementation type`() = assertIsSubtype(returnType("Object.containingSchema"), getSchemaClass().starProjectedType)
+
+    @Test
+    @EnabledIf("noMissingClasses")
+    fun `containingSchema of Input returns schema implementation type`() = assertIsSubtype(returnType("Input.containingSchema"), getSchemaClass().starProjectedType)
 
     companion object {
         val MANDATORY_CLASS_NAMES =
@@ -275,15 +364,15 @@ abstract class ViaductSchemaSubtypeContract {
                 "Enum",
                 "EnumValue",
                 "Field",
-                "HasArgs",
                 "HasDefaultValue",
                 "Input",
                 "Interface",
                 "Object",
+                "OutputRecord",
                 "Record",
                 "Scalar",
+                "TopLevelDef",
                 "TypeDef",
-                "TypeExpr",
                 "Union"
             )
         val OPTIONAL_CLASS_NAMES =
@@ -291,8 +380,7 @@ abstract class ViaductSchemaSubtypeContract {
                 "AppliedDirective",
                 "Extension",
                 "ExtensionWithSupers",
-                "HasExtensions",
-                "HasExtensionsWithSupers"
+                "TypeExpr"
             )
 
         fun KType.elementType() =

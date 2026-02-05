@@ -10,15 +10,18 @@ package conventions
 //
 
 import kotlinx.validation.ApiValidationExtension
+import io.gitlab.arturbosch.detekt.Detekt
+import viaduct.gradle.internal.repoRoot
 
 plugins {
     id("org.jetbrains.kotlinx.binary-compatibility-validator")
 }
 
 configure<ApiValidationExtension> {
-    nonPublicMarkers.add("viaduct.InternalApi")
-    nonPublicMarkers.add("viaduct.TestingApi")
-    nonPublicMarkers.add("viaduct.ExperimentalApi")
+    publicMarkers.add("viaduct.apiannotations.StableApi")
+    nonPublicMarkers.add("viaduct.apiannotations.ExperimentalApi")
+    nonPublicMarkers.add("viaduct.apiannotations.InternalApi")
+    nonPublicMarkers.add("viaduct.apiannotations.TestingApi")
 }
 
 // We need to control apiCheck execution
@@ -35,4 +38,10 @@ tasks.named("check").configure {
 
     dependsOn.clear()
     dependsOn.addAll(filteredDependsOn)
+}
+
+pluginManager.withPlugin("io.gitlab.arturbosch.detekt") {
+    tasks.withType(Detekt::class.java).configureEach {
+        config.from(files(repoRoot().file("detekt-viaduct-bcv.yml")))
+    }
 }

@@ -5,6 +5,7 @@ import io.kotest.assertions.withClue
 import io.kotest.matchers.shouldBe
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
+import viaduct.graphql.schema.SchemaWithData
 import viaduct.graphql.schema.ViaductSchema
 import viaduct.graphql.schema.parseWrappers
 import viaduct.graphql.schema.unparseWrappers
@@ -51,17 +52,17 @@ class TypeExprTests {
         type Query { foo: T2 }
     """
 
-    private val schema = GJSchema.fromRegistry(readTypes(TEST_SCHEMA))
+    private val schema = gjSchemaFromRegistry(readTypes(TEST_SCHEMA))
 
     private fun tex(f: String): String = field(f).unparseWrappers()
 
-    private fun type(name: String): ViaductSchema.TypeExpr = schema.types[name]!!.asTypeExpr()
+    private fun type(name: String): ViaductSchema.TypeExpr<*> = schema.types[name]!!.asTypeExpr()
 
-    private fun field(f: String): ViaductSchema.TypeExpr {
+    private fun field(f: String): ViaductSchema.TypeExpr<*> {
         val coords = f.split('.')
         val tname: String = coords[0]
         val fname: String = coords[1]
-        val tdef = schema.types[tname] as GJSchema.Record
+        val tdef = schema.types[tname] as SchemaWithData.Record
         return tdef.field(fname)!!.type
     }
 
@@ -85,7 +86,7 @@ class TypeExprTests {
      * assert that a TypeExpr has nullableAtDepth values that match the indexed
      * expected values
      */
-    private fun ViaductSchema.TypeExpr.assertNullableAtDepth(vararg expected: Boolean) {
+    private fun ViaductSchema.TypeExpr<*>.assertNullableAtDepth(vararg expected: Boolean) {
         assertThrows(IllegalArgumentException::class.java) { this.nullableAtDepth(-1) }
         expected.forEachIndexed { i, expect ->
             withClue("${this.unparseWrappers()}@$i") {

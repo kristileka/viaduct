@@ -6,10 +6,10 @@ import com.google.inject.Guice
 import com.google.inject.Inject
 import com.google.inject.Injector
 import com.google.inject.ProvisionException
-import graphql.ExecutionResult
-import graphql.ExecutionResultImpl
+import graphql.ExecutionResult as GJExecutionResult
+import graphql.ExecutionResultImpl as GJExecutionResultImpl
 import graphql.GraphQL
-import graphql.GraphQLError
+import graphql.GraphQLError as GJGraphQLError
 import graphql.GraphqlErrorBuilder
 import graphql.execution.DataFetcherExceptionHandler
 import graphql.execution.instrumentation.Instrumentation
@@ -23,7 +23,6 @@ import viaduct.engine.EngineConfiguration
 import viaduct.engine.EngineImpl
 import viaduct.engine.api.CheckerExecutorFactory
 import viaduct.engine.api.EngineExecutionContext
-import viaduct.engine.api.FragmentLoader
 import viaduct.engine.api.GraphQLBuildError
 import viaduct.engine.api.TemporaryBypassAccessCheck
 import viaduct.engine.api.TenantModuleBootstrapper
@@ -37,6 +36,7 @@ import viaduct.engine.runtime.execution.ViaductDataFetcherExceptionHandler
 import viaduct.engine.runtime.tenantloading.DispatcherRegistryFactory
 import viaduct.engine.runtime.tenantloading.RequiredSelectionsAreInvalid
 import viaduct.service.api.ExecutionInput
+import viaduct.service.api.ExecutionResult
 import viaduct.service.api.SchemaId
 import viaduct.service.api.Viaduct
 import viaduct.service.api.spi.ErrorReporter
@@ -87,7 +87,6 @@ class StandardViaduct
 
         class Builder {
             private var airbnbModeEnabled: Boolean = false
-            private var fragmentLoader: FragmentLoader? = null
             private var instrumentation: Instrumentation? = null
             private var flagManager: FlagManager? = null
             private var checkerExecutorFactory: CheckerExecutorFactory? = null
@@ -109,12 +108,8 @@ class StandardViaduct
             private var allowSubscriptions: Boolean = false
             private var globalIDCodec: GlobalIDCodec? = null
 
-            fun enableAirbnbBypassDoNotUse(
-                fragmentLoader: FragmentLoader,
-                tenantNameResolver: TenantNameResolver,
-            ): Builder =
+            fun enableAirbnbBypassDoNotUse(tenantNameResolver: TenantNameResolver,): Builder =
                 apply {
-                    this.fragmentLoader = fragmentLoader
                     this.tenantNameResolver = tenantNameResolver
                     this.airbnbModeEnabled = true
                 }
@@ -264,7 +259,6 @@ class StandardViaduct
                     val finalResolverErrorBuilder = builder.resolverErrorBuilder ?: resolverErrorBuilder
                     copy(
                         coroutineInterop = builder.coroutineInterop ?: coroutineInterop,
-                        fragmentLoader = builder.fragmentLoader ?: fragmentLoader,
                         flagManager = builder.flagManager ?: flagManager,
                         temporaryBypassAccessCheck = builder.temporaryBypassAccessCheck ?: temporaryBypassAccessCheck,
                         resolverErrorReporter = finalResolverErrorReporter,
@@ -369,13 +363,14 @@ class StandardViaduct
         }
 
         private fun mkSchemaNotFoundError(schemaId: SchemaId): CompletableFuture<ExecutionResult> {
-            val error: GraphQLError = GraphqlErrorBuilder.newError()
+            val error: GJGraphQLError = GraphqlErrorBuilder.newError()
                 .message("Schema not found for schemaId=$schemaId")
                 .build()
             return CompletableFuture.completedFuture(
-                ExecutionResultImpl.newExecutionResult()
+                GJExecutionResultImpl.newExecutionResult()
                     .addError(error)
                     .build()
+                    .toExecutionResult()
             )
         }
 
@@ -398,7 +393,7 @@ class StandardViaduct
             }
             return coroutineInterop.enterThreadLocalCoroutineContext(coroutineContext) {
                 val executionResult = engine.execute(executionInput.toEngineExecutionInput())
-                sortExecutionResult(executionResult)
+                sortExecutionResult(executionResult).toExecutionResult()
             }
         }
 
@@ -408,7 +403,7 @@ class StandardViaduct
          *
          * @param executionInput the [ExecutionInput] to execute
          * @param schemaId the id of the schema for which we want to execute the operation. Defaults to the full schema.
-         * @return [CompletableFuture] of sorted [ExecutionResult]
+         * @return sorted [ExecutionResult]
          */
         override fun execute(
             executionInput: ExecutionInput,
@@ -438,13 +433,13 @@ class StandardViaduct
          *
          * Internal for Testing
          */
-        internal fun sortExecutionResult(executionResult: ExecutionResult): ExecutionResult {
-            val sortedErrors: List<GraphQLError> =
+        internal fun sortExecutionResult(executionResult: GJExecutionResult): GJExecutionResult {
+            val sortedErrors: List<GJGraphQLError> =
                 executionResult.errors.sortedWith(
                     compareBy({ it.path?.joinToString(separator = ".") ?: "" }, { it.message })
                 )
 
-            return ExecutionResultImpl(
+            return GJExecutionResultImpl(
                 executionResult.getData(),
                 sortedErrors,
                 executionResult.extensions

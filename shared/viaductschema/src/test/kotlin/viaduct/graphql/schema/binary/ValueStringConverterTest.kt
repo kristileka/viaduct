@@ -1,15 +1,6 @@
 package viaduct.graphql.schema.binary
 
-import graphql.language.ArrayValue
-import graphql.language.BooleanValue
-import graphql.language.EnumValue
-import graphql.language.FloatValue
-import graphql.language.IntValue
-import graphql.language.ObjectValue
-import graphql.language.StringValue
 import graphql.schema.idl.SchemaParser
-import java.math.BigDecimal
-import java.math.BigInteger
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
@@ -17,7 +8,7 @@ import org.junit.jupiter.params.ParameterizedTest
 import org.junit.jupiter.params.provider.CsvSource
 import org.junit.jupiter.params.provider.ValueSource
 import viaduct.graphql.schema.ViaductSchema
-import viaduct.graphql.schema.graphqljava.GJSchemaRaw
+import viaduct.graphql.schema.graphqljava.extensions.fromTypeDefinitionRegistry
 
 /**
  * Tests for ValueStringConverter using round-trip testing.
@@ -72,7 +63,7 @@ class ValueStringConverterTest {
 
     private val schema by lazy {
         val tdr = SchemaParser().parse(testSchema)
-        GJSchemaRaw.fromRegistry(tdr)
+        ViaductSchema.fromTypeDefinitionRegistry(tdr)
     }
 
     /**
@@ -147,7 +138,7 @@ class ValueStringConverterTest {
     @Test
     fun `Long - positive from IntValue`() {
         // Long can be represented as IntValue in literals
-        val value = IntValue(BigInteger("9223372036854775807"))
+        val value = ViaductSchema.IntLiteral.of("9223372036854775807")
         val result = ValueStringConverter.simpleValueToString(value)
         assertEquals("${K_INT_VALUE.toChar()}9223372036854775807", result)
     }
@@ -166,10 +157,10 @@ class ValueStringConverterTest {
     @CsvSource(
         "3.14, 3.14",
         "-2.5, -2.5",
-        "1.5E10, 1.5E+10", // BigDecimal normalizes: adds + for positive exponents
-        "2.5E-3, 0.0025", // BigDecimal normalizes: expands small exponentials
+        "1.5E10, 1.5E10", // ViaductSchema.FloatLiteral preserves literal as-is
+        "2.5E-3, 2.5E-3", // ViaductSchema.FloatLiteral preserves literal as-is
         "0.0, 0.0",
-        "42, 42"
+        "42.0, 42.0" // GraphQL float literals must have decimal point or exponent
     )
     fun `Float round-trip`(
         input: String,
@@ -250,8 +241,6 @@ class ValueStringConverterTest {
 
     @Test
     fun `Error - invalid boolean value`() {
-        val typeDef = schema.types["Boolean"]!!
-
         assertThrows<IllegalArgumentException> {
             ValueStringConverter.stringToSimpleValue("True")
         }
@@ -292,22 +281,22 @@ class ValueStringConverterTest {
 
     @Test
     fun `EnumValue encodes with kind code`() {
-        val value = EnumValue("VALUE")
+        val value = ViaductSchema.EnumLit.of("VALUE")
         val result = ValueStringConverter.simpleValueToString(value)
         assertEquals("${K_ENUM_VALUE.toChar()}VALUE", result)
     }
 
     @Test
-    fun `Error - Unsupported Value type (ArrayValue)`() {
-        val arrayValue = ArrayValue(listOf(StringValue("test")))
+    fun `Error - Unsupported Value type (ListValue)`() {
+        val listValue = ViaductSchema.ListLiteral.of(listOf(ViaductSchema.StringLiteral.of("test")))
         assertThrows<IllegalArgumentException> {
-            ValueStringConverter.simpleValueToString(arrayValue)
+            ValueStringConverter.simpleValueToString(listValue)
         }
     }
 
     @Test
     fun `Error - Unsupported Value type (ObjectValue)`() {
-        val objectValue = ObjectValue(emptyList())
+        val objectValue = ViaductSchema.ObjectLiteral.of(emptyMap())
         assertThrows<IllegalArgumentException> {
             ValueStringConverter.simpleValueToString(objectValue)
         }
@@ -315,28 +304,27 @@ class ValueStringConverterTest {
 
     @Test
     fun `BooleanValue encodes with kind code`() {
-        val value = BooleanValue(true)
-        val result = ValueStringConverter.simpleValueToString(value)
+        val result = ValueStringConverter.simpleValueToString(ViaductSchema.TRUE)
         assertEquals("${K_BOOLEAN_VALUE.toChar()}true", result)
     }
 
     @Test
     fun `IntValue encodes with kind code`() {
-        val value = IntValue(BigInteger("42"))
+        val value = ViaductSchema.IntLiteral.of("42")
         val result = ValueStringConverter.simpleValueToString(value)
         assertEquals("${K_INT_VALUE.toChar()}42", result)
     }
 
     @Test
     fun `FloatValue encodes with kind code`() {
-        val value = FloatValue(BigDecimal("3.14"))
+        val value = ViaductSchema.FloatLiteral.of("3.14")
         val result = ValueStringConverter.simpleValueToString(value)
         assertEquals("${K_FLOAT_VALUE.toChar()}3.14", result)
     }
 
     @Test
     fun `StringValue encodes with kind code`() {
-        val value = StringValue("true")
+        val value = ViaductSchema.StringLiteral.of("true")
         val result = ValueStringConverter.simpleValueToString(value)
         assertEquals("${K_STRING_VALUE.toChar()}true", result)
     }
@@ -371,13 +359,13 @@ class ValueStringConverterTest {
     @Test
     fun `String kind code decodes to StringValue`() {
         val value = ValueStringConverter.stringToSimpleValue("${K_STRING_VALUE.toChar()}some-value")
-        assertEquals(StringValue::class.java, value.javaClass)
-        assertEquals("some-value", (value as StringValue).value)
+        assertEquals(ViaductSchema.StringLiteral::class.java, value.javaClass)
+        assertEquals("some-value", (value as ViaductSchema.StringLiteral).value)
     }
 
     @Test
-    fun `StringValue with null content becomes empty string`() {
-        val value = StringValue(null)
+    fun `StringValue with empty content`() {
+        val value = ViaductSchema.StringLiteral.of("")
         val result = ValueStringConverter.simpleValueToString(value)
         assertEquals("${K_STRING_VALUE.toChar()}", result)
     }
@@ -386,10 +374,10 @@ class ValueStringConverterTest {
     fun `Boolean parsing - explicit true and false`() {
         val kb = K_BOOLEAN_VALUE.toChar()
         val trueValue = ValueStringConverter.stringToSimpleValue("${kb}true")
-        assertEquals(true, (trueValue as BooleanValue).isValue)
+        assertEquals(ViaductSchema.TRUE, trueValue)
 
         val falseValue = ValueStringConverter.stringToSimpleValue("${kb}false")
-        assertEquals(false, (falseValue as BooleanValue).isValue)
+        assertEquals(ViaductSchema.FALSE, falseValue)
     }
 
     @Test

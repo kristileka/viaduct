@@ -20,7 +20,6 @@ import viaduct.api.internal.ObjectBaseTestHelpers
 import viaduct.api.internal.ResolverBase
 import viaduct.api.internal.internal
 import viaduct.api.internal.select.SelectionSetFactory
-import viaduct.api.internal.select.SelectionsLoader
 import viaduct.api.mocks.MockExecutionContext
 import viaduct.api.mocks.MockFieldExecutionContext
 import viaduct.api.mocks.MockInternalContext
@@ -37,14 +36,11 @@ import viaduct.api.types.NodeObject
 import viaduct.api.types.Object
 import viaduct.api.types.Query
 import viaduct.apiannotations.TestingApi
-import viaduct.engine.api.FragmentLoader
 import viaduct.engine.api.ViaductSchema
-import viaduct.engine.runtime.RawSelectionsLoaderImpl
 import viaduct.engine.runtime.select.RawSelectionSetFactoryImpl
 import viaduct.service.api.spi.globalid.GlobalIDCodecDefault
 import viaduct.tenant.runtime.select.SelectionSetFactoryImpl
 import viaduct.tenant.runtime.select.SelectionSetImpl
-import viaduct.tenant.runtime.select.SelectionsLoaderImpl
 
 /**
  * Base class for Viaduct resolver tests. Use [runFieldResolver] for non-mutation resolvers
@@ -55,48 +51,76 @@ import viaduct.tenant.runtime.select.SelectionsLoaderImpl
  * dependency injection frameworks. Subclasses should provide their own injector
  * integration as needed.
  *
- * ## Integration
+ * ## Deprecation Notice
  *
- * Users need to provide a ViaductSchema implementation via [getSchema]
+ * **This API is deprecated.** Please migrate to the new type-safe testing API in
+ * `viaduct.api.testing` package, which provides:
+ * - **Explicit type parameters**: No reflection-based type inference
+ * - **Factory pattern**: No inheritance required
+ * - **API-only dependencies**: No runtime module dependencies
  *
- * For the schema, you can either:
- * - Load from a GraphQL schema file using ViaductSchemaGenerator.makeUnexecutableSchema()
+ * ### Migration Guide
  *
- * Example subclass:
-
- *    class MyResolverTestBase : ResolverTestBase() {
- *        override val selectionsLoaderFactory by lazy {
- *            mkSelectionsLoaderFactory()
- *        }
+ * **Old API (deprecated):**
+ * ```kotlin
+ * class MyResolverTest : DefaultAbstractResolverTestBase() {
+ *     override fun getSchema() = mySchema
  *
- *        override val context: ExecutionContext by lazy {
- *            ResolverExecutionContextImpl(
- *               mkInternalContext(),
- *               queryLoader = mkQueryLoader(),
- *               selectionSetFactory = mkSelectionSetFactory(),
- *               nodeReferenceFactory = mkNodeReferenceFactory()
- *           )
- *        }
+ *     @Test
+ *     fun test() = runBlocking {
+ *         val result = runFieldResolver(
+ *             resolver = MyResolver(),
+ *             objectValue = myObject,
+ *             arguments = myArgs
+ *         )
+ *         assertEquals(expected, result)
+ *     }
+ * }
+ * ```
  *
- *        override fun getSchema(): ViaductSchema = myTestSchema
- *        override fun getFragmentLoader(): FragmentLoader = myMockFragmentLoader
- *    }
+ * **New API:**
+ * ```kotlin
+ * class MyResolverTest {
+ *     private val tester = FieldResolverTester.create<
+ *         MyObject,           // Object type (T)
+ *         Query,              // Query type (Q)
+ *         MyArguments,        // Arguments type (A)
+ *         MyOutput            // Output type (O)
+ *     >(
+ *         ResolverTester.TesterConfig(schemaSDL = MY_SCHEMA_SDL)
+ *     )
  *
- * Example usage:
+ *     @Test
+ *     fun test() = runBlocking {
+ *         val result = tester.test(MyResolver()) {
+ *             objectValue = myObject
+ *             arguments = myArgs
+ *         }
+ *         assertEquals(expected, result)
+ *     }
+ * }
+ * ```
  *
- *    // Mock the required selection set result
- *    val objectValue = Wishlist.Builder(context)
- *       .internalName("Hawaii")
- *       .namePhrase(null)
- *       .build()
+ * ### Migration by Resolver Type
  *
- *    val result = runFieldResolver(
- *       resolver,
- *       objectValue,
- *       Wishlist_Name_Arguments(...)
- *    )
- *    assertEquals("Hawaii", result)
+ * | Old Method                | New Tester                    |
+ * |---------------------------|-------------------------------|
+ * | `runFieldResolver()`      | `FieldResolverTester.test()`  |
+ * | `runFieldBatchResolver()` | `FieldResolverTester.testBatch()` |
+ * | `runMutationFieldResolver()` | `MutationResolverTester.test()` |
+ * | `runNodeResolver()`       | `NodeResolverTester.test()`   |
+ * | `runNodeBatchResolver()`  | `NodeResolverTester.testBatch()` |
+ *
+ * @see viaduct.api.testing.FieldResolverTester
+ * @see viaduct.api.testing.MutationResolverTester
+ * @see viaduct.api.testing.NodeResolverTester
+ * @see viaduct.api.testing.ResolverTester.TesterConfig
  */
+@Deprecated(
+    message = "ResolverTestBase interface is deprecated. Use the new type-safe testing API in viaduct.api.testing package. " +
+        "See FieldResolverTester, MutationResolverTester, or NodeResolverTester for the new API.",
+    level = DeprecationLevel.WARNING
+)
 @OptIn(TestingApi::class)
 interface ResolverTestBase {
     /**
@@ -111,14 +135,6 @@ interface ResolverTestBase {
      * to load the schema in their preferred way (e.g., from resources, test data, etc.)
      */
     fun getSchema(): ViaductSchema
-
-    /**
-     * Subclasses must provide a FragmentLoader instance. This allows different implementations
-     * to integrate with their dependency injection framework.
-     */
-    fun getFragmentLoader(): FragmentLoader = mockk()
-
-    val selectionsLoaderFactory: SelectionsLoader.Factory
 
     val ossSelectionSetFactory: SelectionSetFactory
 
@@ -393,14 +409,14 @@ interface ResolverTestBase {
     }
 
     fun ResolverTestBase.createMutationFieldResolverContext(
-        ctxKClass: KClass<out MutationFieldExecutionContext<*, *, *>>,
+        ctxKClass: KClass<out MutationFieldExecutionContext<*, *, *, *>>,
         queryValue: Query = NullQuery,
         arguments: Arguments = Arguments.NoArguments,
         requestContext: Any? = null,
         selections: SelectionSet<*> = SelectionSet.NoSelections,
         contextQueries: List<Query> = emptyList(),
         contextMutations: List<Mutation> = emptyList()
-    ): MutationFieldExecutionContext<*, *, *> {
+    ): MutationFieldExecutionContext<*, *, *, *> {
         val innerCtx = mkMutationFieldExecutionContext(
             queryValue,
             arguments,
@@ -418,14 +434,6 @@ interface ResolverTestBase {
         val internal = MockInternalContext(getSchema(), GlobalIDCodecDefault, rl)
         return MockExecutionContext(internal)
     }
-
-    fun mkSelectionsLoaderFactory(): SelectionsLoader.Factory =
-        SelectionsLoaderImpl.Factory(
-            RawSelectionsLoaderImpl.Factory(
-                getFragmentLoader(),
-                getSchema()
-            )
-        )
 
     fun mkSelectionSetFactory(): SelectionSetFactory =
         SelectionSetFactoryImpl(
@@ -500,7 +508,7 @@ private inline fun <T, reified C : Any> getResolverContextKClass(resolver: Resol
 
 private fun <T> getFieldResolverContextKClass(resolver: ResolverBase<T>): KClass<out FieldExecutionContext<*, *, *, *>> = getResolverContextKClass(resolver)
 
-private fun <T> getMutationFieldResolverContextKClass(resolver: ResolverBase<T>): KClass<out MutationFieldExecutionContext<*, *, *>> = getResolverContextKClass(resolver)
+private fun <T> getMutationFieldResolverContextKClass(resolver: ResolverBase<T>): KClass<out MutationFieldExecutionContext<*, *, *, *>> = getResolverContextKClass(resolver)
 
 /**
  * Creates a Context class for a specific node resolver. We suggest using [runNodeResolver] to test the
@@ -559,6 +567,7 @@ private fun ResolverTestBase.mkFieldExecutionContext(
     )
 }
 
+@Suppress("UNCHECKED_CAST")
 private fun ResolverTestBase.mkMutationFieldExecutionContext(
     queryValue: Query,
     arguments: Arguments,
@@ -566,16 +575,16 @@ private fun ResolverTestBase.mkMutationFieldExecutionContext(
     selections: SelectionSet<*>,
     contextQueryValues: List<Query> = emptyList(),
     contextMutationValues: List<Mutation> = emptyList()
-): MutationFieldExecutionContext<*, *, *> {
+): MutationFieldExecutionContext<*, *, *, *> {
     val internalContext = context.internal
     val queryResultsMap = buildContextQueryMap(contextQueryValues)
     val mutationResultsMap = buildContextMutationMap(contextMutationValues)
 
-    return MockMutationFieldExecutionContext(
+    return MockMutationFieldExecutionContext<Query, Mutation, Arguments, CompositeOutput>(
         queryValue = queryValue,
         arguments = arguments,
         requestContext = requestContext,
-        selectionsValue = selections,
+        selectionsValue = selections as SelectionSet<CompositeOutput>,
         internalContext = internalContext,
         queryResults = queryResultsMap,
         mutationResults = mutationResultsMap,

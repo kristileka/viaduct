@@ -1,5 +1,6 @@
 package viaduct.tenant.codegen.bytecode.testschema
 
+import graphql.schema.idl.SchemaParser
 import graphql.schema.idl.UnExecutableSchemaGenerator
 import java.io.File
 import kotlin.test.assertFalse
@@ -11,7 +12,8 @@ import org.junit.jupiter.params.provider.Arguments
 import org.junit.jupiter.params.provider.MethodSource
 import viaduct.codegen.utils.JavaName
 import viaduct.engine.api.ViaductSchema
-import viaduct.graphql.schema.graphqljava.GJSchemaRaw
+import viaduct.graphql.schema.ViaductSchema as ViaductGraphQLSchema
+import viaduct.graphql.schema.graphqljava.extensions.fromTypeDefinitionRegistry
 import viaduct.graphql.schema.graphqljava.readTypes
 import viaduct.graphql.utils.DefaultSchemaProvider
 import viaduct.invariants.InvariantChecker
@@ -93,9 +95,16 @@ class ParameterizedSchemaDrivenTests {
     ) {
         reflectionDrivenExercisesV2(schemaName, schemaFiles) { failures ->
             assertFalse(failures.isEmpty, "Expected failures for invalid schema '$schemaName', but found none.")
+            // Accept either graphql-java SchemaProblem or GJSchemaRaw type-not-found error.
+            // The schema has two undefined types: NonExistentProfileType and UndefinedSettingsType
+            val details = failures.toList().map { f -> f.details }
             assertTrue(
-                failures.toList().map { f -> f.details }
-                    .any { it?.contains("SchemaProblem{errors=[The field type 'NonExistentProfileType' is not present when resolving type 'UserWithInvalidField'") == true }
+                details.any {
+                    it?.contains("SchemaProblem{errors=[The field type 'NonExistentProfileType' is not present when resolving type 'UserWithInvalidField'") == true ||
+                        it?.contains("Type not found: NonExistentProfileType") == true ||
+                        it?.contains("Type not found: UndefinedSettingsType") == true
+                },
+                "Expected error about undefined type, but found: $details"
             )
         }
     }
@@ -119,7 +128,7 @@ class ParameterizedSchemaDrivenTests {
             val userSdl = schemaFiles.joinToString("\n") { it.readText() }
             val sdl = userSdl + "\n" + defaultSdl
 
-            val schema = GJSchemaRaw.fromSDL(sdl)
+            val schema = ViaductGraphQLSchema.fromTypeDefinitionRegistry(SchemaParser().parse(sdl))
             val graphqlSchema = ViaductSchema(UnExecutableSchemaGenerator.makeUnExecutableSchema(readTypes(sdl)))
 
             val args = CodeGenArgs(

@@ -16,7 +16,7 @@ import viaduct.utils.collections.BitVector
  *  means a not-nullable list of nullable elements, each
  *  element, if not null, is itself a list of non-null
  *  elements having the bast-type as their type. */
-fun ViaductSchema.TypeExpr.unparseWrappers(): String {
+fun <T : ViaductSchema.TypeDef> ViaductSchema.TypeExpr<T>.unparseWrappers(): String {
     val result = StringBuilder()
     for (i in 0 until listDepth) {
         result.append(if (nullableAtDepth(i)) '?' else '!')
@@ -36,7 +36,7 @@ fun ViaductSchema.TypeExpr.unparseWrappers(): String {
  *  zero) and whose elements reflect the nullability at
  *  each listing depth (where element '0' is the
  *  outermost list-wrapper). */
-fun parseWrappers(wrappers: String): BitVector {
+internal fun parseWrappers(wrappers: String): BitVector {
     val sz = wrappers.length
     if (sz == 0) throw IllegalArgumentException("At least wrapper needed for basetype ($wrappers).")
     val baseWrapper = wrappers[sz - 1]
@@ -53,4 +53,20 @@ fun parseWrappers(wrappers: String): BitVector {
         }
     }
     return result
+}
+
+/**
+ * Extension function to create a TypeExpr from wrapper string notation.
+ * This is the inverse of [unparseWrappers].
+ */
+fun ViaductSchema.toTypeExpr(
+    wrappers: String,
+    baseString: String
+): ViaductSchema.TypeExpr<ViaductSchema.TypeDef> {
+    val baseTypeDef = requireNotNull(this.types[baseString]) {
+        "Type not found: $baseString"
+    }
+    val listNullable = parseWrappers(wrappers)
+    val baseNullable = (wrappers.last() == '?')
+    return ViaductSchema.TypeExpr(baseTypeDef, baseNullable, listNullable)
 }

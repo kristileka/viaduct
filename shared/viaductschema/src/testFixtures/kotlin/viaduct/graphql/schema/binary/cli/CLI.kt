@@ -35,12 +35,13 @@ import java.util.function.BiPredicate
 import kotlin.streams.toList
 import kotlin.system.measureTimeMillis
 import org.slf4j.LoggerFactory
+import viaduct.graphql.schema.SchemaWithData
 import viaduct.graphql.schema.ViaductSchema
-import viaduct.graphql.schema.binary.readBSchema
-import viaduct.graphql.schema.binary.writeBSchema
-import viaduct.graphql.schema.checkBridgeSchemaInvariants
-import viaduct.graphql.schema.graphqljava.GJSchema
+import viaduct.graphql.schema.binary.extensions.fromBinaryFile
+import viaduct.graphql.schema.binary.extensions.toBinaryFile
+import viaduct.graphql.schema.checkViaductSchemaInvariants
 import viaduct.graphql.schema.graphqljava.GraphQLSchemaExtraDiff
+import viaduct.graphql.schema.graphqljava.gjSchemaFromRegistry
 import viaduct.graphql.schema.graphqljava.readTypesFromURLs
 import viaduct.graphql.schema.graphqljava.toGraphQLSchema
 import viaduct.graphql.schema.test.SchemaDiff
@@ -86,8 +87,8 @@ private class MmWriteCommand : CliktCommand(
         .required()
 
     override fun run() {
-        val schema = readGJSchema(projectDirectory!!.toPath())
-        writeBSchema(schema, FileOutputStream(System.getProperty("user.home") + "/schema.bgql"))
+        val schema = readGJSchema(projectDirectory.toPath())
+        schema.toBinaryFile(FileOutputStream(System.getProperty("user.home") + "/schema.bgql"))
     }
 }
 
@@ -119,13 +120,14 @@ private class MmLoadTimeCommand : CliktCommand(
         val rt = Runtime.getRuntime()
         rt.gc()
         println("Heap at start (KB): ${(rt.totalMemory() - rt.freeMemory()) / 1024}")
+        @Suppress("ASSIGNED_BUT_NEVER_ACCESSED_VARIABLE") // Intentional: holds reference to prevent GC during benchmark
         var schema: Any?
         repeat(count) {
             val time = measureTimeMillis {
                 schema = if (useBinGQL) {
-                    readBSchema(FileInputStream(System.getProperty("user.home") + "/schema.bgql"))
+                    ViaductSchema.fromBinaryFile(FileInputStream(System.getProperty("user.home") + "/schema.bgql"))
                 } else if (b2g) {
-                    val b = readBSchema(FileInputStream(System.getProperty("user.home") + "/schema.bgql"))
+                    val b = ViaductSchema.fromBinaryFile(FileInputStream(System.getProperty("user.home") + "/schema.bgql"))
                     b.toGraphQLSchema(
                         scalarsNeeded = setOf(/*"Boolean",*/ "Float", "ID", "Int", /*"String"*/),
                         additionalScalars = setOf("BackingData", "Date", "DateTime", "JSON", "Long", "Short", "Time"),
@@ -172,7 +174,7 @@ private class MmAccessTimeCommand : CliktCommand(
 
     override fun run() {
         if (useBinGQL) {
-            runViaductSchema(readBSchema(FileInputStream(System.getProperty("user.home") + "/schema.bgql")))
+            runViaductSchema(ViaductSchema.fromBinaryFile(FileInputStream(System.getProperty("user.home") + "/schema.bgql")))
         } else {
             if (noGJ) {
                 runGraphQLJava(projectDirectory!!)
@@ -349,8 +351,8 @@ private class MmLoadNoGJCommand : CliktCommand(
         println("Heap at start (KB): ${(rt.totalMemory() - rt.freeMemory()) / 1024}")
         var schema: GraphQLSchema?
         repeat(count) {
-            var parseTime = 0L
-            var buildTime = 0L
+            var parseTime: Long
+            var buildTime: Long
             val time = measureTimeMillis {
                 var registry: TypeDefinitionRegistry
                 parseTime = measureTimeMillis {
@@ -392,17 +394,17 @@ private class MmDiffCommand : CliktCommand(
         val checker = InvariantChecker()
 
         // Read input schema (both GJSchema and the underlying registry)
-        val (expected, registry) = readGJSchemaWithRegistry(projectDirectory!!.toPath())
+        val (expected, registry) = readGJSchemaWithRegistry(projectDirectory.toPath())
 
         // Write to binary format
         val binaryFilePath = System.getProperty("user.home") + "/schema.bgql"
-        writeBSchema(expected, FileOutputStream(binaryFilePath))
+        expected.toBinaryFile(FileOutputStream(binaryFilePath))
 
         // Read back from binary format
-        val actual = readBSchema(FileInputStream(binaryFilePath))
+        val actual = ViaductSchema.fromBinaryFile(FileInputStream(binaryFilePath))
 
         // Validate output schema invariants
-        checkBridgeSchemaInvariants(actual, checker)
+        checkViaductSchemaInvariants(actual, checker)
 
         // Compare schemas structurally (reusing same checker)
         SchemaDiff(expected, actual, checker).diff()
@@ -428,11 +430,7 @@ private class MmDiffCommand : CliktCommand(
             )
 
             // Compare using GraphQLSchemaExtraDiff (runtime properties like deprecation, default values)
-            if (actualGraphQLSchema != null) {
-                GraphQLSchemaExtraDiff(expectedGraphQLSchema, actualGraphQLSchema, checker).diff()
-            } else {
-                checker.isTrue(false, "GRAPHQL_SCHEMA_CONVERSION: toGraphQLSchema returned null")
-            }
+            GraphQLSchemaExtraDiff(expectedGraphQLSchema, actualGraphQLSchema, checker).diff()
         } catch (e: Exception) {
             println("Warning: toGraphQLSchema round-trip check skipped due to: ${e.message}")
             println("  (This may occur with schemas using custom directives not fully supported by toGraphQLSchema)")
@@ -448,12 +446,12 @@ private class MmDiffCommand : CliktCommand(
     }
 }
 
-private fun readGJSchema(inputPath: Path): GJSchema {
+private fun readGJSchema(inputPath: Path): SchemaWithData {
     val (schema, _) = readGJSchemaWithRegistry(inputPath)
     return schema
 }
 
-private fun readGJSchemaWithRegistry(inputPath: Path): Pair<GJSchema, TypeDefinitionRegistry> {
+private fun readGJSchemaWithRegistry(inputPath: Path): Pair<SchemaWithData, TypeDefinitionRegistry> {
     val reader =
         MultiSourceReader.newMultiSourceReader().apply {
             viaductFiles(inputPath).forEach {
@@ -466,7 +464,7 @@ private fun readGJSchemaWithRegistry(inputPath: Path): Pair<GJSchema, TypeDefini
     val registry = SchemaParser().parse(reader).apply {
         DefaultSchemaProvider.addDefaults(this, allowExisting = true)
     }
-    return GJSchema.fromRegistry(registry) to registry
+    return gjSchemaFromRegistry(registry) to registry
 }
 
 private fun viaductFiles(inputPath: Path): List<URL> = Files.find(inputPath, 100, viaductFilter).map { it.toUri().toURL() }.toList()

@@ -1,0 +1,260 @@
+public final class viaduct/api/ExceptionsKt {
+	public static final fun wrapResolveException (Ljava/lang/String;Lkotlin/jvm/functions/Function1;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+}
+
+public final class viaduct/api/FetchUtilsKt {
+	public static final fun fetchOrDefault (Ljava/lang/Object;Lkotlin/jvm/functions/Function1;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+	public static final fun fetchOrNull (Lkotlin/jvm/functions/Function1;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+}
+
+public abstract interface class viaduct/api/FieldValue {
+	public static final field Companion Lviaduct/api/FieldValue$Companion;
+	public abstract fun get ()Ljava/lang/Object;
+	public abstract fun isError ()Z
+}
+
+public final class viaduct/api/FieldValue$Companion {
+	public final fun ofError (Ljava/lang/Exception;)Lviaduct/api/FieldValue;
+	public final fun ofValue (Ljava/lang/Object;)Lviaduct/api/FieldValue;
+}
+
+public abstract interface annotation class viaduct/api/Resolver : java/lang/annotation/Annotation {
+	public abstract fun objectValueFragment ()Ljava/lang/String;
+	public abstract fun queryValueFragment ()Ljava/lang/String;
+	public abstract fun variables ()[Lviaduct/api/Variable;
+}
+
+public abstract interface class viaduct/api/SelectiveResolver {
+}
+
+public abstract interface class viaduct/api/TenantModule {
+	public abstract fun getMetadata ()Ljava/util/Map;
+	public abstract fun getPackageName ()Ljava/lang/String;
+}
+
+public final class viaduct/api/TenantModule$DefaultImpls {
+	public static fun getPackageName (Lviaduct/api/TenantModule;)Ljava/lang/String;
+}
+
+public abstract interface annotation class viaduct/api/Variable : java/lang/annotation/Annotation {
+	public static final field Companion Lviaduct/api/Variable$Companion;
+	public static final field UNSET_STRING_VALUE Ljava/lang/String;
+	public abstract fun fromArgument ()Ljava/lang/String;
+	public abstract fun fromObjectField ()Ljava/lang/String;
+	public abstract fun fromQueryField ()Ljava/lang/String;
+	public abstract fun name ()Ljava/lang/String;
+}
+
+public final class viaduct/api/Variable$Companion {
+	public static final field UNSET_STRING_VALUE Ljava/lang/String;
+}
+
+public abstract interface annotation class viaduct/api/Variables : java/lang/annotation/Annotation {
+	public abstract fun types ()Ljava/lang/String;
+}
+
+public abstract interface class viaduct/api/VariablesProvider {
+	public abstract fun provide (Lviaduct/api/context/VariablesProviderContext;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+}
+
+public final class viaduct/api/ViaductFrameworkException : java/lang/Exception {
+	public fun <init> (Ljava/lang/String;Ljava/lang/Throwable;)V
+	public synthetic fun <init> (Ljava/lang/String;Ljava/lang/Throwable;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
+}
+
+public abstract interface class viaduct/api/ViaductTenantException {
+}
+
+public final class viaduct/api/ViaductTenantResolverException : java/lang/Exception, viaduct/api/ViaductTenantException {
+	public fun <init> (Ljava/lang/Throwable;Ljava/lang/String;)V
+	public fun getCause ()Ljava/lang/Throwable;
+	public final fun getResolver ()Ljava/lang/String;
+	public final fun getResolversCallChain ()Ljava/lang/String;
+}
+
+public final class viaduct/api/ViaductTenantUsageException : java/lang/Exception, viaduct/api/ViaductTenantException {
+	public fun <init> (Ljava/lang/String;Ljava/lang/Throwable;)V
+	public synthetic fun <init> (Ljava/lang/String;Ljava/lang/Throwable;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
+}
+
+public abstract interface class viaduct/api/context/BaseFieldExecutionContext : viaduct/api/context/ResolverExecutionContext {
+	public abstract fun getArguments ()Lviaduct/api/types/Arguments;
+	public abstract fun getQueryValue ()Lviaduct/api/types/Query;
+	public abstract fun selections ()Lviaduct/api/select/SelectionSet;
+}
+
+public abstract interface class viaduct/api/context/ExecutionContext {
+	public abstract fun getRequestContext ()Ljava/lang/Object;
+	public abstract fun globalIDFor (Lviaduct/api/reflect/Type;Ljava/lang/String;)Lviaduct/api/globalid/GlobalID;
+}
+
+public abstract interface class viaduct/api/context/FieldExecutionContext : viaduct/api/context/BaseFieldExecutionContext {
+	public abstract fun getObjectValue ()Lviaduct/api/types/Object;
+}
+
+public abstract interface class viaduct/api/context/MutationFieldExecutionContext : viaduct/api/context/BaseFieldExecutionContext {
+	public abstract fun mutation (Ljava/lang/String;Ljava/util/Map;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+}
+
+public final class viaduct/api/context/MutationFieldExecutionContext$DefaultImpls {
+	public static synthetic fun mutation$default (Lviaduct/api/context/MutationFieldExecutionContext;Ljava/lang/String;Ljava/util/Map;Lkotlin/coroutines/Continuation;ILjava/lang/Object;)Ljava/lang/Object;
+}
+
+public abstract interface class viaduct/api/context/NodeExecutionContext : viaduct/api/context/ResolverExecutionContext {
+	public abstract fun getId ()Lviaduct/api/globalid/GlobalID;
+}
+
+public abstract interface class viaduct/api/context/ResolverExecutionContext : viaduct/api/context/ExecutionContext {
+	public abstract fun globalIDStringFor (Lviaduct/api/reflect/Type;Ljava/lang/String;)Ljava/lang/String;
+	public abstract fun nodeFor (Lviaduct/api/globalid/GlobalID;)Lviaduct/api/types/NodeObject;
+	public abstract fun query (Ljava/lang/String;Ljava/util/Map;Lkotlin/coroutines/Continuation;)Ljava/lang/Object;
+	public abstract fun selectionsFor (Lviaduct/api/reflect/Type;Ljava/lang/String;Ljava/util/Map;)Lviaduct/api/select/SelectionSet;
+}
+
+public final class viaduct/api/context/ResolverExecutionContext$DefaultImpls {
+	public static synthetic fun query$default (Lviaduct/api/context/ResolverExecutionContext;Ljava/lang/String;Ljava/util/Map;Lkotlin/coroutines/Continuation;ILjava/lang/Object;)Ljava/lang/Object;
+	public static synthetic fun selectionsFor$default (Lviaduct/api/context/ResolverExecutionContext;Lviaduct/api/reflect/Type;Ljava/lang/String;Ljava/util/Map;ILjava/lang/Object;)Lviaduct/api/select/SelectionSet;
+}
+
+public abstract interface class viaduct/api/context/SelectiveNodeExecutionContext : viaduct/api/context/NodeExecutionContext {
+	public abstract fun selections ()Lviaduct/api/select/SelectionSet;
+}
+
+public abstract interface class viaduct/api/context/VariablesProviderContext : viaduct/api/context/ExecutionContext {
+	public abstract fun getArguments ()Lviaduct/api/types/Arguments;
+}
+
+public class viaduct/api/exception/FieldError : java/lang/Exception {
+	public fun <init> (Ljava/lang/String;Ljava/util/Map;Ljava/lang/Throwable;)V
+	public synthetic fun <init> (Ljava/lang/String;Ljava/util/Map;Ljava/lang/Throwable;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
+	public final fun getExtensions ()Ljava/util/Map;
+	public fun getMessage ()Ljava/lang/String;
+}
+
+public final class viaduct/api/exception/ValueMapperException : java/lang/Exception {
+	public fun <init> (Ljava/lang/String;Ljava/lang/Throwable;)V
+	public synthetic fun <init> (Ljava/lang/String;Ljava/lang/Throwable;ILkotlin/jvm/internal/DefaultConstructorMarker;)V
+}
+
+public abstract interface class viaduct/api/globalid/GlobalID {
+	public abstract fun getInternalID ()Ljava/lang/String;
+	public abstract fun getType ()Lviaduct/api/reflect/Type;
+}
+
+public abstract interface class viaduct/api/globalid/GlobalIDCodec {
+	public abstract fun deserialize (Ljava/lang/String;)Lviaduct/api/globalid/GlobalID;
+	public abstract fun serialize (Lviaduct/api/globalid/GlobalID;)Ljava/lang/String;
+}
+
+public abstract interface class viaduct/api/internal/ReflectionLoader {
+	public abstract fun getGRTKClassFor (Ljava/lang/String;)Lkotlin/reflect/KClass;
+	public abstract fun reflectionFor (Ljava/lang/String;)Lviaduct/api/reflect/Type;
+}
+
+public abstract interface class viaduct/api/reflect/CompositeField : viaduct/api/reflect/Field {
+	public abstract fun getType ()Lviaduct/api/reflect/Type;
+}
+
+public abstract interface class viaduct/api/reflect/Field {
+	public abstract fun getContainingType ()Lviaduct/api/reflect/Type;
+	public abstract fun getName ()Ljava/lang/String;
+}
+
+public abstract interface class viaduct/api/reflect/Type {
+	public static final field Companion Lviaduct/api/reflect/Type$Companion;
+	public abstract fun getKcls ()Lkotlin/reflect/KClass;
+	public abstract fun getName ()Ljava/lang/String;
+}
+
+public final class viaduct/api/reflect/Type$Companion {
+	public final fun ofClass (Lkotlin/reflect/KClass;)Lviaduct/api/reflect/Type;
+}
+
+public abstract interface class viaduct/api/reflect/TypeFields {
+}
+
+public abstract interface class viaduct/api/select/SelectionSet {
+	public static final field Companion Lviaduct/api/select/SelectionSet$Companion;
+	public abstract fun contains (Lviaduct/api/reflect/Field;)Z
+	public abstract fun getType ()Lviaduct/api/reflect/Type;
+	public abstract fun isEmpty ()Z
+	public abstract fun requestsType (Lviaduct/api/reflect/Type;)Z
+	public abstract fun selectionSetFor (Lviaduct/api/reflect/CompositeField;)Lviaduct/api/select/SelectionSet;
+	public abstract fun selectionSetFor (Lviaduct/api/reflect/Type;)Lviaduct/api/select/SelectionSet;
+}
+
+public final class viaduct/api/select/SelectionSet$Companion {
+	public final fun empty (Lviaduct/api/reflect/Type;)Lviaduct/api/select/SelectionSet;
+}
+
+public final class viaduct/api/select/SelectionSet$NoSelections : viaduct/api/select/SelectionSet {
+	public static final field INSTANCE Lviaduct/api/select/SelectionSet$NoSelections;
+	public fun contains (Lviaduct/api/reflect/Field;)Z
+	public fun getType ()Lviaduct/api/reflect/Type;
+	public fun isEmpty ()Z
+	public fun requestsType (Lviaduct/api/reflect/Type;)Z
+	public fun selectionSetFor (Lviaduct/api/reflect/CompositeField;)Lviaduct/api/select/SelectionSet;
+	public fun selectionSetFor (Lviaduct/api/reflect/Type;)Lviaduct/api/select/SelectionSet;
+}
+
+public abstract interface annotation class viaduct/api/select/Selections : java/lang/annotation/Annotation {
+}
+
+public abstract interface class viaduct/api/types/Arguments : viaduct/api/types/InputLike {
+}
+
+public final class viaduct/api/types/Arguments$NoArguments : viaduct/api/types/Arguments {
+	public static final field INSTANCE Lviaduct/api/types/Arguments$NoArguments;
+}
+
+public abstract interface class viaduct/api/types/CompositeOutput : viaduct/api/types/GRT {
+}
+
+public final class viaduct/api/types/CompositeOutput$NotComposite : viaduct/api/types/CompositeOutput {
+	public static final field INSTANCE Lviaduct/api/types/CompositeOutput$NotComposite;
+}
+
+public abstract interface class viaduct/api/types/Enum : viaduct/api/types/GRT {
+	public static final field Companion Lviaduct/api/types/Enum$Companion;
+}
+
+public final class viaduct/api/types/Enum$Companion {
+	public final fun enumFrom (Lkotlin/reflect/KClass;Ljava/lang/String;)Ljava/lang/Enum;
+}
+
+public abstract interface class viaduct/api/types/GRT {
+}
+
+public abstract interface class viaduct/api/types/Input : viaduct/api/types/InputLike {
+}
+
+public abstract interface class viaduct/api/types/InputLike : viaduct/api/types/Struct {
+}
+
+public abstract interface class viaduct/api/types/Interface : viaduct/api/types/RecordOutput {
+}
+
+public abstract interface class viaduct/api/types/Mutation : viaduct/api/types/Object {
+}
+
+public abstract interface class viaduct/api/types/NodeCompositeOutput : viaduct/api/types/CompositeOutput {
+}
+
+public abstract interface class viaduct/api/types/NodeObject : viaduct/api/types/NodeCompositeOutput, viaduct/api/types/Object {
+}
+
+public abstract interface class viaduct/api/types/Object : viaduct/api/types/RecordOutput, viaduct/api/types/Struct {
+}
+
+public abstract interface class viaduct/api/types/Query : viaduct/api/types/Object {
+}
+
+public abstract interface class viaduct/api/types/RecordOutput : viaduct/api/types/CompositeOutput {
+}
+
+public abstract interface class viaduct/api/types/Struct : viaduct/api/types/GRT {
+}
+
+public abstract interface class viaduct/api/types/Union : viaduct/api/types/CompositeOutput {
+}
+

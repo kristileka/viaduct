@@ -1,18 +1,30 @@
 package viaduct.tenant.testing
 
-import io.mockk.mockk
 import viaduct.api.context.ExecutionContext
 import viaduct.api.internal.select.SelectionSetFactory
-import viaduct.api.internal.select.SelectionsLoader
-import viaduct.engine.api.FragmentLoader
 
+/**
+ * Default implementation of [ResolverTestBase] with pre-configured test dependencies.
+ *
+ * ## Deprecation Notice
+ *
+ * **This class is deprecated.** Please migrate to the new type-safe testing API in
+ * `viaduct.api.testing` package. The new API uses a factory pattern instead of inheritance,
+ * provides explicit type parameters, and has zero runtime dependencies.
+ *
+ * See [ResolverTestBase] KDoc for detailed migration guide and examples.
+ *
+ * @see viaduct.api.testing.FieldResolverTester
+ * @see viaduct.api.testing.MutationResolverTester
+ * @see viaduct.api.testing.NodeResolverTester
+ * @see ResolverTestBase for migration guide
+ */
+@Deprecated(
+    message = "DefaultAbstractResolverTestBase is deprecated. Use the new type-safe testing API in viaduct.api.testing package. " +
+        "See FieldResolverTester, MutationResolverTester, or NodeResolverTester for the new API.",
+    level = DeprecationLevel.WARNING
+)
 abstract class DefaultAbstractResolverTestBase : ResolverTestBase {
-    override fun getFragmentLoader(): FragmentLoader = mockk()
-
-    override val selectionsLoaderFactory: SelectionsLoader.Factory by lazy {
-        mkSelectionsLoaderFactory()
-    }
-
     override val ossSelectionSetFactory: SelectionSetFactory by lazy {
         mkSelectionSetFactory()
     }

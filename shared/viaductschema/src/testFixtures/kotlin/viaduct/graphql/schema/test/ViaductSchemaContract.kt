@@ -2,6 +2,7 @@ package viaduct.graphql.schema.test
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertInstanceOf
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertSame
@@ -12,9 +13,37 @@ import viaduct.graphql.schema.ViaductSchema
 
 typealias NSE = NoSuchElementException
 
-/** A set of unit tests for ViaductSchema implementations, with emphasis on
- *  catching error cases (non-error cases are tested pretty well in the "full"
- *  tests).
+/**
+ * A contract test suite for [ViaductSchema] implementations.
+ *
+ * This interface provides a comprehensive set of JUnit 5 tests that verify
+ * the behavioral correctness of any [ViaductSchema] implementation. Implementers
+ * need only provide a [makeSchema] factory method, and they receive extensive
+ * test coverage for:
+ *
+ * - Default value handling for fields and arguments
+ * - Field path navigation
+ * - Override detection (`isOverride`)
+ * - Extension lists and applied directives
+ * - Root type referential integrity
+ * - Type expression properties
+ *
+ * ## Usage
+ *
+ * To use this contract, create a test class that implements this interface:
+ *
+ * ```kotlin
+ * class MySchemaContractTest : ViaductSchemaContract {
+ *     override fun makeSchema(schema: String): ViaductSchema {
+ *         return MySchema.fromSDL(schema)
+ *     }
+ * }
+ * ```
+ *
+ * JUnit will automatically discover and run all the `@Test` methods defined
+ * in this interface.
+ *
+ * @see ViaductSchemaSubtypeContract for complementary tests verifying type structure
  */
 interface ViaductSchemaContract {
     companion object {
@@ -27,8 +56,8 @@ interface ViaductSchemaContract {
             type: String,
             block: (Iterable<ViaductSchema.Extension<*, *>>) -> Unit
         ) = block(
-            (this.types[type] as? ViaductSchema.HasExtensions<*, *>)?.extensions
-                ?: throw IllegalArgumentException("Unknown on non-extensions type $type")
+            this.types[type]?.extensions
+                ?: throw IllegalArgumentException("Unknown type $type")
         )
 
         private fun ViaductSchema.withField(
@@ -63,6 +92,16 @@ interface ViaductSchemaContract {
         }
     }
 
+    /**
+     * Factory method to create a [ViaductSchema] from SDL.
+     *
+     * Implementations should parse the given GraphQL SDL string and return
+     * a [ViaductSchema] instance. The SDL will always be syntactically valid
+     * GraphQL schema definition language.
+     *
+     * @param schema A valid GraphQL SDL string
+     * @return A [ViaductSchema] parsed from the SDL
+     */
     fun makeSchema(schema: String): ViaductSchema
 
     @Test
@@ -126,7 +165,7 @@ interface ViaductSchemaContract {
         ).apply {
             withArg("Query", "foo", "a") {
                 assertTrue(it.hasEffectiveDefault, "Query.a")
-                assertNull(it.effectiveDefaultValue, "Query.a")
+                assertInstanceOf(ViaductSchema.NullLiteral::class.java, it.effectiveDefaultValue, "Query.a")
             }
             withArg("Query", "foo", "b") {
                 assertTrue(it.hasEffectiveDefault, "Query.b")
@@ -134,7 +173,7 @@ interface ViaductSchemaContract {
             }
             withField("I", "a") {
                 assertTrue(it.hasEffectiveDefault, "I.a")
-                assertNull(it.effectiveDefaultValue, "I.a")
+                assertInstanceOf(ViaductSchema.NullLiteral::class.java, it.effectiveDefaultValue, "I.a")
             }
             withField("I", "b") {
                 assertTrue(it.hasEffectiveDefault, "I.b")
@@ -496,13 +535,15 @@ interface ViaductSchemaContract {
     @Test
     fun `test extensionAppliedDirectives`() {
         fun assertions(
-            extensionAppliedDirectives: Iterable<ViaductSchema.AppliedDirective>,
+            extensionAppliedDirectives: Iterable<ViaductSchema.AppliedDirective<*>>,
             a1Value: String
         ) {
             assertEquals(1, extensionAppliedDirectives.count())
             val dir = extensionAppliedDirectives.first()
             assertEquals("d1", dir.name)
-            assertEquals("StringValue{value='$a1Value'}", dir.arguments["a1"].toString())
+            val argValue = dir.arguments["a1"]
+            assertInstanceOf(ViaductSchema.StringLiteral::class.java, argValue)
+            assertEquals(a1Value, (argValue as ViaductSchema.StringLiteral).value)
         }
         makeSchema(
             """
@@ -579,6 +620,31 @@ interface ViaductSchemaContract {
         ).apply {
             assertNull(this.mutationTypeDef)
             assertNull(this.subscriptionTypeDef)
+        }
+    }
+
+    @Test
+    fun `test containingSchema referential integrity`() {
+        makeSchema(
+            """
+            directive @d1 on OBJECT
+            type Query { foo: String }
+            enum E { A }
+            input I { a: Int }
+            interface A { a: String }
+            scalar S
+            type T implements A { a: String }
+            union U = Query | T
+            """.trimIndent()
+        ).apply {
+            // Every TypeDef's containingSchema should be this schema
+            for ((name, typeDef) in this.types) {
+                assertSame(this, typeDef.containingSchema, "TypeDef $name containingSchema")
+            }
+            // Every Directive's containingSchema should be this schema
+            for ((name, directive) in this.directives) {
+                assertSame(this, directive.containingSchema, "Directive $name containingSchema")
+            }
         }
     }
 }

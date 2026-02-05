@@ -20,7 +20,6 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertDoesNotThrow
 import org.junit.jupiter.api.assertThrows
-import viaduct.engine.api.FragmentLoader
 import viaduct.engine.api.GraphQLBuildError
 import viaduct.engine.api.ViaductSchema
 import viaduct.engine.runtime.execution.TenantNameResolver
@@ -91,8 +90,8 @@ class StandardViaductTest {
         val graphqlErrors = listOf(GraphQLError.newError().message("Error").build())
 
         every {
-            executionResult.getData<String>()
-        } returns "Test"
+            executionResult.getData<Map<String, Any?>>()
+        } returns mapOf("field" to "Test")
 
         every {
             executionResult.errors
@@ -104,7 +103,7 @@ class StandardViaductTest {
 
         val executionResultImpl = subject.sortExecutionResult(executionResult)
 
-        assertEquals("Test", executionResultImpl.getData())
+        assertEquals(mapOf("field" to "Test"), executionResultImpl.getData())
         assertEquals(graphqlErrors, executionResultImpl.errors)
         assertEquals(mapOf(), executionResultImpl.extensions)
     }
@@ -194,14 +193,10 @@ class StandardViaductTest {
             }
         """.trimIndent()
         val schemaConfiguration = SchemaConfiguration.fromSdl(sdl)
-        val fragmentLoader = mockk<FragmentLoader>(relaxed = true)
 
         assertDoesNotThrow {
             StandardViaduct.Builder()
-                .enableAirbnbBypassDoNotUse(
-                    fragmentLoader = fragmentLoader,
-                    tenantNameResolver = TenantNameResolver()
-                )
+                .enableAirbnbBypassDoNotUse(tenantNameResolver = TenantNameResolver())
                 .withSchemaConfiguration(schemaConfiguration)
                 .build()
         }

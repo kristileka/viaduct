@@ -10,7 +10,7 @@ import viaduct.codegen.km.setterName
 import viaduct.engine.api.EngineObjectDataBuilder
 import viaduct.engine.api.ViaductSchema
 import viaduct.graphql.schema.ViaductSchema as ViaductGraphQLSchema
-import viaduct.graphql.schema.graphqljava.GJSchema
+import viaduct.graphql.schema.graphqljava.extensions.fromGraphQLSchema
 import viaduct.loaders.core.edges.EdgesQueryResponse
 import viaduct.schema.base.BuilderBase
 import viaduct.tenant.codegen.bytecode.config.BaseTypeMapper
@@ -36,7 +36,7 @@ fun ViaductGraphQLSchema.HasDefaultValue.createValueV2(
     classResolver: ClassResolver,
     schema: ViaductSchema,
     value2: Boolean = false,
-    baseTypeMapper: BaseTypeMapper = ViaductBaseTypeMapper(GJSchema.fromSchema(schema.schema)),
+    baseTypeMapper: BaseTypeMapper = ViaductBaseTypeMapper(ViaductGraphQLSchema.fromGraphQLSchema(schema.schema)),
     classLoader: ClassLoader = ClassLoader.getSystemClassLoader(),
 ): Any? = this.valueV2FromGenericValue(classResolver, schema, this.createGenericValue(value2, if (value2) 2 else 1, emptyList(), baseTypeMapper), classLoader = classLoader)
 
@@ -390,7 +390,7 @@ fun Iterable<ViaductGraphQLSchema.HasDefaultValue>.onlyOneValue(seen: List<Viadu
 }
 
 /** Returns true iff there's only one value for this type expression. */
-private fun ViaductGraphQLSchema.TypeExpr.onlyOneValue(seen: List<ViaductGraphQLSchema.HasDefaultValue>): Boolean =
+private fun ViaductGraphQLSchema.TypeExpr<*>.onlyOneValue(seen: List<ViaductGraphQLSchema.HasDefaultValue>): Boolean =
     if (this.nullableOrEmpty) {
         false
     } else {
@@ -413,10 +413,10 @@ private fun ViaductGraphQLSchema.TypeDef.onlyOneValue(): Boolean =
         false
     }
 
-private val ViaductGraphQLSchema.TypeExpr.nullableOrEmpty: Boolean get() =
+private val ViaductGraphQLSchema.TypeExpr<*>.nullableOrEmpty: Boolean get() =
     baseTypeNullable || (0 < listDepth)
 
-private fun ViaductGraphQLSchema.TypeExpr.nullOrEmpty(): Any? {
+private fun ViaductGraphQLSchema.TypeExpr<*>.nullOrEmpty(): Any? {
     if (!nullableOrEmpty) throw IllegalArgumentException("Must be nullable somewhere ($this).")
     var result: Any? = null
     if (isNullable) return result

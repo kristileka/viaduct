@@ -4,6 +4,7 @@ import kotlin.collections.get
 import org.junit.jupiter.api.Test
 import viaduct.api.FieldValue
 import viaduct.api.Resolver
+import viaduct.api.SelectiveResolver
 import viaduct.graphql.test.assertEquals
 import viaduct.tenant.runtime.execution.batchresolver.errorhandling.resolverbases.QueryResolvers
 import viaduct.tenant.runtime.fixtures.FeatureAppTestBase
@@ -32,7 +33,7 @@ class BatchResolverErrorHandlingFeatureAppTest : FeatureAppTestBase() {
         }
     }
 
-    class FooResolver : NodeResolvers.Foo() {
+    class FooResolver : NodeResolvers.Foo(), SelectiveResolver {
         companion object {
             var shouldReturnWrongNumberOfResults = false
         }
@@ -152,7 +153,7 @@ class BatchResolverErrorHandlingFeatureAppTest : FeatureAppTestBase() {
 
         assert(result.errors.isEmpty()) { "Query should execute without errors, got: ${result.errors}" }
 
-        val data = result.getData<Map<String, Any>>()
+        val data = result.getData()!!
         val f1Data = data["f1"] as Map<*, *>
         val f2Data = data["f2"] as Map<*, *>
         val f1Selections = f1Data["a"] as String

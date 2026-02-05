@@ -1,14 +1,14 @@
 package viaduct.graphql.schema.binary
 
-import graphql.language.NullValue
-import graphql.language.Value
 import viaduct.graphql.schema.ViaductSchema
 
 internal fun SchemaEncoder.encodeDefinitions() {
     out.writeInt(MAGIC_DEFINITIONS)
 
-    // Write directives first, in alphabetical order by name
-    val sortedDirectives = schemaInfo.inputSchema.directives.values.sortedBy { it.name }
+    // Write directives first, in topological order (dependencies before dependents).
+    // This ensures that when decoding, the directive definition is always available
+    // when decoding applied directives that reference it.
+    val sortedDirectives = topologicalSortDirectives(schemaInfo.inputSchema.directives.values)
     for (directive in sortedDirectives) {
         encodeDirective(directive)
     }
@@ -33,11 +33,10 @@ private fun SchemaEncoder.encodeDirective(directive: ViaductSchema.Directive) {
     out.writeInt(directiveInfo.word)
 
     // Encode arguments if present.
-    // For directive definition arguments, we must encode ALL applied directive arguments
-    // explicitly (no omission optimization) because circular directive dependencies are
-    // allowed and the decoder may not have access to the directive definition yet.
+    // Since directives are written in topological order, the decoder will always have
+    // access to referenced directive definitions when reconstructing omitted arguments.
     if (directiveInfo.hasArgs()) {
-        encodeArgs(directive.args, allowOmitAppliedDirectiveArgs = false)
+        encodeArgs(directive.args)
     }
 }
 
@@ -73,7 +72,7 @@ private fun SchemaEncoder.encodeTypeDef(td: ViaductSchema.TypeDef) {
             if (td is ViaductSchema.Interface) {
                 encodeTypeDefsOrMarker(td.possibleObjectTypes)
             } else {
-                encodeTypeDefsOrMarker(td.unions)
+                encodeTypeDefsOrMarker((td as ViaductSchema.Object).unions)
             }
         }
 
@@ -84,16 +83,18 @@ private fun SchemaEncoder.encodeTypeDef(td: ViaductSchema.TypeDef) {
         }
 
         is ViaductSchema.Scalar -> {
-            val hasAppliedDirectives = td.appliedDirectives.isNotEmpty()
-            val refPlus = DefinitionRefPlus(
-                schemaInfo.sourceNameIndex(td.sourceLocation?.sourceName),
-                hasImplementedTypes = false,
-                hasAppliedDirectives = hasAppliedDirectives,
-                hasNext = false // Only one extension
-            )
-            out.writeInt(refPlus.word)
-            if (hasAppliedDirectives) {
-                encodeAppliedDirectives(td.appliedDirectives)
+            td.extensions.encode { ext, hasNext ->
+                val hasAppliedDirectives = ext.appliedDirectives.isNotEmpty()
+                val refPlus = DefinitionRefPlus(
+                    schemaInfo.sourceNameIndex(ext.sourceLocation?.sourceName),
+                    hasImplementedTypes = false,
+                    hasAppliedDirectives = hasAppliedDirectives,
+                    hasNext = hasNext
+                )
+                out.writeInt(refPlus.word)
+                if (hasAppliedDirectives) {
+                    encodeAppliedDirectives(ext.appliedDirectives)
+                }
             }
         }
 
@@ -146,25 +147,17 @@ private inline fun <T> SchemaEncoder.encodeListOrMarker(
 }
 
 /**
- * Encode applied directives.
- * @param allowOmitArgs If true, arguments matching defaults may be omitted (optimization).
- *                      If false, ALL arguments are encoded explicitly.
- *                      This should be false when encoding applied directives on directive
- *                      definition arguments, since circular directive dependencies are allowed
- *                      and the decoder may not have access to the directive definition.
+ * Encode applied directives. Arguments matching defaults are omitted as an optimization;
+ * the decoder reconstructs them using the directive definition. This works because directives
+ * are encoded in topological order, ensuring definitions are always available when decoding.
  */
-private fun SchemaEncoder.encodeAppliedDirectives(
-    appliedDirectives: Iterable<ViaductSchema.AppliedDirective>,
-    allowOmitArgs: Boolean = true
-) {
+private fun SchemaEncoder.encodeAppliedDirectives(appliedDirectives: Iterable<ViaductSchema.AppliedDirective<*>>) {
     appliedDirectives.encode { ad, hasNext ->
-        // Filter arguments to only include those that need to be explicitly encoded
-        // (unless allowOmitArgs is false, in which case all args are encoded)
-        val argsToEncode = if (allowOmitArgs) {
-            filterAppliedDirectiveArguments(ad)
-        } else {
-            ad.arguments.entries.map { it.key to it.value }.sortedBy { it.first }
-        }
+        // Filter arguments to only include those that need to be explicitly encoded.
+        // Arguments matching defaults can be omitted since the decoder can reconstruct them.
+        // This works for all applied directives because directives are encoded in topological
+        // order, ensuring the directive definition is always available when decoding.
+        val argsToEncode = filterAppliedDirectiveArguments(ad)
         val hasArguments = argsToEncode.isNotEmpty()
         val refPlus = AppliedDirectiveRefPlus(
             schemaInfo.identifierIndex(ad.name),
@@ -184,7 +177,7 @@ private fun SchemaEncoder.encodeAppliedDirectives(
  * - Its value matches the default value in the directive definition, OR
  * - Its value is null and the argument type is nullable (and has no default)
  */
-private fun SchemaEncoder.filterAppliedDirectiveArguments(appliedDirective: ViaductSchema.AppliedDirective): List<Pair<String, Any?>> {
+private fun SchemaEncoder.filterAppliedDirectiveArguments(appliedDirective: ViaductSchema.AppliedDirective<*>): List<Pair<String, ViaductSchema.Literal>> {
     val directiveDef = requireNotNull(schemaInfo.inputSchema.directives[appliedDirective.name]) {
         "Unknown directive: ${appliedDirective.name}"
     }
@@ -204,17 +197,28 @@ private fun SchemaEncoder.filterAppliedDirectiveArguments(appliedDirective: Viad
  * Check if an argument can be omitted because the decoder will reconstruct the same value.
  */
 private fun canOmitArgument(
-    argDef: ViaductSchema.Arg,
-    argValue: Any?
+    argDef: ViaductSchema.HasDefaultValue,
+    argValue: ViaductSchema.Literal
 ): Boolean {
     return when {
         // If argument has a default and value matches it, omit
         argDef.hasDefault && valuesEqual(argDef.defaultValue, argValue) -> true
-        // If argument is nullable (no default) and value is null, omit
-        !argDef.hasDefault && argDef.type.isNullable && argValue == null -> true
+        // If argument is nullable (no default) and value is NullValue, omit
+        // (the decoder reconstructs NullValue for nullable args without defaults)
+        !argDef.hasDefault && argDef.type.isNullable && argValue is ViaductSchema.NullLiteral -> true
         // Otherwise, must encode explicitly
         else -> false
     }
+}
+
+/**
+ * Get the default value as a representation suitable for encoding, or null if no default.
+ */
+private fun ViaductSchema.HasDefaultValue.defaultValueRepr(): Any? {
+    if (!hasDefault) return null
+    // defaultValue is ViaductSchema.Literal (non-nullable) when hasDefault is true;
+    // GraphQL null values are represented as NullValue, not Kotlin null
+    return ValueStringConverter.valueToString(defaultValue)
 }
 
 /**
@@ -232,20 +236,21 @@ private fun valuesEqual(
 }
 
 private fun SchemaEncoder.encodeAppliedDirectiveArguments(
-    appliedDirective: ViaductSchema.AppliedDirective,
-    argsToEncode: List<Pair<String, Any?>>
+    appliedDirective: ViaductSchema.AppliedDirective<*>,
+    argsToEncode: List<Pair<String, ViaductSchema.Literal>>
 ) {
     val directiveDef = schemaInfo.inputSchema.directives[appliedDirective.name]
         ?: throw IllegalArgumentException("Unknown directive: ${appliedDirective.name}")
     argsToEncode.encode { (argName, argValue), hasNext ->
         val refPlus = AppliedDirectiveArgRefPlus(schemaInfo.identifierIndex(argName), hasNext)
         out.writeInt(refPlus.word)
-        // Convert value to string representation
-        val argDef = directiveDef.args.find { it.name == argName }
-            ?: throw IllegalArgumentException("Unknown argument $argName for directive ${appliedDirective.name}")
-        val value = argValue as? Value<*>
-            ?: NullValue.newNullValue().build()
-        val constantRepr = ValueStringConverter.valueToString(value)
+        // Validate argument exists in directive definition
+        require(directiveDef.args.any { it.name == argName }) {
+            "Unknown argument $argName for directive ${appliedDirective.name}"
+        }
+        // argValue is ViaductSchema.Literal from appliedDirective.arguments;
+        // GraphQL null values are represented as NullValue, not Kotlin null
+        val constantRepr = ValueStringConverter.valueToString(argValue)
         out.writeInt(constantsEncoder.findRef(constantRepr))
     }
 }
@@ -263,18 +268,14 @@ private fun SchemaEncoder.encodeTypeDefsOrMarker(typeDefs: Iterable<ViaductSchem
 /**
  * Encode a single input-like field (name + type + optional constant reference).
  * Used for directive args, field args, and input object fields.
- *
- * @param allowOmitAppliedDirectiveArgs If true, applied directive arguments matching defaults
- *                                       may be omitted. Should be false for directive definition args.
  */
 private fun SchemaEncoder.encodeInputLikeField(
     name: String,
-    type: ViaductSchema.TypeExpr,
+    type: ViaductSchema.TypeExpr<*>,
     hasDefault: Boolean,
     defaultValue: Any?,
     hasNext: Boolean,
-    appliedDirectives: Collection<ViaductSchema.AppliedDirective> = emptyList(),
-    allowOmitAppliedDirectiveArgs: Boolean = true
+    appliedDirectives: Collection<ViaductSchema.AppliedDirective<*>> = emptyList()
 ) {
     val hasAppliedDirs = appliedDirectives.isNotEmpty()
     val refPlus = InputLikeFieldRefPlus(
@@ -285,7 +286,7 @@ private fun SchemaEncoder.encodeInputLikeField(
     )
     out.writeInt(refPlus.word)
     if (hasAppliedDirs) {
-        encodeAppliedDirectives(appliedDirectives, allowOmitAppliedDirectiveArgs)
+        encodeAppliedDirectives(appliedDirectives)
     }
     out.writeInt(schemaInfo.typeExprs[type]!!)
     if (hasDefault) {
@@ -295,31 +296,16 @@ private fun SchemaEncoder.encodeInputLikeField(
 
 /**
  * Encode a list of arguments.
- *
- * @param allowOmitAppliedDirectiveArgs If true, applied directive arguments matching defaults
- *                                       may be omitted. Should be false for directive definition args.
  */
-private fun SchemaEncoder.encodeArgs(
-    args: Iterable<ViaductSchema.Arg>,
-    allowOmitAppliedDirectiveArgs: Boolean = true
-) {
+private fun SchemaEncoder.encodeArgs(args: Iterable<ViaductSchema.Arg>) {
     args.encode { arg, hasNext ->
-        val defaultValue = if (arg.hasDefault) {
-            // Handle explicit null default values - ViaductSchema returns Java null instead of NullValue
-            val value = arg.defaultValue as? Value<*>
-                ?: NullValue.newNullValue().build()
-            ValueStringConverter.valueToString(value)
-        } else {
-            null
-        }
         encodeInputLikeField(
             arg.name,
             arg.type,
             arg.hasDefault,
-            defaultValue,
+            arg.defaultValueRepr(),
             hasNext,
-            arg.appliedDirectives,
-            allowOmitAppliedDirectiveArgs
+            arg.appliedDirectives
         )
     }
 }
@@ -330,15 +316,7 @@ private fun SchemaEncoder.encodeArgs(
  */
 private fun SchemaEncoder.encodeInputFields(fields: Iterable<ViaductSchema.Field>) {
     fields.encode { field, hasNext ->
-        val defaultValue = if (field.hasDefault) {
-            // Handle explicit null default values - ViaductSchema returns Java null instead of NullValue
-            val value = field.defaultValue as? Value<*>
-                ?: NullValue.newNullValue().build()
-            ValueStringConverter.valueToString(value)
-        } else {
-            null
-        }
-        encodeInputLikeField(field.name, field.type, field.hasDefault, defaultValue, hasNext, field.appliedDirectives)
+        encodeInputLikeField(field.name, field.type, field.hasDefault, field.defaultValueRepr(), hasNext, field.appliedDirectives)
     }
 }
 
@@ -392,6 +370,7 @@ private fun SchemaEncoder.encodeFieldsOrMarker(fields: Iterable<ViaductSchema.Fi
     encodeListOrMarker(fields) { encodeFields(it) }
 }
 
+@Suppress("NOTHING_TO_INLINE")
 private inline fun Int.tagIf(needsTag: Boolean) = this or (if (needsTag) (1 shl 31) else 0)
 
 private inline val Iterable<*>.isNotEmpty get() = this.iterator().hasNext()
@@ -403,5 +382,90 @@ private fun <T> Iterable<T>.encode(encoder: (T, Boolean) -> Unit) {
         val v = i.next()
         hasNext = i.hasNext()
         encoder(v, hasNext)
+    }
+}
+
+//
+// Topological sort for directives
+//
+
+/**
+ * Topological sort of directives using DFS with gray coloring.
+ *
+ * A directive A depends on directive B if A has @B applied to any of its arguments.
+ * The GraphQL spec prohibits circular directive references, so this sort should
+ * always succeed for valid schemas. If a cycle is detected, an exception is thrown.
+ *
+ * Ties (directives with no dependency relationship) are broken alphabetically
+ * for deterministic output.
+ */
+internal fun topologicalSortDirectives(directives: Collection<ViaductSchema.Directive>): List<ViaductSchema.Directive> {
+    if (directives.isEmpty()) return emptyList()
+
+    // Build name -> directive map for lookups
+    val byName = directives.associateBy { it.name }
+
+    // Color states for DFS
+    val white = directives.map { it.name }.toMutableSet() // unvisited
+    val gray = mutableSetOf<String>() // currently visiting (in stack)
+    val black = mutableSetOf<String>() // finished
+
+    // Get dependencies for a directive (names of directives applied to its arguments)
+    fun getDependencies(directive: ViaductSchema.Directive): Set<String> =
+        buildSet {
+            for (arg in directive.args) {
+                for (appliedDirective in arg.appliedDirectives) {
+                    require(appliedDirective.name in byName) {
+                        "Directive @${directive.name} references unknown directive @${appliedDirective.name} " +
+                            "on argument '${arg.name}'. This indicates a malformed schema."
+                    }
+                    add(appliedDirective.name)
+                }
+            }
+        }
+
+    // Mutable path for cycle detection - uses backtracking to avoid O(n²) list copies
+    val path = mutableListOf<String>()
+
+    return buildList {
+        // DFS visit function
+        fun visit(name: String) {
+            if (name in black) return
+            if (name in gray) {
+                // Cycle detected - build error message showing the cycle
+                val cycleStart = path.indexOf(name)
+                val cycle = path.subList(cycleStart, path.size) + name
+                throw IllegalArgumentException(
+                    "Circular directive dependency detected: ${cycle.joinToString(" -> ") { "@$it" }}. " +
+                        "The GraphQL spec prohibits directives from referencing themselves directly or indirectly."
+                )
+            }
+
+            white.remove(name)
+            gray.add(name)
+            path.add(name)
+
+            val directive = byName[name]!!
+            // Visit dependencies in alphabetical order for determinism
+            for (dep in getDependencies(directive).sorted()) {
+                visit(dep)
+            }
+
+            path.removeLast()
+            gray.remove(name)
+            black.add(name)
+
+            // Add to final result
+            add(directive)
+        }
+
+        // Visit all directives in alphabetical order for deterministic output.
+        // Note: we check "name in white" because visit() may have already processed
+        // this directive transitively as a dependency of an earlier directive.
+        for (name in white.toList().sorted()) {
+            if (name in white) {
+                visit(name)
+            }
+        }
     }
 }

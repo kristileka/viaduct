@@ -1,18 +1,21 @@
 package viaduct.graphql.schema.graphqljava
 
 import graphql.schema.idl.SchemaParser
+import graphql.schema.idl.UnExecutableSchemaGenerator
 import kotlin.reflect.KClass
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.BeforeAll
 import org.junit.jupiter.api.Test
-import viaduct.graphql.schema.FilteredSchema
 import viaduct.graphql.schema.SchemaFilter
 import viaduct.graphql.schema.SchemaInvariantOptions
+import viaduct.graphql.schema.SchemaWithData
 import viaduct.graphql.schema.ViaductSchema
-import viaduct.graphql.schema.checkBridgeSchemaInvariants
+import viaduct.graphql.schema.checkViaductSchemaInvariants
+import viaduct.graphql.schema.graphqljava.extensions.fromGraphQLSchema
 import viaduct.graphql.schema.test.SchemaDiff
+import viaduct.graphql.schema.unfilteredDef
 import viaduct.invariants.InvariantChecker
 
 // TODO - Gradle doesn't seem to like this -- strange!!
@@ -124,16 +127,24 @@ class FilteredSchemaTest {
             type OB implements AKeep { a: String }
             """.trimIndent()
 
+        private fun filterSchema(
+            schema: ViaductSchema,
+            filter: SchemaFilter,
+            schemaInvariantOptions: SchemaInvariantOptions = SchemaInvariantOptions.DEFAULT,
+        ) = schema.filter(filter, schemaInvariantOptions)
+
         @BeforeAll
         @JvmStatic
         fun loadSchema() {
-            unfilteredTestSchema = GJSchema.fromRegistry(SchemaParser().parse(testSchemaString))
+            val registry = SchemaParser().parse(testSchemaString)
+            val graphQLSchema = UnExecutableSchemaGenerator.makeUnExecutableSchema(registry)
+            unfilteredTestSchema = ViaductSchema.fromGraphQLSchema(graphQLSchema)
         }
     }
 
     @Test
     fun `compare noop-filtered test schema against expected result`() {
-        val noopFilteredSchema = unfilteredTestSchema.filter(NoopSchemaFilter())
+        val noopFilteredSchema = filterSchema(unfilteredTestSchema, NoopSchemaFilter())
         SchemaDiff(unfilteredTestSchema, noopFilteredSchema).diff().assertEmpty("\n")
     }
 
@@ -145,7 +156,7 @@ class FilteredSchemaTest {
         try {
             InvariantChecker()
                 .also { check ->
-                    checkBridgeSchemaInvariants(unfilteredTestSchema.filter(EmptyTypesSchemaFilter()), check)
+                    checkViaductSchemaInvariants(filterSchema(unfilteredTestSchema, EmptyTypesSchemaFilter()), check)
                 }.assertEmpty("\n")
         } catch (_: AssertionError) {
             // Assertion error is expected here as the filtered schema has empty types
@@ -154,8 +165,9 @@ class FilteredSchemaTest {
         // Verify with an ALLOW_EMPTY_TYPES option enabled
         InvariantChecker()
             .also { check ->
-                checkBridgeSchemaInvariants(
-                    unfilteredTestSchema.filter(
+                checkViaductSchemaInvariants(
+                    filterSchema(
+                        unfilteredTestSchema,
                         schemaFilterProducingEmptyTypes,
                         SchemaInvariantOptions.ALLOW_EMPTY_TYPES
                     ),
@@ -169,49 +181,51 @@ class FilteredSchemaTest {
     fun `invariant checks on filtered test schema`() {
         InvariantChecker()
             .also { check ->
-                checkBridgeSchemaInvariants(unfilteredTestSchema.filter(SuffixSchemaFilter("Remove", "Keep")), check)
+                checkViaductSchemaInvariants(filterSchema(unfilteredTestSchema, SuffixSchemaFilter("Remove", "Keep")), check)
             }.assertEmpty("\n")
     }
 
     @Test
     fun `compare filtered test schema against expected result`() {
-        val filteredSchema = unfilteredTestSchema.filter(SuffixSchemaFilter("Remove", "Keep"))
+        val filteredSchema = filterSchema(unfilteredTestSchema, SuffixSchemaFilter("Remove", "Keep"))
         assertFalse(
             SchemaDiff(unfilteredTestSchema, filteredSchema).diff().isEmpty,
             "Unfiltered schema should be different from filtered schema"
         )
 
-        val expectedFilteredSchema = GJSchema.fromRegistry(SchemaParser().parse(filteredTestSchemaString))
+        val expectedRegistry = SchemaParser().parse(filteredTestSchemaString)
+        val expectedGraphQLSchema = UnExecutableSchemaGenerator.makeUnExecutableSchema(expectedRegistry)
+        val expectedFilteredSchema = ViaductSchema.fromGraphQLSchema(expectedGraphQLSchema)
         SchemaDiff(expectedFilteredSchema, filteredSchema).diff().assertEmpty("\n")
     }
 
     @Test
     fun `test unfilteredDef`() {
-        val filteredSchema = unfilteredTestSchema.filter(SuffixSchemaFilter("Remove", "Keep"))
+        val filteredSchema = filterSchema(unfilteredTestSchema, SuffixSchemaFilter("Remove", "Keep"))
 
-        val filteredEnum = filteredSchema.types["EnumKeep"] as FilteredSchema.Enum
-        filteredEnum.checkUnfilteredDef(GJSchema.Enum::class)
+        val filteredEnum = filteredSchema.types["EnumKeep"] as SchemaWithData.Enum
+        filteredEnum.checkUnfilteredDef(SchemaWithData.Enum::class)
 
         val filteredEnumValue = filteredEnum.values.first { it.name == "A" }
-        filteredEnumValue.checkUnfilteredDef(GJSchema.EnumValue::class)
+        filteredEnumValue.checkUnfilteredDef(SchemaWithData.EnumValue::class)
 
-        val filteredInput = filteredSchema.types["InputKeep"] as FilteredSchema.Input
-        filteredInput.checkUnfilteredDef(GJSchema.Input::class)
+        val filteredInput = filteredSchema.types["InputKeep"] as SchemaWithData.Input
+        filteredInput.checkUnfilteredDef(SchemaWithData.Input::class)
 
-        val filteredObj = filteredSchema.types["ObjectKeep"] as FilteredSchema.Object<*>
-        filteredObj.checkUnfilteredDef(GJSchema.Object::class)
+        val filteredObj = filteredSchema.types["ObjectKeep"] as SchemaWithData.Object
+        filteredObj.checkUnfilteredDef(SchemaWithData.Object::class)
 
-        val filteredField = filteredObj.field("c") as FilteredSchema.Field
-        filteredField.checkUnfilteredDef(GJSchema.Field::class)
+        val filteredField = filteredObj.field("c") as SchemaWithData.Field
+        filteredField.checkUnfilteredDef(SchemaWithData.Field::class)
 
         val filteredArg = filteredField.args.first { it.name == "a1" }
-        filteredArg.checkUnfilteredDef(GJSchema.FieldArg::class)
+        filteredArg.checkUnfilteredDef(SchemaWithData.FieldArg::class)
 
-        val filteredUnion = filteredSchema.types["UnionKeep"] as FilteredSchema.Union
-        filteredUnion.checkUnfilteredDef(GJSchema.Union::class)
+        val filteredUnion = filteredSchema.types["UnionKeep"] as SchemaWithData.Union
+        filteredUnion.checkUnfilteredDef(SchemaWithData.Union::class)
 
-        val filteredInterface = filteredSchema.types["InterfaceKeep"] as FilteredSchema.Interface
-        filteredInterface.checkUnfilteredDef(GJSchema.Interface::class)
+        val filteredInterface = filteredSchema.types["InterfaceKeep"] as SchemaWithData.Interface
+        filteredInterface.checkUnfilteredDef(SchemaWithData.Interface::class)
     }
 
     @Test
@@ -223,7 +237,7 @@ class FilteredSchemaTest {
                 .map { it.name }
                 .toSet()
         )
-        val filteredSchema = unfilteredTestSchema.filter(SuffixSchemaFilter("Remove", "Keep"))
+        val filteredSchema = filterSchema(unfilteredTestSchema, SuffixSchemaFilter("Remove", "Keep"))
         assertEquals(
             setOf("OA", "OB"),
             filteredSchema.types["AKeep"]!!
@@ -239,16 +253,17 @@ class FilteredSchemaTest {
 
     @Test
     fun `test unwrapAll for one layer`() {
-        val filteredSchema = unfilteredTestSchema.filter(SuffixSchemaFilter("Remove", "Keep"))
+        val filteredSchema = filterSchema(unfilteredTestSchema, SuffixSchemaFilter("Remove", "Keep"))
         `test unwrapAll`(unfilteredTestSchema, filteredSchema)
     }
 
     @Test
     fun `test unwrapAll for two layers`() {
         val filteredSchema =
-            unfilteredTestSchema
-                .filter(SuffixSchemaFilter("Remove", "Keep"))
-                .filter(NoopSchemaFilter())
+            filterSchema(
+                filterSchema(unfilteredTestSchema, SuffixSchemaFilter("Remove", "Keep")),
+                NoopSchemaFilter()
+            )
         `test unwrapAll`(unfilteredTestSchema, filteredSchema)
     }
 
@@ -281,9 +296,15 @@ class FilteredSchemaTest {
                     checkUnwrapping(unfilteredValue, values)
                 }
             }
-            is ViaductSchema.HasArgs -> {
+            is ViaductSchema.Field -> {
                 for (arg in filteredDef.args) {
-                    val unfilteredArg = (unfilteredDef as ViaductSchema.HasArgs).args.first { it.name == arg.name }
+                    val unfilteredArg = (unfilteredDef as ViaductSchema.Field).args.first { it.name == arg.name }
+                    checkUnwrapping(unfilteredArg, arg)
+                }
+            }
+            is ViaductSchema.Directive -> {
+                for (arg in filteredDef.args) {
+                    val unfilteredArg = (unfilteredDef as ViaductSchema.Directive).args.first { it.name == arg.name }
                     checkUnwrapping(unfilteredArg, arg)
                 }
             }
@@ -297,7 +318,7 @@ class FilteredSchemaTest {
         }
     }
 
-    private fun FilteredSchema.Def<*>.checkUnfilteredDef(expectedUnfilteredDefClass: KClass<out ViaductSchema.Def>) {
+    private fun SchemaWithData.Def.checkUnfilteredDef(expectedUnfilteredDefClass: KClass<out ViaductSchema.Def>) {
         assertTrue(expectedUnfilteredDefClass.isInstance(this.unfilteredDef))
         assertEquals(this.name, this.unfilteredDef.name)
     }
@@ -311,7 +332,7 @@ class EmptyTypesSchemaFilter : SchemaFilter {
     override fun includeEnumValue(enumValue: ViaductSchema.EnumValue) = true
 
     override fun includeSuper(
-        record: ViaductSchema.HasExtensionsWithSupers<*, *>,
+        record: ViaductSchema.OutputRecord,
         superInterface: ViaductSchema.Interface
     ) = true
 }
@@ -327,7 +348,7 @@ class SuffixSchemaFilter(
     override fun includeEnumValue(enumValue: ViaductSchema.EnumValue) = !enumValue.name.endsWith(suffixToFilter)
 
     override fun includeSuper(
-        record: ViaductSchema.HasExtensionsWithSupers<*, *>,
+        record: ViaductSchema.OutputRecord,
         superInterface: ViaductSchema.Interface
     ) = superInterface.name.endsWith(superSuffix)
 }

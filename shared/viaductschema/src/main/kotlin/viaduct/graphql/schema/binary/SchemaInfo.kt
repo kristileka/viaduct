@@ -1,8 +1,6 @@
 package viaduct.graphql.schema.binary
 
 import com.google.common.base.Utf8
-import graphql.language.NullValue
-import graphql.language.Value
 import viaduct.graphql.schema.ViaductSchema
 
 /**
@@ -27,8 +25,8 @@ internal class SchemaInfo(
     /** Count of source names including null placeholder */
     val sourceNameCount: Int get() = sourceNames.size + 1
 
-    val typeExprs: Map<ViaductSchema.TypeExpr, Int> by lazy {
-        mutableMapOf<ViaductSchema.TypeExpr, Int>().apply {
+    val typeExprs: Map<ViaductSchema.TypeExpr<*>, Int> by lazy {
+        mutableMapOf<ViaductSchema.TypeExpr<*>, Int>().apply {
             var idx = 0
             typeExprMap.entries.sortedBy { -it.value }.forEach {
                 put(it.key, idx++)
@@ -91,7 +89,7 @@ internal class SchemaInfo(
 
     private val identifierSet = sortedSetOf<String>()
     private val sourceNameSet = sortedSetOf<String>()
-    private val typeExprMap = mutableMapOf<ViaductSchema.TypeExpr, Int>()
+    private val typeExprMap = mutableMapOf<ViaductSchema.TypeExpr<*>, Int>()
 
     init {
         // Account for section magic number (4 bytes) in identifiers section
@@ -183,21 +181,12 @@ internal class SchemaInfo(
     //
     // Second-level visit functions
 
-    private fun visitAppliedDirectives(appliedDirectives: Collection<ViaductSchema.AppliedDirective>) {
+    private fun visitAppliedDirectives(appliedDirectives: Collection<ViaductSchema.AppliedDirective<*>>) {
         for (ad in appliedDirectives) {
             addIdentifier(ad.name)
-            val directiveDef = inputSchema.directives[ad.name]
-                ?: throw IllegalArgumentException("Unknown directive: ${ad.name}")
             for ((argName, argValue) in ad.arguments) {
                 addIdentifier(argName)
-                // Find the argument definition to get its type
-                val argDef = directiveDef.args.find { it.name == argName }
-                    ?: throw IllegalArgumentException("Unknown argument $argName for directive ${ad.name}")
-                // Convert the value to string representation using the argument's type
-                val value = argValue as? Value<*>
-                    ?: NullValue.newNullValue().build()
-                val constantRepr = ValueStringConverter.valueToString(value)
-                constantsEncoderBuilder.addValue(constantRepr)
+                addConstantValue(argValue)
             }
         }
     }
@@ -214,11 +203,7 @@ internal class SchemaInfo(
         addTypeExpr(f.type)
         // For input type fields, collect default values
         if (f.containingDef is ViaductSchema.Input && f.hasDefault) {
-            // Handle explicit null default values - ViaductSchema returns Java null instead of NullValue
-            val value = f.defaultValue as? Value<*>
-                ?: NullValue.newNullValue().build()
-            val constantRepr = ValueStringConverter.valueToString(value)
-            constantsEncoderBuilder.addValue(constantRepr)
+            addConstantValue(f.defaultValue)
         }
         for (a in f.args) visitArg(a)
         visitAppliedDirectives(f.appliedDirectives)
@@ -243,15 +228,39 @@ internal class SchemaInfo(
 
     private fun addConstant(arg: ViaductSchema.Arg) {
         if (arg.hasDefault) {
-            // Handle explicit null default values - ViaductSchema returns Java null instead of NullValue
-            val value = arg.defaultValue as? Value<*>
-                ?: NullValue.newNullValue().build()
-            val constantRepr = ValueStringConverter.valueToString(value)
-            constantsEncoderBuilder.addValue(constantRepr)
+            addConstantValue(arg.defaultValue)
         }
     }
 
-    private fun addTypeExpr(te: ViaductSchema.TypeExpr) {
+    /**
+     * Adds a constant value, extracting and registering any field names from
+     * InputObjectConstant values as identifiers.
+     */
+    private fun addConstantValue(value: ViaductSchema.Literal) {
+        val constantRepr = ValueStringConverter.valueToString(value)
+        extractIdentifiersFromConstant(constantRepr)
+        constantsEncoderBuilder.addValue(constantRepr)
+    }
+
+    /**
+     * Recursively extracts field names from compound constants and registers
+     * them as identifiers. This is needed because ObjectValue literals in SDL
+     * can use arbitrary field names that aren't otherwise declared in the schema.
+     */
+    private fun extractIdentifiersFromConstant(repr: Any?) {
+        when (repr) {
+            null, is String -> { /* Simple values have no identifiers to extract */ }
+            is ListConstant -> repr.elements.forEach { extractIdentifiersFromConstant(it) }
+            is InputObjectConstant -> {
+                for ((fieldName, fieldValue) in repr.fieldPairs) {
+                    addIdentifier(fieldName)
+                    extractIdentifiersFromConstant(fieldValue)
+                }
+            }
+        }
+    }
+
+    private fun addTypeExpr(te: ViaductSchema.TypeExpr<*>) {
         typeExprMap.put(te, 1 + typeExprMap.getOrDefault(te, 0))
     }
 

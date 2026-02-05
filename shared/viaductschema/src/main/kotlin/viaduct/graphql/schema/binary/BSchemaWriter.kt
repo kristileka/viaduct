@@ -3,7 +3,7 @@ package viaduct.graphql.schema.binary
 import java.io.OutputStream
 import viaduct.graphql.schema.ViaductSchema
 
-fun writeBSchema(
+internal fun writeBSchema(
     schema: ViaductSchema,
     dst: OutputStream
 ) {
@@ -12,6 +12,6 @@ fun writeBSchema(
         val schemaInfo = SchemaInfo(schema, constantsEncoderBuilder)
         val constantsEncoder = constantsEncoderBuilder.build()
 
-        SchemaEncoder(out, schemaInfo, constantsEncoder).encode(schema)
+        SchemaEncoder(out, schemaInfo, constantsEncoder).encode()
     }
 }

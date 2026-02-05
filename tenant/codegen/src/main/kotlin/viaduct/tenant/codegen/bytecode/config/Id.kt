@@ -1,6 +1,5 @@
 package viaduct.tenant.codegen.bytecode.config
 
-import graphql.language.StringValue
 import viaduct.graphql.schema.ViaductSchema
 import viaduct.tenant.codegen.bytecode.config.IdOf.Companion.idOf
 
@@ -17,12 +16,12 @@ data class IdOf(val type: String) {
     companion object {
         private val name: String = "idOf"
 
-        private fun parse(dir: ViaductSchema.AppliedDirective): IdOf {
+        private fun parse(dir: ViaductSchema.AppliedDirective<*>): IdOf {
             require(dir.name == name)
-            return IdOf((dir.arguments["type"] as StringValue).value)
+            return IdOf((dir.arguments["type"] as ViaductSchema.StringLiteral).value)
         }
 
-        val Iterable<ViaductSchema.AppliedDirective>.idOf: IdOf?
+        val Iterable<ViaductSchema.AppliedDirective<*>>.idOf: IdOf?
             get() = firstNotNullOfOrNull { if (it.name == name) parse(it) else null }
     }
 }

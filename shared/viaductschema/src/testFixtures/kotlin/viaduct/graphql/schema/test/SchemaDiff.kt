@@ -1,10 +1,5 @@
 package viaduct.graphql.schema.test
 
-import graphql.language.ArrayValue
-import graphql.language.IntValue
-import graphql.language.Node
-import graphql.language.StringValue
-import java.lang.IllegalArgumentException
 import viaduct.graphql.schema.ViaductSchema
 import viaduct.invariants.InvariantChecker
 
@@ -12,14 +7,13 @@ class SchemaDiff(
     private val expected: ViaductSchema,
     private val actual: ViaductSchema,
     private val checker: InvariantChecker = InvariantChecker(),
-    private val extraDiffs: ExtraDiffsVisitor = object : ExtraDiffsVisitor { },
     private val includeIntrospectiveTypes: Boolean = false
 ) {
     private var done = false
 
     fun diff(): InvariantChecker {
         if (!done) {
-            // Exclude introspective types from the comparison (not all BridgeSchema impls support them)
+            // Exclude introspective types from the comparison (not all ViaductSchema impls support them)
             visit(
                 expected.types.values.filter { !it.name.startsWith("__") },
                 actual.types.values.filter { !it.name.startsWith("__") },
@@ -61,17 +55,17 @@ class SchemaDiff(
     }
 
     private fun visitAppliedDirective(
-        expectedDir: ViaductSchema.AppliedDirective,
-        actualDir: ViaductSchema.AppliedDirective
+        expectedDir: ViaductSchema.AppliedDirective<*>,
+        actualDir: ViaductSchema.AppliedDirective<*>
     ) {
         sameNames(
             expectedDir.arguments.entries,
             actualDir.arguments.entries,
             "ARG",
-            Map.Entry<String, Any?>::key
+            Map.Entry<String, ViaductSchema.Literal>::key
         ).forEach {
             checker.withContext(it.first.key) {
-                checker.isTrue(areNodesEqual(it.first.value, it.second.value), "ARG_VALUE_AGREES")
+                checker.isTrue(areValuesEqual(it.first.value, it.second.value), "ARG_VALUE_AGREES")
             }
         }
     }
@@ -98,7 +92,7 @@ class SchemaDiff(
     ) {
         try {
             checker.pushContext(actualDef.name)
-            // Checks common for all [BridgeSchema.Def]s
+            // Checks common for all [ViaductSchema.Def]s
             if (!hasSameKind(expectedDef, actualDef, "DEF_CLASS")) {
                 return
             }
@@ -110,28 +104,25 @@ class SchemaDiff(
                 expectedDef.appliedDirectives,
                 actualDef.appliedDirectives,
                 "DIRECTIVE",
-                ViaductSchema.AppliedDirective::name
+                ViaductSchema.AppliedDirective<*>::name
             ).forEach {
                 checker.withContext(it.first.name) { visitAppliedDirective(it.first, it.second) }
             }
 
-            // Visit custom diff logic
-            extraDiffs.visitDef(expectedDef, actualDef, checker)
-
-            // Checks specific to each [BridgeSchema.Def] subclass
+            // Checks specific to each [ViaductSchema.Def] subclass
             if (expectedDef is ViaductSchema.HasDefaultValue) {
                 cvt(expectedDef, actualDef) { exp, act ->
                     hasSameKind(exp.containingDef, act.containingDef, "CONTAINING_TYPES_AGREE")
                     checker.isEqualTo(exp.type, act.type, "ARG_TYPE_AGREE")
                     checker.isEqualTo(exp.containingDef.name, act.containingDef.name, "CONTAINING_TYPE_NAMES_AGREE")
                     if (checker.isEqualTo(exp.hasDefault, act.hasDefault, "HAS_DEFAULTS_AGREE") && exp.hasDefault) {
-                        checker.isTrue(areNodesEqual(exp.defaultValue, act.defaultValue, exp.type), "DEFAULT_VALUES_AGREE")
+                        checker.isTrue(areValuesEqual(exp.defaultValue, act.defaultValue, exp.type), "DEFAULT_VALUES_AGREE")
                     }
                     if (checker.isEqualTo(exp.hasEffectiveDefault, act.hasEffectiveDefault, "HAS_DEFAULTS_AGREE") &&
                         exp.hasEffectiveDefault
                     ) {
                         checker.isTrue(
-                            areNodesEqual(
+                            areValuesEqual(
                                 exp.effectiveDefaultValue,
                                 act.effectiveDefaultValue,
                                 exp.type
@@ -154,7 +145,7 @@ class SchemaDiff(
                     )
                 }
             }
-            if (expectedDef is ViaductSchema.HasExtensions<*, *>) {
+            if (expectedDef is ViaductSchema.TypeDef) {
                 cvt(expectedDef, actualDef) { exp, act ->
                     fun ViaductSchema.Extension<*, *>.memberKeys() =
                         this.members
@@ -164,21 +155,29 @@ class SchemaDiff(
                     sameNames(exp.extensions, act.extensions, "EXTENSION", ViaductSchema.Extension<*, *>::memberKeys)
                 }
             }
-            if (expectedDef is ViaductSchema.HasExtensionsWithSupers<*, *>) {
+            if (expectedDef is ViaductSchema.OutputRecord) {
                 cvt(expectedDef, actualDef) { exp, act ->
-                    fun ViaductSchema.Extension<*, *>.supersKeys() =
-                        this.members
+                    fun ViaductSchema.ExtensionWithSupers<*, *>.supersKeys() =
+                        this.supers
                             .map { it.name }
                             .sorted()
                             .joinToString("::")
-                    sameNames(exp.extensions, act.extensions, "EXTENSION", ViaductSchema.Extension<*, *>::supersKeys)
+                    sameNames(exp.extensions, act.extensions, "EXTENSION_SUPERS", ViaductSchema.ExtensionWithSupers<*, *>::supersKeys)
                 }
             }
             if (expectedDef is ViaductSchema.Record) {
                 cvt(expectedDef, actualDef) { exp, act ->
-                    sameNames(exp.supers, act.supers, "SUPER", ViaductSchema.Def::name)
-                    sameNames(exp.unions, act.unions, "UNION", ViaductSchema.Def::name)
                     visit(exp.fields, act.fields, "FIELD")
+                }
+            }
+            if (expectedDef is ViaductSchema.OutputRecord) {
+                cvt(expectedDef, actualDef) { exp, act ->
+                    sameNames(exp.supers, act.supers, "SUPER", ViaductSchema.Def::name)
+                }
+            }
+            if (expectedDef is ViaductSchema.Object) {
+                cvt(expectedDef, actualDef) { exp, act ->
+                    sameNames(exp.unions, act.unions, "UNION", ViaductSchema.Def::name)
                 }
             }
             when (expectedDef) {
@@ -186,12 +185,10 @@ class SchemaDiff(
                     cvt(expectedDef, actualDef) { exp, act ->
                         hasSameKind(exp.containingDef, act.containingDef, "ARG_DEF_KIND_AGREE")
                         checker.isEqualTo(exp.containingDef.name, act.containingDef.name, "ARG_DEF_NAMES_AGREE")
-                        extraDiffs.visitArg(exp, act, checker)
                     }
                 is ViaductSchema.Enum ->
                     cvt(expectedDef, actualDef) { exp, act ->
                         visit(exp.values, act.values, "ENUM_VALUE")
-                        extraDiffs.visitEnum(exp, act, checker)
                     }
 
                 is ViaductSchema.EnumValue ->
@@ -205,11 +202,10 @@ class SchemaDiff(
                             exp.containingDef.appliedDirectives,
                             act.containingDef.appliedDirectives,
                             "EXTENSION_APPLIED_DIRECTIVE",
-                            ViaductSchema.AppliedDirective::name
+                            ViaductSchema.AppliedDirective<*>::name
                         ).forEach {
                             checker.withContext(it.first.name) { visitAppliedDirective(it.first, it.second) }
                         }
-                        extraDiffs.visitEnumValue(exp, act, checker)
                     }
 
                 is ViaductSchema.Field ->
@@ -220,30 +216,19 @@ class SchemaDiff(
                             exp.containingDef.appliedDirectives,
                             act.containingDef.appliedDirectives,
                             "EXTENSION_APPLIED_DIRECTIVE",
-                            ViaductSchema.AppliedDirective::name
+                            ViaductSchema.AppliedDirective<*>::name
                         ).forEach {
                             checker.withContext(it.first.name) { visitAppliedDirective(it.first, it.second) }
                         }
 
                         visit(exp.args, act.args, "ARG")
-                        extraDiffs.visitField(exp, act, checker)
                     }
 
-                is ViaductSchema.Object ->
-                    extraDiffs.visitObject(expectedDef, actualDef as ViaductSchema.Object, checker)
-
-                is ViaductSchema.Input ->
-                    extraDiffs.visitInput(expectedDef, actualDef as ViaductSchema.Input, checker)
-
-                is ViaductSchema.Interface ->
-                    extraDiffs.visitInterface(expectedDef, actualDef as ViaductSchema.Interface, checker)
-
-                is ViaductSchema.Scalar ->
-                    extraDiffs.visitScalar(expectedDef, actualDef as ViaductSchema.Scalar, checker)
-
-                is ViaductSchema.Union ->
-                    extraDiffs.visitUnion(expectedDef, actualDef as ViaductSchema.Union, checker)
-
+                is ViaductSchema.Object -> { }
+                is ViaductSchema.Input -> { }
+                is ViaductSchema.Interface -> { }
+                is ViaductSchema.Scalar -> { }
+                is ViaductSchema.Union -> { }
                 else -> throw IllegalStateException("Unknown type: $expectedDef")
             }
         } finally {
@@ -251,21 +236,21 @@ class SchemaDiff(
         }
     }
 
-    fun areNodesEqual(
-        expectedNode: Any?,
-        actualNode: Any?,
-        type: ViaductSchema.TypeExpr? = null
+    fun areValuesEqual(
+        expectedValue: ViaductSchema.Literal?,
+        actualValue: ViaductSchema.Literal?,
+        type: ViaductSchema.TypeExpr<*>? = null
     ): Boolean {
         // Handle null cases
-        if (expectedNode == null && actualNode == null) return true
-        if (expectedNode == null || actualNode == null) return false
+        if (expectedValue == null && actualValue == null) return true
+        if (expectedValue == null || actualValue == null) return false
 
         // For lists, recursively compare elements
-        if (type != null && expectedNode is ArrayValue && actualNode is ArrayValue) {
-            if (expectedNode.values.size != actualNode.values.size) return false
+        if (type != null && expectedValue is ViaductSchema.ListLiteral && actualValue is ViaductSchema.ListLiteral) {
+            if (expectedValue.size != actualValue.size) return false
             val elementType = type.unwrapList()
-            return expectedNode.values.zip(actualNode.values).all { (exp, act) ->
-                areNodesEqual(exp, act, elementType)
+            return expectedValue.zip(actualValue).all { (exp, act) ->
+                areValuesEqual(exp, act, elementType)
             }
         }
 
@@ -274,27 +259,30 @@ class SchemaDiff(
         if (type != null && !type.isList) {
             val baseType = type.baseTypeDef
             if (baseType is ViaductSchema.Scalar && baseType.name in setOf("Byte", "Short", "Long")) {
-                val expectedIntegral = extractIntegralValue(expectedNode)
-                val actualIntegral = extractIntegralValue(actualNode)
+                val expectedIntegral = extractIntegralValue(expectedValue)
+                val actualIntegral = extractIntegralValue(actualValue)
                 return expectedIntegral == actualIntegral
             }
         }
 
-        // Default comparison using Node.isEqualTo
-        return (expectedNode as Node<*>).isEqualTo(actualNode as Node<*>)
+        // Default comparison using value equality
+        return expectedValue == actualValue
     }
 
-    private fun extractIntegralValue(node: Any?): Any? =
-        when (node) {
-            is IntValue -> {
+    private fun extractIntegralValue(value: ViaductSchema.Literal?): Any? =
+        when (value) {
+            is ViaductSchema.IntLiteral -> {
                 try {
-                    node.value.toLong()
+                    value.value.toLong()
                 } catch (e: ArithmeticException) {
-                    throw IllegalArgumentException("Integral value out of Long range: ${node.value}", e)
+                    throw IllegalArgumentException("Integral value out of Long range: ${value.value}", e)
                 }
             }
-            is StringValue -> node.value?.toLongOrNull()
-            else -> node
+            is ViaductSchema.StringLiteral -> value.value.toLongOrNull()
+            // NullValue instances are semantically equal regardless of identity.
+            // Return a sentinel object so that all NullValues compare equal with ==.
+            is ViaductSchema.NullLiteral -> ViaductSchema.NullLiteral::class
+            else -> value
         }
 
     private fun hasSameKind(

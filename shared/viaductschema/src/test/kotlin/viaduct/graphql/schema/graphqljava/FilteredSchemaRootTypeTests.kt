@@ -1,27 +1,13 @@
 package viaduct.graphql.schema.graphqljava
 
-import viaduct.graphql.schema.FilteredSchema
-import viaduct.graphql.schema.SchemaInvariantOptions
+import graphql.schema.idl.UnExecutableSchemaGenerator
+import viaduct.graphql.schema.ViaductSchema
+import viaduct.graphql.schema.graphqljava.extensions.fromGraphQLSchema
 
 class FilteredSchemaRootTypeTests : RootTypeFactoryContractForBoth {
-    override fun makeSchema(
-        schema: String,
-        queryTypeName: String?,
-        mutationTypeName: String?,
-        subscriptionTypeName: String?
-    ) = with(GJSchema.fromRegistry(readTypes(schema))) {
-        if (queryTypeName == null && mutationTypeName == null && subscriptionTypeName == null) {
-            this.filter(NoopSchemaFilter())
-        } else {
-            FilteredSchema(
-                NoopSchemaFilter(),
-                this.types.entries,
-                this.directives.entries,
-                SchemaInvariantOptions.DEFAULT,
-                queryTypeName,
-                mutationTypeName,
-                subscriptionTypeName
-            )
-        }
+    override fun makeSchema(schema: String): ViaductSchema {
+        val registry = readTypes(schema)
+        val graphQLSchema = UnExecutableSchemaGenerator.makeUnExecutableSchema(registry)
+        return ViaductSchema.fromGraphQLSchema(graphQLSchema).filter(NoopSchemaFilter())
     }
 }

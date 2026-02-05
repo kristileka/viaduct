@@ -16,6 +16,8 @@ import io.kotest.matchers.types.shouldBeInstanceOf
 import java.math.BigDecimal
 import java.math.BigInteger
 import org.junit.jupiter.api.Test
+import viaduct.graphql.schema.ViaductSchema
+import viaduct.graphql.schema.graphqljava.extensions.fromGraphQLSchema
 import viaduct.graphql.schema.test.SchemaDiff
 
 /**
@@ -380,7 +382,7 @@ class ToGraphQLSchemaDefaultValueTest {
 
         val defaultValue = arg.argumentDefaultValue.value
         defaultValue.shouldBeInstanceOf<StringValue>()
-        (defaultValue as StringValue).value shouldBe "test"
+        defaultValue.value shouldBe "test"
     }
 
     @Test
@@ -393,7 +395,7 @@ class ToGraphQLSchemaDefaultValueTest {
 
         val defaultValue = arg.argumentDefaultValue.value
         defaultValue.shouldBeInstanceOf<IntValue>()
-        (defaultValue as IntValue).value shouldBe BigInteger.valueOf(42)
+        defaultValue.value shouldBe BigInteger.valueOf(42)
     }
 
     @Test
@@ -406,7 +408,7 @@ class ToGraphQLSchemaDefaultValueTest {
 
         val defaultValue = arg.argumentDefaultValue.value
         defaultValue.shouldBeInstanceOf<FloatValue>()
-        (defaultValue as FloatValue).value shouldBe BigDecimal("3.14")
+        defaultValue.value shouldBe BigDecimal("3.14")
     }
 
     @Test
@@ -419,7 +421,7 @@ class ToGraphQLSchemaDefaultValueTest {
 
         val defaultValue = arg.argumentDefaultValue.value
         defaultValue.shouldBeInstanceOf<BooleanValue>()
-        (defaultValue as BooleanValue).isValue shouldBe true
+        defaultValue.isValue shouldBe true
     }
 
     @Test
@@ -444,7 +446,7 @@ class ToGraphQLSchemaDefaultValueTest {
 
         val defaultValue = arg.argumentDefaultValue.value
         defaultValue.shouldBeInstanceOf<ArrayValue>()
-        val arrayValue = defaultValue as ArrayValue
+        val arrayValue = defaultValue
         arrayValue.values.size shouldBe 3
         arrayValue.values.map { (it as IntValue).value.toInt() } shouldBe listOf(1, 2, 3)
     }
@@ -462,7 +464,7 @@ class ToGraphQLSchemaDefaultValueTest {
 
         val defaultValue = arg.argumentDefaultValue.value
         defaultValue.shouldBeInstanceOf<ObjectValue>()
-        val objectValue = defaultValue as ObjectValue
+        val objectValue = defaultValue
         objectValue.objectFields.size shouldBe 2
 
         val xField = objectValue.objectFields.find { it.name == "x" }
@@ -488,7 +490,7 @@ class ToGraphQLSchemaDefaultValueTest {
 
         val defaultValue = limitField.inputFieldDefaultValue.value
         defaultValue.shouldBeInstanceOf<IntValue>()
-        (defaultValue as IntValue).value shouldBe BigInteger.valueOf(100)
+        defaultValue.value shouldBe BigInteger.valueOf(100)
     }
 
     // ==================== HELPER METHODS ====================
@@ -500,10 +502,10 @@ class ToGraphQLSchemaDefaultValueTest {
         ) {
             val tdr = SchemaParser().parse(sdl)
             val expectedGraphQLSchema = SchemaGenerator().makeExecutableSchema(tdr, RuntimeWiring.MOCKED_WIRING)
-            val expectedViaductSchema = GJSchema.fromSchema(expectedGraphQLSchema)
+            val expectedViaductSchema = ViaductSchema.fromGraphQLSchema(expectedGraphQLSchema)
 
             val actualGraphQLSchema = expectedViaductSchema.toGraphQLSchema(scalarsNeeded)
-            val actualViaductSchema = GJSchema.fromSchema(actualGraphQLSchema)
+            val actualViaductSchema = ViaductSchema.fromGraphQLSchema(actualGraphQLSchema)
 
             // Verify structural equivalence
             val schemaDiffResult = SchemaDiff(expectedViaductSchema, actualViaductSchema).diff()
@@ -520,7 +522,7 @@ class ToGraphQLSchemaDefaultValueTest {
         ): graphql.schema.GraphQLSchema {
             val tdr = SchemaParser().parse(sdl)
             val originalSchema = SchemaGenerator().makeExecutableSchema(tdr, RuntimeWiring.MOCKED_WIRING)
-            val viaductSchema = GJSchema.fromSchema(originalSchema)
+            val viaductSchema = ViaductSchema.fromGraphQLSchema(originalSchema)
             return viaductSchema.toGraphQLSchema(scalarsNeeded)
         }
     }

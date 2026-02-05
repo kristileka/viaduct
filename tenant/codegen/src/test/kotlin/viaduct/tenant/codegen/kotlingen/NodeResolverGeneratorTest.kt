@@ -72,6 +72,7 @@ class NodeResolverGeneratorTest {
 
     private fun mockTypeDef(name: String): ViaductSchema.TypeDef {
         return object : ViaductSchema.TypeDef {
+            override val containingSchema: ViaductSchema = ViaductSchema.Empty
             override val name = name
             override val kind = ViaductSchema.TypeDefKind.OBJECT
             override val appliedDirectives = listOf(mockAppliedDirective())
@@ -87,18 +88,22 @@ class NodeResolverGeneratorTest {
             override val possibleObjectTypes = emptySet<ViaductSchema.Object>()
 
             override fun hasAppliedDirective(name: String) = appliedDirectives.any { it.name == name }
+
+            override val extensions: Collection<ViaductSchema.Extension<ViaductSchema.TypeDef, ViaductSchema.Def>>
+                get() = TODO("Not yet implemented")
         }
     }
 
     private fun mockDirective(): ViaductSchema.Directive {
         return object : ViaductSchema.Directive {
+            override val containingSchema: ViaductSchema = ViaductSchema.Empty
             override val name = "resolver"
 
             override fun hasAppliedDirective(name: String): Boolean {
                 TODO("Not yet implemented")
             }
 
-            override val appliedDirectives: Collection<ViaductSchema.AppliedDirective>
+            override val appliedDirectives: Collection<ViaductSchema.AppliedDirective<*>>
                 get() = TODO("Not yet implemented")
             override val sourceLocation: ViaductSchema.SourceLocation?
                 get() = TODO("Not yet implemented")
@@ -109,10 +114,7 @@ class NodeResolverGeneratorTest {
         }
     }
 
-    private fun mockAppliedDirective(): ViaductSchema.AppliedDirective {
-        return object : ViaductSchema.AppliedDirective {
-            override val name = "mockDirective"
-            override val arguments = emptyMap<String, String>()
-        }
+    private fun mockAppliedDirective(): ViaductSchema.AppliedDirective<*> {
+        return ViaductSchema.AppliedDirective.of(mockDirective(), emptyMap())
     }
 }

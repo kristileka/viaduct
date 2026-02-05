@@ -24,9 +24,9 @@ import graphql.language.Type
 import graphql.language.TypeName
 import graphql.language.UnionTypeDefinition
 import graphql.language.UnionTypeExtensionDefinition
-import graphql.language.Value
 import graphql.schema.idl.TypeDefinitionRegistry
 import viaduct.graphql.schema.ViaductSchema
+import viaduct.graphql.schema.graphqljava.toGraphQLJavaValue
 
 data class TypeDefinitionRegistryOptions(
     val addStubsOnEmptyTypes: Boolean
@@ -126,7 +126,12 @@ fun ViaductSchema.Directive.toDirectiveDefinition() =
         .directiveLocations(allowedLocations.map { DirectiveLocation(it.name) })
         .build()
 
-fun ViaductSchema.Scalar.scalarTypeDefinition() = ScalarTypeDefinition.newScalarTypeDefinition().name(this.name).build()
+fun ViaductSchema.Scalar.scalarTypeDefinition() =
+    ScalarTypeDefinition
+        .newScalarTypeDefinition()
+        .name(this.name)
+        .directives(appliedDirectives.map { it.toDirectiveForTypeDefinition() })
+        .build()
 
 fun ViaductSchema.Object.toMergedObjectTypeDefinition(options: TypeDefinitionRegistryOptions = TypeDefinitionRegistryOptions.DEFAULT): ObjectTypeDefinition {
     val allFields = extensions.flatMap { it.members }
@@ -214,16 +219,8 @@ fun ViaductSchema.Input.toMergedInputTypeDefinition(): InputObjectTypeDefinition
     return InputObjectTypeDefinition
         .newInputObjectDefinition()
         .name(allFields.first().containingDef.name)
-        .inputValueDefinitions(
-            allFields.map { field ->
-                InputValueDefinition
-                    .newInputValueDefinition()
-                    .name(field.name)
-                    .type(field.type.toTypeForTypeDefinition())
-                    .directives(field.appliedDirectives.map { it.toDirectiveForTypeDefinition() })
-                    .build()
-            }
-        ).directives(extensions.map { it.appliedDirectives }.flatten().map { it.toDirectiveForTypeDefinition() })
+        .inputValueDefinitions(allFields.map { it.inputValueDefinition() })
+        .directives(extensions.map { it.appliedDirectives }.flatten().map { it.toDirectiveForTypeDefinition() })
         .sourceLocation(sourceLocation?.toSourceLocationDefinition())
         .build()
 }
@@ -232,16 +229,8 @@ fun ViaductSchema.Input.toInputObjectTypeDefinition() =
     InputObjectTypeDefinition
         .newInputObjectDefinition()
         .name(extensions.first().def.name)
-        .inputValueDefinitions(
-            extensions.first().members.map { field ->
-                InputValueDefinition
-                    .newInputValueDefinition()
-                    .name(field.name)
-                    .type(field.type.toTypeForTypeDefinition())
-                    .directives(field.appliedDirectives.map { it.toDirectiveForTypeDefinition() })
-                    .build()
-            }
-        ).directives(extensions.first().appliedDirectives.map { it.toDirectiveForTypeDefinition() })
+        .inputValueDefinitions(extensions.first().members.map { it.inputValueDefinition() })
+        .directives(extensions.first().appliedDirectives.map { it.toDirectiveForTypeDefinition() })
         .sourceLocation(sourceLocation?.toSourceLocationDefinition())
         .build()
 
@@ -250,16 +239,8 @@ fun ViaductSchema.Input.toInputObjectTypeDefinitionExtensions() =
         InputObjectTypeExtensionDefinition
             .newInputObjectTypeExtensionDefinition()
             .name(extension.def.name)
-            .inputValueDefinitions(
-                extension.members.map {
-                    InputValueDefinition
-                        .newInputValueDefinition()
-                        .name(it.name)
-                        .type(it.type.toTypeForTypeDefinition())
-                        .directives(it.appliedDirectives.map { it.toDirectiveForTypeDefinition() })
-                        .build()
-                }
-            ).directives(extension.appliedDirectives.map { it.toDirectiveForTypeDefinition() })
+            .inputValueDefinitions(extension.members.map { it.inputValueDefinition() })
+            .directives(extension.appliedDirectives.map { it.toDirectiveForTypeDefinition() })
             .sourceLocation(sourceLocation?.toSourceLocationDefinition())
             .build()
     }
@@ -312,16 +293,16 @@ fun ViaductSchema.Interface.toInterfaceTypeDefinitionExtensions() =
             .build()
     }
 
-fun ViaductSchema.Arg.inputValueDefinition() =
+fun ViaductSchema.HasDefaultValue.inputValueDefinition() =
     InputValueDefinition
         .newInputValueDefinition()
         .name(name)
         .type(type.toTypeForTypeDefinition())
-        .defaultValue(if (hasDefault) effectiveDefaultValue as Value<*>? else null)
+        .defaultValue(if (hasDefault) effectiveDefaultValue.toGraphQLJavaValue() else null)
         .directives(appliedDirectives.map { it.toDirectiveForTypeDefinition() })
         .build()
 
-fun ViaductSchema.AppliedDirective.toDirectiveForTypeDefinition() =
+fun ViaductSchema.AppliedDirective<*>.toDirectiveForTypeDefinition() =
     Directive
         .newDirective()
         .name(name)
@@ -331,9 +312,9 @@ fun ViaductSchema.AppliedDirective.toDirectiveForTypeDefinition() =
                     Argument
                         .newArgument()
                         .name(arg.key)
-                        .value(arg.value as Value<*>?)
+                        .value(arg.value.toGraphQLJavaValue())
                         .build()
-                }.filter { it.value != null }
+                }
         ).build()
 
 fun ViaductSchema.Union.toMergedUnionTypeDefinition(options: TypeDefinitionRegistryOptions = TypeDefinitionRegistryOptions.DEFAULT): UnionTypeDefinition {
@@ -364,7 +345,7 @@ fun ViaductSchema.Union.unionTypeDefinition(options: TypeDefinitionRegistryOptio
         .memberTypes(
             extensions.first().members.map { TypeName(it.name) } +
                 if (options.addStubsOnEmptyTypes) listOf(TypeName(ViaductSchema.VIADUCT_IGNORE_SYMBOL)) else emptyList()
-        ).directives(appliedDirectives.map { it.toDirectiveForTypeDefinition() })
+        ).directives(extensions.first().appliedDirectives.map { it.toDirectiveForTypeDefinition() })
         .sourceLocation(sourceLocation?.toSourceLocationDefinition())
         .build()
 
@@ -414,7 +395,7 @@ fun ViaductSchema.Enum.enumTypeDefinition() =
                     .directives(it.appliedDirectives.map { it.toDirectiveForTypeDefinition() })
                     .build()
             }
-        ).directives(appliedDirectives.map { it.toDirectiveForTypeDefinition() })
+        ).directives(extensions.first().appliedDirectives.map { it.toDirectiveForTypeDefinition() })
         .sourceLocation(sourceLocation?.toSourceLocationDefinition())
         .build()
 
@@ -436,7 +417,7 @@ fun ViaductSchema.Enum.enumTypeDefinitionExtensions() =
             .build()
     }
 
-private fun ViaductSchema.TypeExpr.constructNestedListType(
+private fun ViaductSchema.TypeExpr<*>.constructNestedListType(
     baseType: Type<*>,
     listDepth: Int
 ): Type<*> =
@@ -445,7 +426,7 @@ private fun ViaductSchema.TypeExpr.constructNestedListType(
         if (nullableAtDepth(index)) listType else NonNullType(listType)
     }
 
-fun ViaductSchema.TypeExpr.toTypeForTypeDefinition(): Type<*> {
+fun ViaductSchema.TypeExpr<*>.toTypeForTypeDefinition(): Type<*> {
     val typeName = TypeName(baseTypeDef.name)
     val baseType = if (!baseTypeNullable) NonNullType(typeName) else typeName
     return if (isList) {

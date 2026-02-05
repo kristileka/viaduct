@@ -2,27 +2,26 @@ package viaduct.graphql.schema
 
 import viaduct.invariants.InvariantChecker
 
-private typealias TypeMap = Map<String, FilteredSchema.TypeDef<out ViaductSchema.TypeDef>>
-
-/** See KDoc for [ViaductSchema] for a background.
+/**
+ * Creates a filtered schema from the given schema entries.
  *
- *  The `xyzTypeNameFromBaseSchema` parameters here work a bit differently from
- *  their analogs in `GJSchemaRaw`.  In `GJSchemaRaw`, they are used to set
- *  the root types, and thus if they name a non-existent type, the right behavior
- *  is to fail.  Here, the base schema is assumed to have (or not have) a root type
- *  defs, and the `xyzTypeNameFromBaseSchema` is intended to pass the name of those
- *  types in.  Now, it might be the case that those types get filtered out, so
- *  it's _not_ an error if they name non-existent types.  The code can't actually
- *  know, however, if `xyzTypeNameFromBaseSchema` is actually from the base schema,
- *  so it _does_ check to ensure that it names an object type.
+ * See KDoc for [ViaductSchema] for background.
  *
- *  (There's a bigger issue here that FilteredSchema does not take an actual schema
- *  as a constructor argument. The reason is that ViaductSchema itself is not
- *  parameterized by a `TypeDef` param, which we'd need to make the typing of
- *  FilteredSchema to work. Not sure if we want to fix this.)
+ * The `xyzTypeNameFromBaseSchema` parameters here work a bit differently from
+ * their analogs in `GJSchemaRaw`. In `GJSchemaRaw`, they are used to set
+ * the root types, and thus if they name a non-existent type, the right behavior
+ * is to fail. Here, the base schema is assumed to have (or not have) a root type
+ * defs, and the `xyzTypeNameFromBaseSchema` is intended to pass the name of those
+ * types in. Now, it might be the case that those types get filtered out, so
+ * it's _not_ an error if they name non-existent types. The code can't actually
+ * know, however, if `xyzTypeNameFromBaseSchema` is actually from the base schema,
+ * so it _does_ check to ensure that it names an object type.
+ *
+ * @return A [SchemaWithData] where each node's [SchemaWithData.Def.data] property
+ *         holds the corresponding unfiltered [ViaductSchema.Def]. Use extension
+ *         properties like [unfilteredDef] to access them.
  */
-@Suppress("DELEGATED_MEMBER_HIDES_SUPERTYPE_OVERRIDE")
-class FilteredSchema<T : ViaductSchema.TypeDef>(
+internal fun <T : ViaductSchema.TypeDef> filteredSchema(
     filter: SchemaFilter,
     schemaEntries: Iterable<Map.Entry<String, T>>,
     directiveEntries: Iterable<Map.Entry<String, ViaductSchema.Directive>>,
@@ -30,383 +29,358 @@ class FilteredSchema<T : ViaductSchema.TypeDef>(
     queryTypeNameFromBaseSchema: String?,
     mutationTypeNameFromBaseSchema: String?,
     subscriptionTypeNameFromBaseSchema: String?
-) : ViaductSchema {
-    private val defs: MutableMap<String, TypeDef<out T>> = mutableMapOf()
-    override val types: Map<String, TypeDef<out T>> = defs
-    override val directives = directiveEntries.associate { (k, v) -> k to Directive(v, defs) }
+): SchemaWithData {
+    val schema = SchemaWithData()
 
-    init {
+    // Phase 1: Create all TypeDef shells (no filter or defs passed to constructors)
+    val defs = buildMap {
         schemaEntries
             .filter { (_, value) -> filter.includeTypeDef(value) }
             .forEach { (k, v) ->
-                val wrappedValue =
-                    when (v) {
-                        is ViaductSchema.Enum -> Enum(v, defs, filter)
-                        is ViaductSchema.Input -> Input(v, defs, filter)
-                        is ViaductSchema.Interface -> Interface(v, defs, filter)
-                        is ViaductSchema.Object -> Object(v, defs, filter)
-                        is ViaductSchema.Union -> Union(v, defs, filter)
-                        is ViaductSchema.Scalar -> Scalar(v, defs)
-                        else -> throw IllegalArgumentException("Unexpected type definition $v")
-                    }
-                defs[k] = wrappedValue
+                val shell: SchemaWithData.TypeDef = when (v) {
+                    is ViaductSchema.Enum -> SchemaWithData.Enum(schema, v.name, v)
+                    is ViaductSchema.Input -> SchemaWithData.Input(schema, v.name, v)
+                    is ViaductSchema.Interface -> SchemaWithData.Interface(schema, v.name, v)
+                    is ViaductSchema.Object -> SchemaWithData.Object(schema, v.name, v)
+                    is ViaductSchema.Union -> SchemaWithData.Union(schema, v.name, v)
+                    is ViaductSchema.Scalar -> SchemaWithData.Scalar(schema, v.name, v)
+                    else -> throw IllegalArgumentException("Unexpected type definition $v")
+                }
+                put(k, shell)
             }
-
-        val violations = InvariantChecker()
-        checkBridgeSchemaInvariants(this, violations, schemaInvariantOptions)
-        violations.assertEmptyMultiline("FilteredSchema failed the following invariant checks:\n")
     }
 
-    private fun rootDef(nameFromBaseSchema: String?): ViaductSchema.Object? {
-        // As noted earlier, we shouldn't fail if the named type doesn't exist
-        val result = nameFromBaseSchema?.let { types[it] }
-        if (result != null && result !is ViaductSchema.Object) {
+    // Create directive shells
+    val directives = directiveEntries.associate { (k, v) ->
+        k to SchemaWithData.Directive(schema, v.name, v)
+    }
+
+    // Phase 2: Create decoder and populate all types and directives
+    val decoder = FilteredSchemaDecoder(filter, defs, directives)
+
+    for (typeDef in defs.values) {
+        when (typeDef) {
+            is SchemaWithData.Scalar -> typeDef.populate(
+                decoder.createScalarExtensions(typeDef)
+            )
+            is SchemaWithData.Enum -> typeDef.populate(
+                decoder.createEnumExtensions(typeDef)
+            )
+            is SchemaWithData.Input -> typeDef.populate(
+                decoder.createInputExtensions(typeDef)
+            )
+            is SchemaWithData.Union -> typeDef.populate(
+                decoder.createUnionExtensions(typeDef)
+            )
+            is SchemaWithData.Interface -> {
+                val unfilteredDef = typeDef.unfilteredDef
+                val filteredSupers = decoder.computeFilteredSupers(unfilteredDef)
+                typeDef.populate(
+                    decoder.createInterfaceExtensions(typeDef, filteredSupers),
+                    decoder.computePossibleObjectTypes(typeDef)
+                )
+            }
+            is SchemaWithData.Object -> {
+                val unfilteredDef = typeDef.unfilteredDef
+                val filteredSupers = decoder.computeFilteredSupers(unfilteredDef)
+                typeDef.populate(
+                    decoder.createObjectExtensions(typeDef, filteredSupers),
+                    decoder.computeFilteredUnions(typeDef)
+                )
+            }
+        }
+    }
+
+    for (directive in directives.values) {
+        decoder.populate(directive)
+    }
+
+    // Determine root types
+    fun rootDef(nameFromBaseSchema: String?): SchemaWithData.Object? {
+        val result = nameFromBaseSchema?.let { defs[it] }
+        if (result != null && result !is SchemaWithData.Object) {
             throw IllegalArgumentException("$result is not an object type.")
         }
-        return result as? ViaductSchema.Object
+        return result as? SchemaWithData.Object
     }
 
-    override val queryTypeDef = rootDef(queryTypeNameFromBaseSchema)
-    override val mutationTypeDef = rootDef(mutationTypeNameFromBaseSchema)
-    override val subscriptionTypeDef = rootDef(subscriptionTypeNameFromBaseSchema)
+    // Populate schema
+    schema.populate(
+        directives,
+        defs,
+        rootDef(queryTypeNameFromBaseSchema),
+        rootDef(mutationTypeNameFromBaseSchema),
+        rootDef(subscriptionTypeNameFromBaseSchema)
+    )
 
-    override fun toString() = defs.toString()
+    val violations = InvariantChecker()
+    checkViaductSchemaInvariants(schema, violations, schemaInvariantOptions)
+    violations.assertEmptyMultiline("FilteredSchema failed the following invariant checks:\n")
 
-    sealed interface Def<D : ViaductSchema.Def> : ViaductSchema.Def {
-        val unfilteredDef: D
+    return schema
+}
 
-        override fun unwrapAll(): ViaductSchema.Def = this.unfilteredDef.unwrapAll()
-    }
+/**
+ * Transforms unfiltered ViaductSchema elements into filtered SchemaWithData elements.
+ * This class centralizes all filtering and transformation logic.
+ */
+internal class FilteredSchemaDecoder(
+    private val filter: SchemaFilter,
+    private val filteredTypes: Map<String, SchemaWithData.TypeDef>,
+    private val filteredDirectives: Map<String, SchemaWithData.Directive>,
+) {
+    // ========== Core: Type Resolution ==========
 
-    sealed interface TypeDef<T : ViaductSchema.TypeDef> :
-        Def<T>,
-        ViaductSchema.TypeDef {
-        override fun asTypeExpr(): TypeExpr<*>
+    fun getFilteredType(name: String): SchemaWithData.TypeDef? = filteredTypes[name]
 
-        override val possibleObjectTypes: Set<Object<out ViaductSchema.Object>>
-    }
-
-    sealed interface Arg<D : ViaductSchema.Def, A : ViaductSchema.Arg> :
-        HasDefaultValue<D, A>,
-        ViaductSchema.Arg {
-        override val unfilteredDef: A
-        override val containingDef: Def<D>
-    }
-
-    interface HasArgs<D : ViaductSchema.Def> :
-        Def<D>,
-        ViaductSchema.HasArgs {
-        override val args: List<Arg<D, out ViaductSchema.Arg>>
-    }
-
-    class DirectiveArg<D : ViaductSchema.Directive, A : ViaductSchema.DirectiveArg> internal constructor(
-        override val unfilteredDef: A,
-        override val containingDef: Directive<D>,
-        private val defs: TypeMap
-    ) : Arg<D, A>,
-        ViaductSchema.DirectiveArg by unfilteredDef {
-        override val type = TypeExpr(unfilteredDef.type, defs)
-
-        override fun toString() = unfilteredDef.toString()
-    }
-
-    class Directive<D : ViaductSchema.Directive> internal constructor(
-        override val unfilteredDef: D,
-        private val defs: TypeMap
-    ) : HasArgs<D>,
-        ViaductSchema.Directive by unfilteredDef {
-        override val args = unfilteredDef.args.map { DirectiveArg(it, this, defs) }
-        override val isRepeatable: Boolean = unfilteredDef.isRepeatable
-
-        override fun toString() = unfilteredDef.toString()
-    }
-
-    class Scalar<S : ViaductSchema.Scalar> internal constructor(
-        override val unfilteredDef: S,
-        private val defs: TypeMap
-    ) : TypeDef<S>,
-        ViaductSchema.Scalar by unfilteredDef {
-        override fun asTypeExpr() = TypeExpr(unfilteredDef.asTypeExpr(), defs)
-
-        override fun toString() = unfilteredDef.toString()
-
-        override val possibleObjectTypes = emptySet<Object<out ViaductSchema.Object>>()
-    }
-
-    class EnumValue<E : ViaductSchema.Enum, V : ViaductSchema.EnumValue> internal constructor(
-        override val unfilteredDef: V,
-        override val containingDef: Enum<E>,
-        override val containingExtension: ViaductSchema.Extension<Enum<E>, EnumValue<E, *>>
-    ) : Def<V>,
-        ViaductSchema.EnumValue by unfilteredDef {
-        override fun toString() = unfilteredDef.toString()
-    }
-
-    class Enum<E : ViaductSchema.Enum> internal constructor(
-        override val unfilteredDef: E,
-        private val defs: TypeMap,
-        filter: SchemaFilter
-    ) : TypeDef<E>,
-        ViaductSchema.Enum by unfilteredDef {
-        override val extensions: List<ViaductSchema.Extension<Enum<E>, EnumValue<E, *>>> =
-            unfilteredDef.extensions.map { unfilteredExt ->
-                makeExtension(this, unfilteredDef, unfilteredExt) { ext ->
-                    unfilteredExt.members.filter(filter::includeEnumValue).map { EnumValue(it, this, ext) }
-                }
-            }
-
-        override val values = extensions.flatMap { it.members }
-
-        override fun value(name: String): EnumValue<E, *>? = values.find { name == it.name }
-
-        override fun asTypeExpr() = TypeExpr(unfilteredDef.asTypeExpr(), defs)
-
-        override val possibleObjectTypes = emptySet<Object<out ViaductSchema.Object>>()
-
-        override fun toString() = unfilteredDef.toString()
-    }
-
-    class Union<U : ViaductSchema.Union> internal constructor(
-        override val unfilteredDef: U,
-        private val defs: TypeMap,
-        filter: SchemaFilter
-    ) : TypeDef<U>,
-        ViaductSchema.Union by unfilteredDef {
-        override val extensions: List<ViaductSchema.Extension<Union<U>, Object<*>>> by lazy {
-            unfilteredDef.extensions.map { unfilteredExt ->
-                makeExtension(this, unfilteredDef, unfilteredExt) { _ ->
-                    unfilteredExt.members.filter(filter::includeTypeDef).map { defs[it.name] as Object<*> }
-                }
-            }
+    /**
+     * Remap applied directives to use the filtered schema's directive definitions.
+     */
+    private fun remapAppliedDirectives(unfilteredAppliedDirectives: Collection<ViaductSchema.AppliedDirective<*>>): List<ViaductSchema.AppliedDirective<*>> =
+        unfilteredAppliedDirectives.map { ad ->
+            val filteredDirective = filteredDirectives[ad.name]
+                ?: error("Directive @${ad.name} not found in filtered directives map.")
+            ViaductSchema.AppliedDirective.of(filteredDirective, ad.arguments)
         }
 
-        override fun asTypeExpr() = TypeExpr(unfilteredDef.asTypeExpr(), defs)
+    // ========== Scalar ==========
 
-        override val possibleObjectTypes by lazy { extensions.flatMap { it.members }.toSet() }
-
-        override fun toString() = unfilteredDef.toString()
+    fun createScalarExtensions(scalar: SchemaWithData.Scalar): List<ViaductSchema.Extension<SchemaWithData.Scalar, Nothing>> {
+        val unfilteredDef = scalar.unfilteredDef
+        return unfilteredDef.extensions.map { unfilteredExt ->
+            ViaductSchema.Extension.of(
+                def = scalar,
+                memberFactory = { emptyList() },
+                isBase = unfilteredExt.isBase,
+                appliedDirectives = remapAppliedDirectives(unfilteredExt.appliedDirectives),
+                sourceLocation = unfilteredExt.sourceLocation
+            )
+        }
     }
 
-    sealed interface HasDefaultValue<P : ViaductSchema.Def, H : ViaductSchema.HasDefaultValue> :
-        Def<H>,
-        ViaductSchema.HasDefaultValue {
-        override val containingDef: Def<P>
-        override val type: TypeExpr<*>
-    }
+    // ========== Enum ==========
 
-    class FieldArg<R : ViaductSchema.Record, F : ViaductSchema.Field, A : ViaductSchema.FieldArg> internal constructor(
-        override val unfilteredDef: A,
-        override val containingDef: Field<R, F>,
-        private val defs: TypeMap
-    ) : Arg<F, A>,
-        ViaductSchema.FieldArg by unfilteredDef {
-        override val type = TypeExpr(unfilteredDef.type, defs)
-
-        override fun toString() = unfilteredDef.toString()
-    }
-
-    class Field<R : ViaductSchema.Record, F : ViaductSchema.Field> internal constructor(
-        override val unfilteredDef: F,
-        override val containingDef: Record<R>,
-        override val containingExtension: ViaductSchema.Extension<Record<R>, Field<R, *>>,
-        defs: TypeMap
-    ) : HasDefaultValue<R, F>,
-        HasArgs<F>,
-        ViaductSchema.Field by unfilteredDef {
-        override val args = unfilteredDef.args.map { FieldArg(it, this, defs) }
-        override val type = TypeExpr(unfilteredDef.type, defs)
-        override val isOverride by lazy { ViaductSchema.isOverride(this) }
-
-        override fun toString() = unfilteredDef.toString()
-    }
-
-    sealed interface Record<R : ViaductSchema.Record> :
-        TypeDef<R>,
-        ViaductSchema.Record {
-        override val fields: List<Field<R, out ViaductSchema.Field>>
-
-        override fun field(name: String) = fields.find { name == it.name }
-
-        override fun field(path: Iterable<String>): Field<R, out ViaductSchema.Field> = ViaductSchema.field(this, path)
-
-        override val supers: List<Interface<*>>
-        override val unions: List<Union<*>>
-    }
-
-    class Interface<I : ViaductSchema.Interface> internal constructor(
-        override val unfilteredDef: I,
-        private val defs: TypeMap,
-        filter: SchemaFilter
-    ) : Record<I>,
-        ViaductSchema.Interface by unfilteredDef {
-        override val extensions: List<ViaductSchema.ExtensionWithSupers<Interface<I>, Field<I, *>>> by lazy {
-            val superNames = supers.map { it.name }.toSet()
-            unfilteredDef.extensions.map { unfilteredExt ->
-                val newSupers =
-                    unfilteredExt.supers
-                        .filter { superNames.contains(it.name) }
-                        .map { defs[it.name] as Interface<*> }
-                makeExtension(this, unfilteredDef, unfilteredExt, newSupers) { ext ->
+    fun createEnumExtensions(enumDef: SchemaWithData.Enum): List<ViaductSchema.Extension<SchemaWithData.Enum, SchemaWithData.EnumValue>> {
+        val unfilteredDef = enumDef.unfilteredDef
+        return unfilteredDef.extensions.map { unfilteredExt ->
+            ViaductSchema.Extension.of(
+                def = enumDef,
+                memberFactory = { ext ->
                     unfilteredExt.members
-                        .filter {
-                            filter.includeField(it) && filter.includeTypeDef(it.type.baseTypeDef)
-                        }.map { Field(it, this, ext, defs) }
-                }
-            }
+                        .filter(filter::includeEnumValue)
+                        .map { SchemaWithData.EnumValue(ext, it.name, remapAppliedDirectives(it.appliedDirectives), it) }
+                },
+                isBase = unfilteredExt == unfilteredDef.extensions.first(),
+                appliedDirectives = remapAppliedDirectives(unfilteredExt.appliedDirectives),
+                sourceLocation = unfilteredExt.sourceLocation
+            )
         }
-
-        override val fields by lazy { extensions.flatMap { it.members } }
-
-        override fun field(name: String) = super<Record>.field(name)
-
-        override fun field(path: Iterable<String>) = super<Record>.field(path)
-
-        override val supers by lazy { unfilteredDef.filterSupers(filter, defs) }
-        override val unions = emptyList<Union<*>>()
-
-        override fun asTypeExpr() = TypeExpr(unfilteredDef.asTypeExpr(), defs)
-
-        override val possibleObjectTypes by lazy {
-            unfilteredDef.possibleObjectTypes
-                .filter { filter.includePossibleSubType(it, unfilteredDef) }
-                .map { defs[it.name] as Object<*> }
-                .toSet()
-        }
-
-        override fun toString() = unfilteredDef.toString()
     }
 
-    class Object<O : ViaductSchema.Object> internal constructor(
-        override val unfilteredDef: O,
-        private val defs: TypeMap,
-        filter: SchemaFilter
-    ) : Record<O>,
-        ViaductSchema.Object by unfilteredDef {
-        override val extensions: List<ViaductSchema.ExtensionWithSupers<Object<O>, Field<O, *>>> by lazy {
-            val superNames = supers.map { it.name }.toSet()
-            unfilteredDef.extensions.map { unfilteredExt ->
-                val newSupers =
-                    unfilteredExt.supers
-                        .filter { superNames.contains(it.name) }
-                        .map { defs[it.name] as Interface<*> }
-                makeExtension(this, unfilteredDef, unfilteredExt, newSupers) { ext ->
+    // ========== Input ==========
+
+    fun createInputExtensions(inputDef: SchemaWithData.Input): List<ViaductSchema.Extension<SchemaWithData.Input, SchemaWithData.Field>> {
+        val unfilteredDef = inputDef.unfilteredDef
+        return unfilteredDef.extensions.map { unfilteredExt ->
+            ViaductSchema.Extension.of(
+                def = inputDef,
+                memberFactory = { ext ->
                     unfilteredExt.members
-                        .filter {
-                            filter.includeField(it) && filter.includeTypeDef(it.type.baseTypeDef)
-                        }.map { Field(it, this, ext, defs) }
-                }
-            }
+                        .filter { filter.includeField(it) && filter.includeTypeDef(it.type.baseTypeDef) }
+                        .map { createField(it, ext) }
+                },
+                isBase = unfilteredExt == unfilteredDef.extensions.first(),
+                appliedDirectives = remapAppliedDirectives(unfilteredExt.appliedDirectives),
+                sourceLocation = unfilteredExt.sourceLocation
+            )
         }
-
-        override val fields by lazy { extensions.flatMap { it.members } }
-
-        override fun field(name: String) = super<Record>.field(name)
-
-        override fun field(path: Iterable<String>) = super<Record>.field(path)
-
-        override val supers by lazy { unfilteredDef.filterSupers(filter, defs) }
-        override val unions by lazy {
-            unfilteredDef.unions
-                .filter { filter.includeTypeDef(it) }
-                .map { defs[it.name] as Union<*> }
-        }
-
-        override fun asTypeExpr() = TypeExpr(unfilteredDef.asTypeExpr(), defs)
-
-        override val possibleObjectTypes = setOf(this)
-
-        override fun toString() = unfilteredDef.toString()
     }
 
-    class Input<I : ViaductSchema.Input> internal constructor(
-        override val unfilteredDef: I,
-        private val defs: TypeMap,
-        filter: SchemaFilter
-    ) : Record<I>,
-        ViaductSchema.Input by unfilteredDef {
-        override val supers = emptyList<Interface<*>>()
-        override val unions = emptyList<Union<*>>()
-        override val extensions: List<ViaductSchema.Extension<Input<I>, Field<I, *>>> by lazy {
-            unfilteredDef.extensions.map { unfilteredExt ->
-                makeExtension(this, unfilteredDef, unfilteredExt) { ext ->
+    // ========== Union ==========
+
+    fun createUnionExtensions(unionDef: SchemaWithData.Union): List<ViaductSchema.Extension<SchemaWithData.Union, SchemaWithData.Object>> {
+        val unfilteredDef = unionDef.unfilteredDef
+        return unfilteredDef.extensions.map { unfilteredExt ->
+            ViaductSchema.Extension.of(
+                def = unionDef,
+                memberFactory = {
                     unfilteredExt.members
-                        .filter {
-                            filter.includeField(it) && filter.includeTypeDef(it.type.baseTypeDef)
-                        }.map { Field(it, this, ext, defs) }
+                        .filter(filter::includeTypeDef)
+                        .map { filteredTypes[it.name] as SchemaWithData.Object }
+                },
+                isBase = unfilteredExt == unfilteredDef.extensions.first(),
+                appliedDirectives = remapAppliedDirectives(unfilteredExt.appliedDirectives),
+                sourceLocation = unfilteredExt.sourceLocation
+            )
+        }
+    }
+
+    // ========== Interface ==========
+
+    fun createInterfaceExtensions(
+        interfaceDef: SchemaWithData.Interface,
+        filteredSupers: List<SchemaWithData.Interface>
+    ): List<ViaductSchema.ExtensionWithSupers<SchemaWithData.Interface, SchemaWithData.Field>> {
+        val unfilteredDef = interfaceDef.unfilteredDef
+        val superNames = filteredSupers.map { it.name }.toSet()
+        return unfilteredDef.extensions.map { unfilteredExt ->
+            val newSupers = unfilteredExt.supers
+                .filter { superNames.contains(it.name) }
+                .map { filteredTypes[it.name] as SchemaWithData.Interface }
+            ViaductSchema.ExtensionWithSupers.of(
+                def = interfaceDef,
+                memberFactory = { ext ->
+                    unfilteredExt.members
+                        .filter { filter.includeField(it) && filter.includeTypeDef(it.type.baseTypeDef) }
+                        .map { createField(it, ext) }
+                },
+                isBase = unfilteredExt == unfilteredDef.extensions.first(),
+                appliedDirectives = remapAppliedDirectives(unfilteredExt.appliedDirectives),
+                sourceLocation = unfilteredExt.sourceLocation,
+                supers = newSupers
+            )
+        }
+    }
+
+    fun computeFilteredSupers(unfilteredDef: ViaductSchema.OutputRecord): List<SchemaWithData.Interface> =
+        unfilteredDef.supers
+            .filter { filter.includeSuper(unfilteredDef, it) && filter.includeTypeDef(it) }
+            .map { filteredTypes[it.name] as SchemaWithData.Interface }
+
+    fun computePossibleObjectTypes(interfaceDef: SchemaWithData.Interface): Set<SchemaWithData.Object> {
+        val unfilteredDef = interfaceDef.unfilteredDef
+        return unfilteredDef.possibleObjectTypes
+            .filter { includePossibleSubType(it, unfilteredDef) }
+            .map { filteredTypes[it.name] as SchemaWithData.Object }
+            .toSet()
+    }
+
+    private fun includePossibleSubType(
+        possibleSubType: ViaductSchema.OutputRecord,
+        targetSuperType: ViaductSchema.Interface
+    ): Boolean =
+        when {
+            possibleSubType.supers.contains(targetSuperType) -> filter.includeSuper(possibleSubType, targetSuperType)
+            else ->
+                possibleSubType.supers.any {
+                    filter.includeSuper(possibleSubType, it) && includePossibleSubType(it, targetSuperType)
                 }
-            }
         }
 
-        override val fields by lazy { extensions.flatMap { it.members } }
+    // ========== Object ==========
 
-        override fun field(name: String) = super<Record>.field(name)
-
-        override fun field(path: Iterable<String>) = super<Record>.field(path)
-
-        override fun asTypeExpr() = TypeExpr(unfilteredDef.asTypeExpr(), defs)
-
-        override val possibleObjectTypes = emptySet<Object<out ViaductSchema.Object>>()
-
-        override fun toString() = unfilteredDef.toString()
+    fun createObjectExtensions(
+        objectDef: SchemaWithData.Object,
+        filteredSupers: List<SchemaWithData.Interface>
+    ): List<ViaductSchema.ExtensionWithSupers<SchemaWithData.Object, SchemaWithData.Field>> {
+        val unfilteredDef = objectDef.unfilteredDef
+        val superNames = filteredSupers.map { it.name }.toSet()
+        return unfilteredDef.extensions.map { unfilteredExt ->
+            val newSupers = unfilteredExt.supers
+                .filter { superNames.contains(it.name) }
+                .map { filteredTypes[it.name] as SchemaWithData.Interface }
+            ViaductSchema.ExtensionWithSupers.of(
+                def = objectDef,
+                memberFactory = { ext ->
+                    unfilteredExt.members
+                        .filter { filter.includeField(it) && filter.includeTypeDef(it.type.baseTypeDef) }
+                        .map { createField(it, ext) }
+                },
+                isBase = unfilteredExt == unfilteredDef.extensions.first(),
+                appliedDirectives = remapAppliedDirectives(unfilteredExt.appliedDirectives),
+                sourceLocation = unfilteredExt.sourceLocation,
+                supers = newSupers
+            )
+        }
     }
 
-    class TypeExpr<T : ViaductSchema.TypeExpr> internal constructor(
-        private val unfilteredTypeExpr: T,
-        private val defs: TypeMap
-    ) : ViaductSchema.TypeExpr() {
-        override val baseTypeNullable = unfilteredTypeExpr.baseTypeNullable
-        override val baseTypeDef: TypeDef<out ViaductSchema.TypeDef>
-            get() {
-                val baseTypeDefName = unfilteredTypeExpr.baseTypeDef.name
-                return defs[baseTypeDefName]
-                    ?: throw IllegalStateException("$baseTypeDefName not found")
-            }
-        override val listNullable = unfilteredTypeExpr.listNullable
-
-        override fun unwrapLists() = TypeExpr(unfilteredTypeExpr.unwrapLists(), defs)
-
-        override fun unwrapList() = unfilteredTypeExpr.unwrapList()?.let { TypeExpr(it, defs) }
+    fun computeFilteredUnions(objectDef: SchemaWithData.Object): List<SchemaWithData.Union> {
+        val unfilteredDef = objectDef.unfilteredDef
+        return unfilteredDef.unions
+            .filter { filter.includeTypeDef(it) }
+            .map { filteredTypes[it.name] as SchemaWithData.Union }
     }
 
-    companion object {
-        private fun ViaductSchema.HasExtensionsWithSupers<*, *>.filterSupers(
-            filter: SchemaFilter,
-            defs: TypeMap
-        ) = this.supers
-            .filter { filter.includeSuper(this, it) && filter.includeTypeDef(it) }
-            .map { defs[it.name] as Interface<*> }
+    // ========== Directive ==========
 
-        private fun <D : ViaductSchema.TypeDef, M : ViaductSchema.Def> makeExtension(
-            def: D,
-            unfilteredDef: ViaductSchema.HasExtensions<*, *>,
-            unfilteredExt: ViaductSchema.Extension<*, *>,
-            memberFactory: (ViaductSchema.Extension<D, M>) -> List<M>
-        ) = ViaductSchema.Extension.of(
-            def = def,
-            memberFactory = memberFactory,
-            isBase = unfilteredExt == unfilteredDef.extensions.first(),
-            appliedDirectives = unfilteredExt.appliedDirectives,
-            sourceLocation = unfilteredExt.sourceLocation
+    fun populate(directive: SchemaWithData.Directive) {
+        val unfilteredDef = directive.unfilteredDef
+        val args = unfilteredDef.args.map { createDirectiveArg(it, directive) }
+        directive.populate(
+            unfilteredDef.isRepeatable,
+            unfilteredDef.allowedLocations,
+            unfilteredDef.sourceLocation,
+            args
         )
+    }
 
-        private fun <D : ViaductSchema.TypeDef, M : ViaductSchema.Def> makeExtension(
-            def: D,
-            unfilteredDef: ViaductSchema.HasExtensions<*, *>,
-            unfilteredExt: ViaductSchema.Extension<*, *>,
-            supers: List<Interface<*>>,
-            memberFactory: (ViaductSchema.Extension<D, M>) -> List<M>
-        ) = ViaductSchema.ExtensionWithSupers.of(
-            def = def,
-            memberFactory = memberFactory,
-            isBase = unfilteredExt == unfilteredDef.extensions.first(),
-            appliedDirectives = unfilteredExt.appliedDirectives,
-            sourceLocation = unfilteredExt.sourceLocation,
-            supers = supers
+    // ========== Helper: Field and Args ==========
+
+    private fun createField(
+        unfilteredField: ViaductSchema.Field,
+        containingExtension: ViaductSchema.Extension<SchemaWithData.Record, SchemaWithData.Field>
+    ): SchemaWithData.Field {
+        val typeExpr = createTypeExprFromDefs(unfilteredField.type)
+        return SchemaWithData.Field(
+            containingExtension,
+            unfilteredField.name,
+            typeExpr,
+            remapAppliedDirectives(unfilteredField.appliedDirectives),
+            unfilteredField.hasDefault,
+            if (unfilteredField.hasDefault) unfilteredField.defaultValue else null,
+            unfilteredField,
+            argsFactory = { field -> createFieldArgs(field, unfilteredField) }
         )
+    }
+
+    private fun createFieldArgs(
+        field: SchemaWithData.Field,
+        unfilteredField: ViaductSchema.Field
+    ): List<SchemaWithData.FieldArg> =
+        unfilteredField.args.map { arg ->
+            val typeExpr = createTypeExprFromDefs(arg.type)
+            SchemaWithData.FieldArg(
+                field,
+                arg.name,
+                typeExpr,
+                remapAppliedDirectives(arg.appliedDirectives),
+                arg.hasDefault,
+                if (arg.hasDefault) arg.defaultValue else null,
+                arg
+            )
+        }
+
+    private fun createDirectiveArg(
+        unfilteredArg: ViaductSchema.DirectiveArg,
+        directive: SchemaWithData.Directive
+    ): SchemaWithData.DirectiveArg {
+        val typeExpr = createTypeExprFromDefs(unfilteredArg.type)
+        return SchemaWithData.DirectiveArg(
+            directive,
+            unfilteredArg.name,
+            typeExpr,
+            remapAppliedDirectives(unfilteredArg.appliedDirectives),
+            unfilteredArg.hasDefault,
+            if (unfilteredArg.hasDefault) unfilteredArg.defaultValue else null,
+            unfilteredArg
+        )
+    }
+
+    private fun createTypeExprFromDefs(unfilteredTypeExpr: ViaductSchema.TypeExpr<*>): ViaductSchema.TypeExpr<SchemaWithData.TypeDef> {
+        val baseTypeDef = filteredTypes[unfilteredTypeExpr.baseTypeDef.name]
+            ?: error("${unfilteredTypeExpr.baseTypeDef.name} not found in filtered types")
+        return ViaductSchema.TypeExpr(baseTypeDef, unfilteredTypeExpr.baseTypeNullable, unfilteredTypeExpr.listNullable)
     }
 }
 
-/** See KDoc for [ViaductSchema] for a background. */
+/**
+ * Encapsulates logic for projecting a schema. Allows one to
+ * remove type-defs, fields, and enumeration values from
+ * schemas. You can also remove the supertypes of object
+ * and interface types. You cannot remove directive
+ * definitions nor can you remove applied directives from
+ * any schema element.
+ */
 interface SchemaFilter {
     fun includeTypeDef(typeDef: ViaductSchema.TypeDef): Boolean
 
@@ -415,19 +389,7 @@ interface SchemaFilter {
     fun includeEnumValue(enumValue: ViaductSchema.EnumValue): Boolean
 
     fun includeSuper(
-        record: ViaductSchema.HasExtensionsWithSupers<*, *>,
+        record: ViaductSchema.OutputRecord,
         superInterface: ViaductSchema.Interface
     ): Boolean
-
-    fun includePossibleSubType(
-        possibleSubType: ViaductSchema.HasExtensionsWithSupers<*, *>,
-        targetSuperType: ViaductSchema.Interface
-    ): Boolean =
-        when {
-            possibleSubType.supers.contains(targetSuperType) -> includeSuper(possibleSubType, targetSuperType)
-            else ->
-                possibleSubType.supers.any {
-                    includeSuper(possibleSubType, it) && includePossibleSubType(it, targetSuperType)
-                }
-        }
 }

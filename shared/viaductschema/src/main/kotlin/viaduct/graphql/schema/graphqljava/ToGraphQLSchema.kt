@@ -14,7 +14,6 @@ import graphql.language.InputObjectTypeDefinition
 import graphql.language.IntValue
 import graphql.language.InterfaceTypeDefinition
 import graphql.language.NullValue
-import graphql.language.ObjectField
 import graphql.language.ObjectTypeDefinition
 import graphql.language.ObjectValue
 import graphql.language.ScalarTypeDefinition
@@ -48,35 +47,11 @@ import graphql.schema.GraphQLUnionType
 import viaduct.graphql.schema.ViaductSchema
 
 /**
- * A passthrough Coercing implementation for custom scalars that just returns values as-is.
- * This is suitable for creating an unexecutable schema representation.
+ * This function is a prototype for the time being - used to take
+ * some preliminary performance measurements as we try to imporve
+ * our schema-build times.  Please don't use for production
+ * purposes!!
  */
-private object PassthroughCoercing : Coercing<Any, Any> {
-    override fun serialize(dataFetcherResult: Any): Any = dataFetcherResult
-
-    override fun parseValue(input: Any): Any = input
-
-    override fun parseLiteral(input: Any): Any = input
-
-    override fun parseLiteral(
-        input: Value<*>,
-        variables: CoercedVariables,
-        graphQLContext: GraphQLContext,
-        locale: java.util.Locale
-    ): Any? {
-        return when (input) {
-            is StringValue -> input.value
-            is IntValue -> input.value
-            is FloatValue -> input.value
-            is BooleanValue -> input.isValue
-            is NullValue -> null
-            is ArrayValue -> input.values.map { parseLiteral(it, variables, graphQLContext, locale) }
-            is ObjectValue -> input.objectFields.associate { it.name to parseLiteral(it.value, variables, graphQLContext, locale) }
-            else -> input
-        }
-    }
-}
-
 fun ViaductSchema.toGraphQLSchema(
     scalarsNeeded: Set<String> = emptySet(),
     additionalScalars: Set<String> = emptySet(),
@@ -154,7 +129,7 @@ private class GraphQLJavaSchemaBuilder(
     internal fun typeRef(typeDef: ViaductSchema.TypeDef): GraphQLNamedType = convertedTypeDefs[typeDef.name] ?: GraphQLTypeReference(typeDef.name)
 
     /** Note: updates [scalarsSeen]. */
-    internal fun typeExpr(source: ViaductSchema.TypeExpr): GraphQLType {
+    internal fun typeExpr(source: ViaductSchema.TypeExpr<*>): GraphQLType {
         val base = source.baseTypeDef
         if (base is ViaductSchema.Scalar) scalarsSeen.add(base.name)
         var result: GraphQLType = typeRef(base)
@@ -239,9 +214,9 @@ private class GraphQLJavaSchemaBuilder(
         }
     }
 
-    internal fun inputTypeExpr(source: ViaductSchema.TypeExpr): GraphQLInputType = typeExpr(source) as GraphQLInputType
+    internal fun inputTypeExpr(source: ViaductSchema.TypeExpr<*>): GraphQLInputType = typeExpr(source) as GraphQLInputType
 
-    internal fun outputTypeExpr(source: ViaductSchema.TypeExpr): GraphQLOutputType = typeExpr(source) as GraphQLOutputType
+    internal fun outputTypeExpr(source: ViaductSchema.TypeExpr<*>): GraphQLOutputType = typeExpr(source) as GraphQLOutputType
 
     internal fun convertInputObjectType(source: ViaductSchema.Input): GraphQLInputObjectType {
         val c = convertedTypeDefs[source.name]
@@ -375,7 +350,7 @@ private class GraphQLJavaSchemaBuilder(
 
         val result = tbuilder.build()
         convertedTypeDefs[source.name] = result
-        registryBuilder.typeResolverIfAbsent(result) { env ->
+        registryBuilder.typeResolverIfAbsent(result) { _ ->
             error("No type resolver configured for interface '${source.name}'. This schema is not executable.")
         }
         return result
@@ -403,7 +378,7 @@ private class GraphQLJavaSchemaBuilder(
         val deprecationInfo = extractDeprecation(source.appliedDirectives)
         return GraphQLArgument.Builder()
             .name(source.name)
-            .type(inputTypeExpr(source.type as ViaductSchema.TypeExpr))
+            .type(inputTypeExpr(source.type))
             .apply {
                 if (source.hasDefault) {
                     defaultValueLiteral(toGraphQLValue(source.defaultValue))
@@ -444,7 +419,7 @@ private class GraphQLJavaSchemaBuilder(
             }
             .build()
         convertedTypeDefs[typeDef.name] = result
-        registryBuilder.typeResolverIfAbsent(result) { env ->
+        registryBuilder.typeResolverIfAbsent(result) { _ ->
             error("No type resolver configured for union '${typeDef.name}'. This schema is not executable.")
         }
         return result
@@ -454,13 +429,12 @@ private class GraphQLJavaSchemaBuilder(
      * Extracts the deprecation reason from applied directives.
      * Returns the reason string if @deprecated is present, null otherwise.
      */
-    private fun extractDeprecation(directives: Collection<ViaductSchema.AppliedDirective>): String? {
+    private fun extractDeprecation(directives: Collection<ViaductSchema.AppliedDirective<*>>): String? {
         val deprecated = directives.find { it.name == "deprecated" } ?: return null
         val reason = deprecated.arguments["reason"]
         return when (reason) {
-            is StringValue -> reason.value
-            is String -> reason
-            null -> "No longer supported" // GraphQL spec default
+            is ViaductSchema.StringLiteral -> reason.value
+            is ViaductSchema.NullLiteral, null -> "No longer supported" // GraphQL spec default
             else -> reason.toString()
         }
     }
@@ -469,9 +443,9 @@ private class GraphQLJavaSchemaBuilder(
      * Converts a ViaductSchema.AppliedDirective to a graphql-java GraphQLAppliedDirective.
      *
      * Note: The argument values in ViaductSchema.AppliedDirective.arguments are stored as
-     * graphql.language.Value<*> objects when using ValueConverter.default.
+     * graphql.language.Value<*> objects.
      */
-    internal fun convertAppliedDirective(source: ViaductSchema.AppliedDirective): GraphQLAppliedDirective {
+    internal fun convertAppliedDirective(source: ViaductSchema.AppliedDirective<*>): GraphQLAppliedDirective {
         // Look up the directive definition to get argument types
         val directiveDef = inputSchema.directives[source.name]
 
@@ -479,19 +453,16 @@ private class GraphQLJavaSchemaBuilder(
             .name(source.name)
             .apply {
                 source.arguments.forEach { (name, value) ->
-                    // Convert the value to a graphql.language.Value if it isn't already
-                    val literalValue = toGraphQLValue(value)
-
                     // Get the argument type from the directive definition, or use String as fallback
                     val argType = directiveDef?.args?.find { it.name == name }?.type?.let {
-                        inputTypeExpr(it as ViaductSchema.TypeExpr)
+                        inputTypeExpr(it)
                     } ?: Scalars.GraphQLString
 
                     argument(
                         GraphQLAppliedDirectiveArgument.newArgument()
                             .name(name)
                             .type(argType)
-                            .valueLiteral(literalValue)
+                            .valueLiteral(value.toGraphQLJavaValue())
                             .build()
                     )
                 }
@@ -521,7 +492,7 @@ private class GraphQLJavaSchemaBuilder(
     private fun convertDirectiveArg(source: ViaductSchema.DirectiveArg): GraphQLArgument {
         return GraphQLArgument.Builder()
             .name(source.name)
-            .type(inputTypeExpr(source.type as ViaductSchema.TypeExpr))
+            .type(inputTypeExpr(source.type))
             .apply {
                 if (source.hasDefault) {
                     defaultValueLiteral(toGraphQLValue(source.defaultValue))
@@ -571,43 +542,38 @@ private class GraphQLJavaSchemaBuilder(
 }
 
 /**
- * Converts a value from ViaductSchema representation back to graphql-java Value<*>.
- *
- * Values must already be graphql.language.Value<*> types, not Kotlin primitives.
- * The only exceptions are:
- * - null → NullValue
- * - List<*> → ArrayValue (elements recursively converted)
- * - Map<String, *> → ObjectValue (values recursively converted)
+ * Converts a ViaductSchema default value (which is a graphql.language.Value<*>) back to
+ * graphql-java Value<*>. This is a place holder: in the future we will be replacing
+ * graphql-java's Value<*> classes with our own, and this will then be needed.
  */
-@Suppress("UNCHECKED_CAST")
-private fun toGraphQLValue(value: Any?): Value<*> {
-    return when (value) {
-        // Already a Value - just return it
-        is Value<*> -> value
+private fun toGraphQLValue(value: ViaductSchema.Literal): Value<*> = value.toGraphQLJavaValue()
 
-        // Null
-        null -> NullValue.of()
+/**
+ * A passthrough Coercing implementation for custom scalars that just returns values as-is.
+ * This is suitable for creating an unexecutable schema representation.
+ */
+private object PassthroughCoercing : Coercing<Any, Any> {
+    override fun serialize(dataFetcherResult: Any): Any = dataFetcherResult
 
-        // List
-        is List<*> -> ArrayValue.newArrayValue()
-            .values(value.map { toGraphQLValue(it) })
-            .build()
+    override fun parseValue(input: Any): Any = input
 
-        // Map (for input objects)
-        is Map<*, *> -> ObjectValue.newObjectValue()
-            .objectFields(
-                (value as Map<String, *>).map { (k, v) ->
-                    ObjectField.newObjectField()
-                        .name(k)
-                        .value(toGraphQLValue(v))
-                        .build()
-                }
-            )
-            .build()
+    override fun parseLiteral(input: Any): Any = input
 
-        else -> throw IllegalArgumentException(
-            "Unsupported value type for conversion: ${value::class}. " +
-                "Values must already be graphql.language.Value types, not Kotlin primitives."
-        )
+    override fun parseLiteral(
+        input: Value<*>,
+        variables: CoercedVariables,
+        graphQLContext: GraphQLContext,
+        locale: java.util.Locale
+    ): Any? {
+        return when (input) {
+            is StringValue -> input.value
+            is IntValue -> input.value
+            is FloatValue -> input.value
+            is BooleanValue -> input.isValue
+            is NullValue -> null
+            is ArrayValue -> input.values.map { parseLiteral(it, variables, graphQLContext, locale) }
+            is ObjectValue -> input.objectFields.associate { it.name to parseLiteral(it.value, variables, graphQLContext, locale) }
+            else -> input
+        }
     }
 }

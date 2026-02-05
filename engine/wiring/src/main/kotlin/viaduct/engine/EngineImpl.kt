@@ -15,10 +15,9 @@ import kotlinx.coroutines.future.await
 import viaduct.engine.api.Engine
 import viaduct.engine.api.EngineExecutionContext
 import viaduct.engine.api.EngineObjectData
-import viaduct.engine.api.ExecuteSelectionSetOptions
 import viaduct.engine.api.ExecutionInput
-import viaduct.engine.api.FragmentLoader
 import viaduct.engine.api.RawSelectionSet
+import viaduct.engine.api.ResolveSelectionSetOptions
 import viaduct.engine.api.SubqueryExecutionException
 import viaduct.engine.api.TemporaryBypassAccessCheck
 import viaduct.engine.api.ViaductSchema
@@ -56,7 +55,6 @@ class EngineImpl(
     private val fullSchema: ViaductSchema,
 ) : Engine, EngineGraphQLJavaCompat {
     private val coroutineInterop: CoroutineInterop = config.coroutineInterop
-    private val fragmentLoader: FragmentLoader = config.fragmentLoader
     private val flagManager: FlagManager = config.flagManager
     private val temporaryBypassAccessCheck: TemporaryBypassAccessCheck = config.temporaryBypassAccessCheck
     private val dataFetcherExceptionHandler: DataFetcherExceptionHandler = config.dataFetcherExceptionHandler
@@ -134,7 +132,6 @@ class EngineImpl(
     private val engineExecutionContextFactory = EngineExecutionContextFactory(
         fullSchema,
         dispatcherRegistry,
-        fragmentLoader,
         resolverDataFetcherInstrumentation,
         flagManager,
         this,
@@ -152,10 +149,10 @@ class EngineImpl(
         return graphql.executeAsync(gjExecutionInput).await()
     }
 
-    override suspend fun executeSelectionSet(
+    override suspend fun resolveSelectionSet(
         executionHandle: EngineExecutionContext.ExecutionHandle,
         selectionSet: RawSelectionSet,
-        options: ExecuteSelectionSetOptions,
+        options: ResolveSelectionSetOptions,
     ): EngineObjectData {
         val parentParams = executionHandle.asExecutionParameters()
 
@@ -220,15 +217,13 @@ class EngineImpl(
                 .executionId(ExecutionId.generate())
                 .query(executionInput.operationText)
 
-        if (executionInput.operationName != null) {
-            executionInputBuilder.operationName(executionInput.operationName)
-        }
+        executionInput.operationName?.let { executionInputBuilder.operationName(it) }
         executionInputBuilder.variables(executionInput.variables)
         val localContext = CompositeLocalContext.withContexts(mkEngineExecutionContext(executionInput.requestContext))
 
         @Suppress("DEPRECATION")
         return executionInputBuilder
-            .context(executionInput.requestContext)
+            .apply { executionInput.requestContext?.let { context(it) } }
             .localContext(localContext)
             .graphQLContext(GraphQLJavaConfig.default.asMap())
             .build()

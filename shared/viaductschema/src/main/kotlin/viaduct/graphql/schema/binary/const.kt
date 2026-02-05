@@ -1,3 +1,5 @@
+@file:Suppress("NOTHING_TO_INLINE")
+
 package viaduct.graphql.schema.binary
 
 import viaduct.graphql.schema.ViaductSchema
@@ -18,7 +20,7 @@ internal const val HEADER_SIZE_IN_WORDS = 16
 internal const val MAGIC_NUMBER: Int = 0xA75F2B1C.toInt()
 
 /** File format version using semantic versioning (major.minor in bytes 1.0). */
-internal const val FILE_VERSION: Int = 0x00000002
+internal const val FILE_VERSION: Int = 0x00000003
 
 /**
  * File version unused bits mask (bits 16-31 unused).
@@ -106,7 +108,7 @@ internal const val EMPTY_OBJECT_MARKER = -2
 
 @JvmInline
 internal value class TexprWordOne(val word: Int) {
-    constructor(baseTypeIdx: Int, te: ViaductSchema.TypeExpr) : this(encode(baseTypeIdx, te))
+    constructor(baseTypeIdx: Int, te: ViaductSchema.TypeExpr<*>) : this(encode(baseTypeIdx, te))
 
     inline fun baseTypeNullable() = (0 != (word and BASE_TYPE_NULLABLE_BIT))
 
@@ -121,7 +123,7 @@ internal value class TexprWordOne(val word: Int) {
     companion object {
         private fun encode(
             baseTypeIdx: Int,
-            te: ViaductSchema.TypeExpr
+            te: ViaductSchema.TypeExpr<*>
         ): Int {
             val code = (VEC_TO_CODE[te.listNullable] ?: TWO_WORD_CODE) shl 28
             val baseNullableBit = (if (te.baseTypeNullable) 1 else 0) shl 31
@@ -166,13 +168,13 @@ internal value class TexprWordOne(val word: Int) {
             size: Int
         ): BitVector = BitVector.Builder().add(bits.toLong(), size).build()
 
-        fun typeExprByteSize(te: ViaductSchema.TypeExpr) = if (VEC_TO_CODE[te.listNullable] != null) WORD_SIZE else 2 * WORD_SIZE
+        fun typeExprByteSize(te: ViaductSchema.TypeExpr<*>) = if (VEC_TO_CODE[te.listNullable] != null) WORD_SIZE else 2 * WORD_SIZE
     }
 }
 
 @JvmInline
 internal value class TexprWordTwo(val word: Int) {
-    constructor(te: ViaductSchema.TypeExpr) : this(encode(te))
+    constructor(te: ViaductSchema.TypeExpr<*>) : this(encode(te))
 
     inline fun listDepth(): Int = (word ushr MAX_LIST_DEPTH) and 0x1F
 
@@ -184,7 +186,7 @@ internal value class TexprWordTwo(val word: Int) {
     companion object {
         const val MAX_LIST_DEPTH = 27
 
-        private fun encode(te: ViaductSchema.TypeExpr): Int {
+        private fun encode(te: ViaductSchema.TypeExpr<*>): Int {
             val depth = te.listDepth.takeIf { it <= MAX_LIST_DEPTH }
                 ?: throw IllegalArgumentException("Max list depth exceeded ($te).")
             return (depth shl MAX_LIST_DEPTH) or te.listNullable.get(0, depth).toInt()
@@ -296,7 +298,7 @@ internal const val SIMPLE_CONSTANT_KIND_LOW_NIBBLE_MASK = 0x0F
  * Depth is calculated as 1 + the maximum depth of any element.
  * For example: [1, 2, 3] has depth 1, [[1], [2]] has depth 2.
  */
-data class ListConstant(override val depth: Int, val elements: List<Any?>) : CompoundConstant {
+internal data class ListConstant(override val depth: Int, val elements: List<Any?>) : CompoundConstant {
     override val key = elements
 }
 
@@ -306,7 +308,7 @@ data class ListConstant(override val depth: Int, val elements: List<Any?>) : Com
  * Depth is calculated as 1 + the maximum depth of any field value.
  * For example: {x: 1, y: 2} has depth 1, {x: {y: 1}} has depth 2.
  */
-data class InputObjectConstant(override val depth: Int, val fieldPairs: Map<String, Any?>) : CompoundConstant {
+internal data class InputObjectConstant(override val depth: Int, val fieldPairs: Map<String, Any?>) : CompoundConstant {
     override val key = fieldPairs
 }
 
@@ -316,7 +318,7 @@ data class InputObjectConstant(override val depth: Int, val fieldPairs: Map<Stri
  * The depth property enables ordering by nesting level, which will be used
  * for future optimizations in the binary encoding.
  */
-sealed interface CompoundConstant : Comparable<CompoundConstant> {
+internal sealed interface CompoundConstant : Comparable<CompoundConstant> {
     val depth: Int
     val key: Any?
 

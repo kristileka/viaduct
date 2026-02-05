@@ -1,18 +1,19 @@
 import viaduct.gradle.internal.repoRoot
 
 plugins {
-    id("org.jetbrains.dokka")
     id("conventions.dokka")
 }
 
 dependencies {
     dokka(libs.viaduct.service.wiring)
     dokka(libs.viaduct.service.api)
+    // Required for aggregating multiple Dokka modules into a single publication
+    dokkaHtmlPublicationPlugin(libs.dokka.all.modules.page.plugin)
 }
 
 dokka {
     dokkaPublications.html {
-        outputDirectory.set(repoRoot().dir("docs/static/apis/service"))
+        outputDirectory.set(repoRoot().dir("docs/docs/apis/service"))
         includes.from(layout.projectDirectory.file("module.md"))
     }
     pluginsConfiguration.html {

@@ -5,6 +5,7 @@ plugins {
     `java-test-fixtures`
     id("conventions.kotlin-static-analysis")
     id("conventions.dokka")
+    id("conventions.bcv-api")
     id("jacoco-integration-base")
 }
 
@@ -40,6 +41,7 @@ dependencies {
     testImplementation(testFixtures(libs.viaduct.shared.mapping))
 
     /** Test dependencies - External **/
+    testImplementation(libs.assertj.core)
     testImplementation(libs.graphql.java.extension)
     testImplementation(libs.io.mockk.jvm)
     testImplementation(libs.kotlinx.coroutines.test)

@@ -1,0 +1,19 @@
+{
+  "version": "1",
+  "tenantName": "generatedregistrytest",
+  "apiName": "kotlin",
+  "executorFactory": "viaduct.service.runtime.GeneratedRegistryTestExecutorFactory",
+  "nodes": [],
+  "fields": [
+    {
+      "typeName": "Query",
+      "fieldName": "generatedRegistryTestField",
+      "isBatching": false,
+      "isSelective": false,
+      "attribution": "generated-registry-test",
+      "tenantAPIData": {
+        "value": "generated-registry"
+      }
+    }
+  ]
+}

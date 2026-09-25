@@ -1,0 +1,145 @@
+package viaduct.engine.runtime.tenantloading
+
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import viaduct.bootstrap.ExecutionRegistryConfigFile
+import viaduct.engine.api.bootstrap.executionregistry.ModuleConfigSource
+import viaduct.engine.api.spi.ExecutorFactory
+import viaduct.service.api.spi.CodeInjector
+import viaduct.service.api.spi.TenantModuleInjectorFactory
+
+/**
+ * Engine-owned orchestration that turns a pre-collected list of [ModuleConfigSource]s into one
+ * [ModuleResolvers] instance per source.
+ *
+ * Resource discovery and tenant-name resolution happen upstream (in
+ * [ExecutionRegistryConfigSourceCollector]); this class is concerned only with bootstrap
+ * orchestration. For each source, it reuses the parsed [ExecutionRegistryConfigFile], instantiates
+ * the [ExecutorFactory] FQN via the 2-arg constructor (CodeInjector, ExecutionRegistryConfigFile),
+ * and creates executors for each entry in the registry.
+ *
+ * The framework calls [tenantModuleInjectorFactory] once per tenant with the tenant name (taken
+ * from the [ModuleConfigSource]) and the bootstrap class from the registry (or null) to obtain a
+ * per-tenant [CodeInjector]. Once all tenants have been bootstrapped, the framework calls
+ * [TenantModuleInjectorFactory.onBootstrapComplete] before constructing executor factories so
+ * stateful implementations can complete cross-tenant setup. Bootstrap class loading and executor factory
+ * construction are concurrent; bootstrapping is intentionally sequential to keep the
+ * [TenantModuleInjectorFactory] contract simple.
+ *
+ * Pass [grtPackagePrefix] to override the GRT package used by the executor factory, allowing tenant
+ * implementations to decouple from the production default (e.g. contract tests generate GRTs into
+ * the tenant package rather than the production constant).
+ */
+class ModuleConfigBootstrapper(
+    private val tenantModuleInjectorFactory: TenantModuleInjectorFactory,
+    private val grtPackagePrefix: String? = null,
+) {
+    /**
+     * Runs the bootstrap algorithm over [moduleConfigSources] and returns one
+     * [ModuleResolvers] instance per source.
+     */
+    suspend fun bootstrap(moduleConfigSources: List<ModuleConfigSource>): List<ModuleResolvers> {
+        // The inputs to one registry build must form a map: at most one config per
+        // <tenantName, apiName>. Enforced here because every bootstrap path converges on this call
+        // (classpath discovery, hotswap overlay, generated built-ins, and callers that hand
+        // StandardViaduct.Builder a list directly), so no producer can bypass it.
+        ModuleConfigSource.requireUniqueKeys(moduleConfigSources)
+
+        val parsedRegistries = coroutineScope {
+            moduleConfigSources.map { moduleConfigSource ->
+                async {
+                    val registry = moduleConfigSource.config
+                    ParsedRegistry(
+                        source = moduleConfigSource,
+                        registry = registry,
+                        bootstrapClass = registry.bootstrapClass?.let { Class.forName(it) },
+                    )
+                }
+            }.awaitAll()
+        }
+
+        // A single tenant may contribute more than one source (e.g. a `kotlin` `<pkg>.json` and a
+        // classic `<pkg>.classic.json`), but the TenantModuleInjectorFactory SPI contract is to
+        // bootstrap each tenant exactly once. Group sources by tenant and bootstrap once per tenant,
+        // reusing the one CodeInjector across all of that tenant's sources.
+        // Note this projects tenantName out of the config key deliberately: injector scope and
+        // bootstrap-class agreement are tenant-module concerns, so keying them by the full
+        // <tenantName, apiName> would give a tenant's per-API configs one injector each.
+        //
+        // Keep bootstrap calls sequential so service-owned TenantModuleInjectorFactory implementations
+        // do not need to be thread-safe when accumulating cross-tenant state prior to onBootstrapComplete().
+        val codeInjectorsByTenant = LinkedHashMap<String, CodeInjector>()
+        parsedRegistries.groupBy { it.source.tenantName }.forEach { (tenantName, tenantRegistries) ->
+            codeInjectorsByTenant[tenantName] = tenantModuleInjectorFactory.bootstrap(
+                tenantName = tenantName,
+                tenantBootstrapClass = bootstrapClassFor(tenantName, tenantRegistries),
+            )
+        }
+
+        tenantModuleInjectorFactory.onBootstrapComplete()
+
+        return coroutineScope {
+            parsedRegistries.map { parsedRegistry ->
+                val codeInjector = codeInjectorsByTenant.getValue(parsedRegistry.source.tenantName)
+                async {
+                    val executorFactory = instantiateExecutorFactory(
+                        fqn = parsedRegistry.registry.executorFactory,
+                        registry = parsedRegistry.registry,
+                        codeInjector = codeInjector,
+                    )
+                    ModuleResolvers(parsedRegistry.registry, executorFactory)
+                }
+            }.awaitAll()
+        }
+    }
+
+    /**
+     * Resolves the single bootstrap class for a tenant from its (possibly multiple) sources. Sources
+     * may omit a bootstrap class (null), but any that declare one must agree, since the tenant is
+     * bootstrapped exactly once.
+     */
+    private fun bootstrapClassFor(
+        tenantName: String,
+        tenantRegistries: List<ParsedRegistry>,
+    ): Class<*>? {
+        val distinctBootstrapClasses = tenantRegistries.mapNotNull { it.bootstrapClass }.distinct()
+        require(distinctBootstrapClasses.size <= 1) {
+            "Tenant '$tenantName' declares conflicting bootstrap classes across its config sources: " +
+                distinctBootstrapClasses.joinToString { it.name }
+        }
+        return distinctBootstrapClasses.singleOrNull()
+    }
+
+    private fun instantiateExecutorFactory(
+        fqn: String,
+        registry: ExecutionRegistryConfigFile,
+        codeInjector: CodeInjector,
+    ): ExecutorFactory {
+        val clazz = Class.forName(fqn)
+        @Suppress("UNCHECKED_CAST")
+        return if (grtPackagePrefix != null) {
+            // Tenant implementations may override the default GRT package prefix so the
+            // executor factory is decoupled from any hardcoded constant (e.g. contract tests
+            // generate GRTs into the tenant package rather than the production default).
+            val ctor = clazz.getDeclaredConstructor(
+                CodeInjector::class.java,
+                String::class.java,
+                ExecutionRegistryConfigFile::class.java,
+            )
+            ctor.newInstance(codeInjector, grtPackagePrefix, registry) as ExecutorFactory
+        } else {
+            val ctor = clazz.getDeclaredConstructor(
+                CodeInjector::class.java,
+                ExecutionRegistryConfigFile::class.java,
+            )
+            ctor.newInstance(codeInjector, registry) as ExecutorFactory
+        }
+    }
+}
+
+private data class ParsedRegistry(
+    val source: ModuleConfigSource,
+    val registry: ExecutionRegistryConfigFile,
+    val bootstrapClass: Class<*>?,
+)

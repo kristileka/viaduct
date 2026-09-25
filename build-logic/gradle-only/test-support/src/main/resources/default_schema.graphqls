@@ -1,0 +1,83 @@
+"@backingData directive"
+directive @backingData(class: String!) on FIELD_DEFINITION
+
+"@idOf directive"
+directive @idOf(type: String!) on FIELD_DEFINITION | ARGUMENT_DEFINITION | INPUT_FIELD_DEFINITION
+
+"@resolver directive"
+directive @resolver(isSelective: Boolean! = false, isBatching: Boolean! = false) on OBJECT | FIELD_DEFINITION
+
+"@scope directive"
+directive @scope(to: [String!]!) repeatable on OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT
+
+"@tenantLocal directive"
+directive @tenantLocal on FIELD_DEFINITION
+
+"Marks an object type as a Relay Connection type"
+directive @connection on OBJECT
+
+"Marks an object type as a Relay Edge type"
+directive @edge on OBJECT
+
+"Marks an object type as a namespace type (non-entity container for grouping resolvers)"
+directive @namespaceType on OBJECT
+
+"Marks a field as resolving to the current execution parent object"
+directive @parent on FIELD_DEFINITION
+
+interface Node @scope(to: ["*"]) {
+  id: ID!
+}
+
+type Mutation @scope(to: ["*"]) {
+  _: String @deprecated(reason: "Dummy field to ensure root type is valid. Do not use.")
+}
+
+type Query @scope(to: ["*"]) {
+  "Fetches an object given its ID"
+  node("The ID of an object" id: ID!): Node @resolver
+  "Fetches objects given their IDs"
+  nodes("The IDs of objects" ids: [ID!]!): [Node]! @resolver
+}
+
+type Subscription @scope(to: ["*"]) {
+  _: String @deprecated(reason: "Dummy field to ensure root type is valid. Do not use.")
+}
+
+"Custom scalar type for private fields"
+scalar BackingData
+
+"An arbitrary precision signed decimal"
+scalar BigDecimal
+
+"An arbitrary precision signed integer"
+scalar BigInteger
+
+"An 8-bit signed integer"
+scalar Byte
+
+"An RFC-3339 compliant Full Date Scalar"
+scalar Date
+
+"A slightly refined version of RFC-3339 compliant DateTime Scalar"
+scalar DateTime
+
+"A JSON scalar"
+scalar JSON
+
+"Long type that serializes/deserializes to/from a string."
+scalar Long
+
+"A 16-bit signed integer"
+scalar Short
+
+"An RFC-3339 compliant Full Time Scalar"
+scalar Time
+
+"PageInfo for Relay-style connection types"
+type PageInfo {
+  hasNextPage: Boolean!
+  hasPreviousPage: Boolean!
+  startCursor: String
+  endCursor: String
+}

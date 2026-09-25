@@ -1,7 +1,6 @@
 package com.example.viadapp
 
 import com.fasterxml.jackson.databind.ObjectMapper
-import io.kotest.common.runBlocking
 import jakarta.servlet.http.HttpServlet
 import jakarta.servlet.http.HttpServletRequest
 import jakarta.servlet.http.HttpServletResponse
@@ -99,17 +98,12 @@ class ViaductServlet(
             operationName = operationName
         )
         val result = try {
-            runBlocking {
-                viaduct.executeAsync(executionInput).join()
-            }
+            viaduct.executeAsync(executionInput).join()
         } catch (e: Exception) {
             sendError(resp, 500, e.message ?: "Execution error")
             return
         }
-        // Convert to GraphQL spec format and send response
-        val specResult = result.toSpecification()
-        val statusCode = if (result.errors.isNotEmpty()) 400 else 200
-        sendJson(resp, statusCode, specResult)
+        sendJson(resp, 200, result.toSpecification())
     }
 
     private fun sendJson(

@@ -1,0 +1,91 @@
+package viaduct.gradle.task
+
+import java.io.File
+import javaResolverBasesDirectory
+import javax.inject.Inject
+import org.gradle.api.DefaultTask
+import org.gradle.api.Project
+import org.gradle.api.file.ConfigurableFileCollection
+import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.provider.Property
+import org.gradle.api.tasks.CacheableTask
+import org.gradle.api.tasks.Classpath
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputFiles
+import org.gradle.api.tasks.OutputDirectory
+import org.gradle.api.tasks.PathSensitive
+import org.gradle.api.tasks.PathSensitivity
+import org.gradle.api.tasks.TaskAction
+import org.gradle.workers.WorkerExecutor
+import viaduct.gradle.CodegenWorkAction
+import viaduct.gradle.ViaductModulePackageLayout
+import viaduct.gradle.ViaductPluginCommon
+import viaduct.gradle.runCodegen
+
+@CacheableTask
+abstract class GenerateJavaResolverBasesTask
+    @Inject
+    constructor(
+        private val workerExecutor: WorkerExecutor
+    ) : DefaultTask() {
+        init {
+            description = "Generate abstract Java resolver base classes from the merged schema. Implement these classes to write your GraphQL field resolvers."
+        }
+
+        @get:Classpath
+        abstract val classpath: ConfigurableFileCollection
+
+        @get:InputFiles
+        @get:PathSensitive(PathSensitivity.RELATIVE)
+        abstract val centralSchemaFiles: ConfigurableFileCollection
+
+        @get:Input
+        abstract val tenantPackagePrefix: Property<String>
+
+        @get:Input
+        abstract val tenantPackage: Property<String>
+
+        @get:OutputDirectory
+        abstract val outputDirectory: DirectoryProperty
+
+        @TaskAction
+        fun taskAction() {
+            val resolverDir = outputDirectory.get().asFile
+            if (resolverDir.exists()) resolverDir.deleteRecursively()
+            resolverDir.mkdirs()
+
+            val grtDiscardDir = temporaryDir.resolve("discard-grts").apply {
+                deleteRecursively()
+                mkdirs()
+            }
+
+            val fullPackage = listOf(tenantPackagePrefix.get(), tenantPackage.get())
+                .filter { it.isNotBlank() }
+                .joinToString(".")
+
+            workerExecutor.runCodegen(
+                classpath,
+                CodegenWorkAction.MainClasses.JAVA_GRTS_GENERATOR,
+                listOf(
+                    "--schema_files",
+                    centralSchemaFiles.files.map(File::getAbsolutePath).sorted().joinToString(","),
+                    "--grt_output_dir",
+                    grtDiscardDir.absolutePath,
+                    "--grt_package",
+                    ViaductPluginCommon.JAVA_GRT_PACKAGE,
+                    "--resolver_generated_dir",
+                    resolverDir.absolutePath,
+                    "--tenant_package",
+                    fullPackage
+                )
+            )
+        }
+
+        fun Project.wireToModuleLayout(moduleLayout: ViaductModulePackageLayout) {
+            tenantPackagePrefix.set(moduleLayout.resolverBasePackagePrefix)
+            tenantPackage.set(moduleLayout.resolverBasePackage)
+            // The codegen CLI writes files at {outputDir}/{package-as-path}/resolverbases/*.java,
+            // so outputDirectory must be the source set root — not a pre-augmented subdirectory.
+            outputDirectory.set(javaResolverBasesDirectory())
+        }
+    }

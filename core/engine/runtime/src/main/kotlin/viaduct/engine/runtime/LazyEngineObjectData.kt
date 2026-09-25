@@ -1,0 +1,56 @@
+package viaduct.engine.runtime
+
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.CompletableDeferred
+import viaduct.engine.api.EngineExecutionContext
+import viaduct.engine.api.EngineObjectData
+import viaduct.engine.api.EngineSelectionSet
+
+/**
+ * An EngineObjectData that is not fully resolved until [resolveData] is called.
+ */
+interface LazyEngineObjectData : EngineObjectData {
+    /**
+     * Resolves the data for this lazy object.
+     *
+     * @return the resolved [EngineObjectData], or null if the lazy object resolved to null
+     */
+    suspend fun resolveData(
+        selections: EngineSelectionSet,
+        context: EngineExecutionContext,
+    ): EngineObjectData?
+}
+
+/**
+ * Helper for lazy data implementations that ensures a resolution block runs at most once.
+ * Subsequent calls await the first resolution and return the resolved value
+ * (or re-throw the exception thrown by that first resolution).
+ */
+internal class ResolveOnce<T> {
+    private val deferred = CompletableDeferred<T>()
+    private val called = AtomicBoolean(false)
+
+    /** Suspends until the first [resolve] call completes and returns its result. */
+    suspend fun await(): T = deferred.await()
+
+    /**
+     * Runs [block] exactly once. Subsequent calls await the first resolution and return
+     * the same result (or re-throw the exception thrown by that first resolution).
+     *
+     * @return the value produced by [block]
+     * @throws Exception if [block] threw
+     */
+    suspend fun resolve(block: suspend () -> T): T {
+        if (!called.compareAndSet(false, true)) {
+            return deferred.await()
+        }
+        try {
+            val result = block()
+            deferred.complete(result)
+            return result
+        } catch (e: Exception) {
+            deferred.completeExceptionally(e)
+            throw e
+        }
+    }
+}

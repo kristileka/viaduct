@@ -1,136 +1,203 @@
 name: Release
+# Orchestrates either a release candidate or a final Viaduct release.
+# RC flow: validate -> publish -> push RC demoapps -> verify.
+# Final flow: validate -> publish -> push demoapps -> verify -> tag -> GitHub release.
 
 on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: 'Release version (e.g., 1.0.0)'
+        description: 'Base release version (e.g., 1.0.0)'
         required: true
-      previous_release_version:
-        description: 'Previous release version (e.g., 1.0.0) for changelog generation'
-        required: true
-      publish_snapshot:
-        description: 'Publish snapshot build'
+        type: string
+      rc_ver:
+        description: "Optional RC suffix only (e.g., 'rc.1'). Leave empty for final releases."
+        required: false
+        type: string
+      final:
+        description: "Must be true for a final release. Leave false when publishing an RC."
         required: false
         default: false
         type: boolean
-      skip_check:
-        description: 'Skip project check step'
+      release_notes:
+        description: 'Release notes body for final releases (use gh -F release_notes=@file.md to upload from file)'
         required: false
-        default: false
-        type: boolean
-      skip_publish:
-        description: 'Skip publishing artifacts'
-        required: false
-        default: false
-        type: boolean
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.release_version }}-${{ inputs.rc_ver || 'final' }}
+  cancel-in-progress: false  # never cancel a release mid-flight
 
 jobs:
-  publish-artifacts:
+  # ---------------------------------------------------------------------------
+  # Pre-flight: validate mode inputs, verify branch exists, and derive outputs
+  # ---------------------------------------------------------------------------
+  preflight:
     runs-on: ubuntu-latest
-    env:
-      GRADLE_OPTS_EXTRA: "-Dorg.gradle.parallel=false -Dorg.gradle.caching=true -Dorg.gradle.daemon=false"
-      GRADLE_SCAN: "false"
+    outputs:
+      publish_mode: ${{ steps.validate.outputs.publish_mode }}
+      published_version: ${{ steps.validate.outputs.published_version }}
+      source_ref: ${{ steps.validate.outputs.source_ref }}
+      destination_branch: ${{ steps.validate.outputs.destination_branch }}
+      is_final: ${{ steps.validate.outputs.is_final }}
     steps:
-      - name: Set release ref
-        if: ${{ !inputs.publish_snapshot }}
-        run: |
-          echo "RELEASE_REF=release/v${{ inputs.release_version }}" >> "$GITHUB_ENV"
-      - name: Set release ref for snapshot publish
-        if: inputs.publish_snapshot
-        run: |
-          echo "RELEASE_REF=main" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v6
 
-      - uses: actions/checkout@v5
-        with:
-          ref: ${{ env.RELEASE_REF }}
-          fetch-depth: 0
-          fetch-tags: true
-
-      - name: Verify Gradle wrapper
+      - name: Validate inputs and derive release metadata
+        id: validate
+        env:
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          RC_VER: ${{ inputs.rc_ver }}
+          FINAL: ${{ inputs.final }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
         run: |
-          if [ ! -f "./gradlew" ]; then
-            echo "❌ gradlew not found"
+          set -euo pipefail
+          args=(--release-version "$RELEASE_VERSION")
+          args+=(--final "$FINAL")
+          if [ -n "$RC_VER" ]; then
+            args+=(--rc-ver "$RC_VER")
+          fi
+          if [ -n "$RELEASE_NOTES" ]; then
+            args+=(--release-notes "$RELEASE_NOTES")
+          fi
+          python3 .github/scripts/validate_release_inputs.py "${args[@]}"
+        shell: bash
+
+      - name: Fail if release inputs are invalid
+        if: steps.validate.outputs.is_valid != 'true'
+        env:
+          VALIDATION_ERROR: ${{ steps.validate.outputs.validation_error }}
+        run: |
+          set -euo pipefail
+          echo "::error::${VALIDATION_ERROR}"
+          exit 1
+        shell: bash
+
+      - name: Verify release branch exists
+        if: steps.validate.outputs.is_valid == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ steps.validate.outputs.source_ref }}
+        run: |
+          set -euo pipefail
+          if ! gh api "repos/${{ github.repository }}/branches/${BRANCH}" --silent 2>/dev/null; then
+            echo "::error::Release branch '${BRANCH}' does not exist. Create it first."
             exit 1
           fi
-          chmod +x ./gradlew
-          echo "✅ Gradle wrapper ready"
+          echo "✅ Release branch '${BRANCH}' exists."
+        shell: bash
 
-      - name: Setup JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.13'
-
-      - name: Install Python dependencies
-        run: pip install -r .github/scripts/requirements.txt
-
-      - name: Cache Gradle dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-            .gradle
-          key: gradle-${{ runner.os }}-${{ hashFiles('**/gradle-wrapper.properties', '**/libs.versions.toml', '**/build.gradle.kts') }}
-          restore-keys: |
-            gradle-${{ runner.os }}-
-      - name: Download dependencies
-        run: |
-          echo "📥 Downloading Gradle dependencies..."
-          ./gradlew dependencies --no-scan || {
-            echo "❌ Failed to download dependencies"
-            exit 1
-          }
-          echo "✅ Dependencies downloaded successfully"
-      - name: Check project
-        if: ${{ !inputs.skip_check }}
-        run: |
-          echo "🔨 Building project..."
-          ./gradlew clean --no-scan || { echo "❌ Clean failed"; exit 1; }
-          ./gradlew check --no-scan || { echo "❌ Check failed"; exit 1; }
-          echo "✅ Project built successfully"
-      - name: Publish Artifacts
-        if: ${{ !inputs.skip_publish }}
+      - name: Verify release tag does not exist
+        if: steps.validate.outputs.is_valid == 'true' && steps.validate.outputs.is_final == 'true'
         env:
-          VIADUCT_GRADLE_PUBLISH_KEY: ${{ secrets.VIADUCT_GRADLE_PUBLISH_KEY }}
-          VIADUCT_GRADLE_PUBLISH_SECRET: ${{ secrets.VIADUCT_GRADLE_PUBLISH_SECRET }}
-          VIADUCT_SONATYPE_USERNAME: ${{ secrets.VIADUCT_SONATYPE_USERNAME }}
-          VIADUCT_SONATYPE_PASSWORD: ${{ secrets.VIADUCT_SONATYPE_PASSWORD }}
-          ORG_GRADLE_PROJECT_signingKey: ${{ secrets.GPG_PRIVATE_KEY }}
-          ORG_GRADLE_PROJECT_signingPassword: ${{ secrets.GPG_PASSPHRASE }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: v${{ steps.validate.outputs.published_version }}
         run: |
-          python3 ./.github/scripts/publish_release.py
+          set -euo pipefail
+          if gh api "repos/${{ github.repository }}/git/ref/tags/${TAG}" --silent 2>/dev/null; then
+            echo "::error::Tag '${TAG}' already exists. This version has already been released."
+            exit 1
+          fi
+          echo "✅ Tag '${TAG}' does not exist. Safe to proceed."
+        shell: bash
+
+  # ---------------------------------------------------------------------------
+  # Publish artifacts via publish-branch.yml (checks + Plugin Portal + Maven Central)
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [preflight]
+    uses: ./.github/workflows/publish-branch.yml
+    with:
+      mode: ${{ needs.preflight.outputs.publish_mode }}
+      ref: ${{ needs.preflight.outputs.source_ref }}
+      run_checks: true
+      confirm_versions: true
+      expected_version: ${{ needs.preflight.outputs.published_version }}
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Push demoapps to viaduct-dev/* standalone repos
+  # ---------------------------------------------------------------------------
+  push-demoapps:
+    needs: [preflight, publish]
+    uses: ./.github/workflows/push-demoapps.yml
+    with:
+      ref: ${{ needs.preflight.outputs.source_ref }}
+      release_mode: ${{ needs.preflight.outputs.is_final == 'true' }}
+      destination_branch: ${{ needs.preflight.outputs.destination_branch }}
+    secrets: inherit
+
+  # ---------------------------------------------------------------------------
+  # Wait for new artifacts to propagate to Maven Central / Plugin Portal CDNs.
+  # Without this, verify-demoapps races the CDN and fails to resolve the
+  # newly-published version even though publish succeeded.
+  # ---------------------------------------------------------------------------
+  wait-for-new-artifacts:
+    needs: [preflight, publish, push-demoapps]
+    runs-on: ubuntu-latest
+    steps:
+      # No `ref:` — the probe script must match the dispatched workflow, not the
+      # release branch, which may predate it.
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: published-coordinates
+          path: coordinates
+
+      - name: Probe Maven Central and Plugin Portal for ${{ needs.preflight.outputs.published_version }}
+        env:
+          VERSION: ${{ needs.preflight.outputs.published_version }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/probe_published_artifacts.py \
+            --root coordinates --version "$VERSION"
+        shell: bash
+
+  # ---------------------------------------------------------------------------
+  # Verify standalone repos build against published release artifacts
+  # ---------------------------------------------------------------------------
+  verify-demoapps:
+    needs: [push-demoapps, wait-for-new-artifacts]
+    uses: ./.github/workflows/check-published-demoapps.yml
+    with:
+      ref: ${{ needs.push-demoapps.outputs.destination_branch }}
+      use_snapshot_repo: false
+
+  # ---------------------------------------------------------------------------
+  # Create tag and publish GitHub release
+  # ---------------------------------------------------------------------------
+  create-release:
+    needs: [preflight, publish, verify-demoapps]
+    if: needs.preflight.outputs.is_final == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
       - name: Create release tag
-        if: ${{ !inputs.publish_snapshot && !inputs.skip_publish }}
-        uses: actions/github-script@v5
+        uses: actions/github-script@v8
         with:
           script: |
-            github.rest.git.createRef({
+            await github.rest.git.createRef({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              ref: 'refs/tags/v${{ inputs.release_version }}',
-              sha: context.sha
+              ref: 'refs/tags/v${{ needs.preflight.outputs.published_version }}',
+              sha: '${{ needs.publish.outputs.source_sha }}'
             })
-      - name: Generate Changelog
-        id: generate_changelog
-        if: ${{ !inputs.publish_snapshot }}
+            console.log('✅ Created tag v${{ needs.preflight.outputs.published_version }}')
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_NOTES: ${{ inputs.release_notes }}
         run: |
-          echo "## Changelog\n\n" > ${{ github.workspace }}-CHANGELOG.txt
-          python3 ./.github/scripts/generate_changelog.py "v${{ inputs.previous_release_version }}" "HEAD" >> ${{ github.workspace }}-CHANGELOG.txt
-          cat ${{ github.workspace }}-CHANGELOG.txt
-      - name: Create Draft Release
-        id: create_release
-        if: ${{ !inputs.publish_snapshot }}
-        uses: softprops/action-gh-release@v2.4.1
-        with:
-          tag_name: "v${{ inputs.release_version }}"
-          name: Release ${{ inputs.release_version }}
-          body_path: ${{ github.workspace }}-CHANGELOG.txt
-          draft: true # Set to true to create a draft release
-          prerelease: false # Set to true if it's a prerelease
-          generate_release_notes: false
+          set -euo pipefail
+          gh release create "v${{ needs.preflight.outputs.published_version }}" \
+            --repo "${{ github.repository }}" \
+            --title "Release ${{ needs.preflight.outputs.published_version }}" \
+            --notes "$RELEASE_NOTES" \
+            --latest
+          echo "✅ Published release v${{ needs.preflight.outputs.published_version }}"
+        shell: bash

@@ -2,39 +2,31 @@ package com.example.starwars.service.viaduct
 
 import io.micronaut.context.annotation.Bean
 import io.micronaut.context.annotation.Factory
-import viaduct.service.BasicViaductFactory
-import viaduct.service.SchemaRegistrationInfo
-import viaduct.service.TenantRegistrationInfo
-import viaduct.service.api.SchemaId
+import viaduct.service.SchemaScopeInfo
+import viaduct.service.ViaductBuilder
 import viaduct.service.api.Viaduct
-import viaduct.service.toSchemaScopeInfo
+import viaduct.service.api.spi.FlagManager
 
 const val DEFAULT_SCOPE_ID = "default"
 const val EXTRAS_SCOPE_ID = "extras"
-val DEFAULT_SCHEMA_ID = SchemaId.Scoped("publicSchema", setOf(DEFAULT_SCOPE_ID))
-val EXTRAS_SCHEMA_ID = SchemaId.Scoped("publicSchemaWithExtras", setOf(DEFAULT_SCOPE_ID, EXTRAS_SCOPE_ID))
+val DEFAULT_SCHEMA = SchemaScopeInfo.Scoped("publicSchema", setOf(DEFAULT_SCOPE_ID))
+val EXTRAS_SCHEMA = SchemaScopeInfo.Scoped("publicSchemaWithExtras", setOf(DEFAULT_SCOPE_ID, EXTRAS_SCOPE_ID))
+private val MAT_RESOLUTION_FLAG_MANAGER = object : FlagManager {
+    override fun isEnabled(flag: FlagManager.Flag): Boolean = flag == FlagManager.Flags.ENABLE_MAT_RESOLUTION
+}
 
-// tag::viaduct_configuration[20]
+// tag::viaduct_configuration[13]
 @Factory
 class ViaductConfiguration(
-    val micronautTenantCodeInjector: MicronautTenantCodeInjector
+    val tenantModuleInjectorFactory: MicronautTenantModuleInjectorFactory,
 ) {
     @Bean
-    fun providesViaduct(): Viaduct {
-        return BasicViaductFactory.create(
-            // tag::schema_registration[11]
-            schemaRegistrationInfo = SchemaRegistrationInfo(
-                scopes = listOf(
-                    DEFAULT_SCHEMA_ID.toSchemaScopeInfo(),
-                    EXTRAS_SCHEMA_ID.toSchemaScopeInfo(),
-                )
-                // grtPackagePrefix and grtResourcesIncluded not set - using defaults
-            ),
-            // end::schema_registration
-            tenantRegistrationInfo = TenantRegistrationInfo(
-                tenantPackagePrefix = "com.example.starwars",
-                tenantCodeInjector = micronautTenantCodeInjector
-            )
-        )
-    }
+    fun providesViaduct(): Viaduct =
+        // tag::schema_registration[4]
+        ViaductBuilder()
+            .withTenantModuleInjectorFactory(tenantModuleInjectorFactory)
+            .withScopedSchemas(listOf(DEFAULT_SCHEMA, EXTRAS_SCHEMA))
+            .withFlagManager(MAT_RESOLUTION_FLAG_MANAGER)
+            .build()
+    // end::schema_registration
 }

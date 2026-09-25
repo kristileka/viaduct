@@ -1,0 +1,325 @@
+package viaduct.tenant.runtime.context.factory
+
+import graphql.language.FragmentDefinition
+import graphql.schema.GraphQLCompositeType
+import graphql.schema.GraphQLTypeUtil
+import java.util.Locale.getDefault
+import kotlin.reflect.KClass
+import viaduct.api.ConnectionResolverBase
+import viaduct.api.FieldResolverBase
+import viaduct.api.MutationResolverBase
+import viaduct.api.ResolverBase
+import viaduct.api.context.BaseFieldExecutionContext
+import viaduct.api.context.ConnectionFieldExecutionContext
+import viaduct.api.context.FieldExecutionContext
+import viaduct.api.context.MutationFieldExecutionContext
+import viaduct.api.context.NodeExecutionContext
+import viaduct.api.context.VariablesProviderContext
+import viaduct.api.internal.GRTConvFactory
+import viaduct.api.internal.ReflectionLoader
+import viaduct.api.reflect.Type
+import viaduct.api.select.SelectionSet
+import viaduct.api.types.Arguments
+import viaduct.api.types.CompositeOutput
+import viaduct.api.types.Connection
+import viaduct.api.types.ConnectionArguments
+import viaduct.api.types.Mutation
+import viaduct.api.types.NodeObject
+import viaduct.api.types.Object
+import viaduct.api.types.Query
+import viaduct.engine.api.EngineExecutionContext
+import viaduct.engine.api.EngineObjectData
+import viaduct.engine.api.EngineSchema
+import viaduct.engine.api.EngineSelectionSet
+import viaduct.engine.api.ResolverType
+import viaduct.tenant.runtime.context.ConnectionFieldExecutionContextImpl
+import viaduct.tenant.runtime.context.EngineExecutionContextWrapperImpl
+import viaduct.tenant.runtime.context.FieldExecutionContextImpl
+import viaduct.tenant.runtime.context.MutationFieldExecutionContextImpl
+import viaduct.tenant.runtime.context.NodeExecutionContextImpl
+import viaduct.tenant.runtime.context.VariablesProviderContextImpl
+import viaduct.tenant.runtime.internal.InternalContextImpl
+import viaduct.tenant.runtime.select.SelectionSetImpl
+import viaduct.tenant.runtime.toInputLikeGRT
+
+sealed class ResolverExecutionContextFactoryBase<R : CompositeOutput>(
+    protected val resultType: Type<CompositeOutput>,
+) {
+    private val toNonCompositeSelectionSet: ResolverExecutionContextFactoryBase<R>.(EngineSelectionSet?) -> SelectionSet<R> = { sels ->
+        require(sels == null) {
+            "received a non-null selection set on a type declared as not-composite: ${resultType.kcls}"
+        }
+        @Suppress("UNCHECKED_CAST")
+        SelectionSet.NoSelections as SelectionSet<R>
+    }
+
+    private val toCompositeSelectionSet: ResolverExecutionContextFactoryBase<R>.(EngineSelectionSet?) -> SelectionSet<R> = { sels ->
+        require(sels != null) {
+            "received a null selection set on a type declared as composite: ${resultType.kcls}"
+        }
+        @Suppress("UNCHECKED_CAST")
+        SelectionSetImpl(resultType, sels) as SelectionSet<R>
+    }
+
+    protected val toSelectionSet: ResolverExecutionContextFactoryBase<R>.(EngineSelectionSet?) -> SelectionSet<R> =
+        if (resultType.kcls == CompositeOutput.NotComposite::class) {
+            toNonCompositeSelectionSet
+        } else {
+            toCompositeSelectionSet
+        }
+
+    protected fun ownedSelectionSet(
+        engineExecutionContext: EngineExecutionContext,
+        selections: EngineSelectionSet?,
+        resolverType: ResolverType,
+    ): Lazy<SelectionSet<R>> =
+        lazy {
+            require(resultType.kcls != CompositeOutput.NotComposite::class && selections != null) {
+                "resolver-owned selections require a composite output type"
+            }
+            @Suppress("UNCHECKED_CAST")
+            SelectionSetImpl(
+                resultType,
+                engineExecutionContext.projectOwnedSelections(selections, resolverType),
+            ) as SelectionSet<R>
+        }
+}
+
+class NodeExecutionContextFactory(
+    private val reflectionLoader: ReflectionLoader,
+    resultType: Type<NodeObject>,
+    private val grtConvFactory: GRTConvFactory,
+    private val knownFragments: Map<String, FragmentDefinition> = emptyMap(),
+) : ResolverExecutionContextFactoryBase<NodeObject>(resultType) {
+    operator fun invoke(
+        engineExecutionContext: EngineExecutionContext,
+        selections: EngineSelectionSet?,
+        requestContext: Any?,
+        id: String
+    ): NodeExecutionContext<*> {
+        val internalContext = InternalContextImpl(engineExecutionContext.fullSchema, engineExecutionContext.globalIDCodec, reflectionLoader, grtConvFactory)
+        return NodeExecutionContextImpl(
+            internalContext,
+            EngineExecutionContextWrapperImpl(engineExecutionContext, knownFragments),
+            this.toSelectionSet(selections),
+            requestContext,
+            internalContext.deserializeGlobalID(id),
+            ownedSelectionSet(engineExecutionContext, selections, ResolverType.NODE),
+        )
+    }
+}
+
+interface VariablesProviderContextFactory {
+    fun createVariablesProviderContext(
+        engineExecutionContext: EngineExecutionContext,
+        requestContext: Any?,
+        rawArguments: Map<String, Any?>
+    ): VariablesProviderContext<Arguments>
+}
+
+class FieldExecutionContextFactory internal constructor(
+    private val expectedContextInterface: Class<out BaseFieldExecutionContext<*, *, *>>,
+    private val reflectionLoader: ReflectionLoader,
+    resultType: Type<CompositeOutput>,
+    private val argumentsCls: KClass<Arguments>,
+    private val objectCls: KClass<Object>,
+    private val queryCls: KClass<Query>,
+    private val grtConvFactory: GRTConvFactory,
+    private val graphqlTypeName: String? = null,
+    private val graphqlFieldName: String? = null,
+    private val knownFragments: Map<String, FragmentDefinition> = emptyMap(),
+) : VariablesProviderContextFactory,
+    ResolverExecutionContextFactoryBase<CompositeOutput>(
+        resultType
+    ) {
+    @Suppress("UNCHECKED_CAST")
+    operator fun invoke(
+        engineExecutionContext: EngineExecutionContext,
+        engineSelections: EngineSelectionSet?,
+        requestContext: Any?,
+        rawArguments: Map<String, Any?>,
+        syncObjectValueGetter: (suspend () -> EngineObjectData.Sync)? = null,
+        syncQueryValueGetter: (suspend () -> EngineObjectData.Sync)? = null,
+    ): BaseFieldExecutionContext<*, *, *> {
+        val internalContext = InternalContextImpl(engineExecutionContext.fullSchema, engineExecutionContext.globalIDCodec, reflectionLoader, grtConvFactory)
+        val engineExecutionContextWrapper = EngineExecutionContextWrapperImpl(engineExecutionContext, knownFragments)
+        val ownedSelections = ownedSelectionSet(
+            engineExecutionContext,
+            engineSelections,
+            ResolverType.FIELD,
+        )
+
+        return when (expectedContextInterface) {
+            ConnectionFieldExecutionContext::class.java -> ConnectionFieldExecutionContextImpl(
+                internalContext,
+                engineExecutionContextWrapper,
+                this.toSelectionSet(engineSelections) as SelectionSet<Connection<*, *>>,
+                requestContext,
+                rawArguments.toInputLikeGRT(internalContext, argumentsCls, graphqlTypeName, graphqlFieldName) as ConnectionArguments,
+                syncObjectValueGetter,
+                syncQueryValueGetter,
+                objectCls,
+                queryCls,
+                ownedSelections as Lazy<SelectionSet<Connection<*, *>>>,
+            )
+
+            FieldExecutionContext::class.java -> FieldExecutionContextImpl(
+                internalContext,
+                engineExecutionContextWrapper,
+                this.toSelectionSet(engineSelections),
+                requestContext,
+                rawArguments.toInputLikeGRT(internalContext, argumentsCls, graphqlTypeName, graphqlFieldName),
+                syncObjectValueGetter,
+                syncQueryValueGetter,
+                objectCls,
+                queryCls,
+                ownedSelections,
+            )
+
+            MutationFieldExecutionContext::class.java -> MutationFieldExecutionContextImpl<Query, Mutation>(
+                internalContext,
+                engineExecutionContextWrapper,
+                this.toSelectionSet(engineSelections),
+                requestContext,
+                rawArguments.toInputLikeGRT(internalContext, argumentsCls, graphqlTypeName, graphqlFieldName),
+                syncQueryValueGetter,
+                queryCls,
+                ownedSelections,
+            )
+
+            else -> throw IllegalArgumentException(
+                "Expected context interface must be one of `ConnectionFieldExecutionContext`, `FieldExecutionContext`, or `MutationFieldExecutionContext` ($expectedContextInterface)."
+            )
+        }
+    }
+
+    override fun createVariablesProviderContext(
+        engineExecutionContext: EngineExecutionContext,
+        requestContext: Any?,
+        rawArguments: Map<String, Any?>
+    ): VariablesProviderContext<Arguments> {
+        val ic = InternalContextImpl(engineExecutionContext.fullSchema, engineExecutionContext.globalIDCodec, reflectionLoader, grtConvFactory)
+        return VariablesProviderContextImpl(ic, requestContext, rawArguments.toInputLikeGRT(ic, argumentsCls, graphqlTypeName, graphqlFieldName))
+    }
+
+    companion object {
+        @Suppress("UNCHECKED_CAST")
+        fun of(
+            resolverClass: Class<out ResolverBase<*>>,
+            reflectionLoader: ReflectionLoader,
+            typeName: String,
+            fieldName: String,
+            hasArguments: Boolean,
+            queryTypeName: String,
+            returnTypeName: String?,
+            grtConvFactory: GRTConvFactory,
+            knownFragments: Map<String, FragmentDefinition> = emptyMap(),
+        ): FieldExecutionContextFactory {
+            val expectedContextInterface = resolveExpectedContextInterface(resolverClass)
+            val queryCls = reflectionLoader.reflectionFor(queryTypeName).kcls as KClass<Query>
+            val objectCls = reflectionLoader.reflectionFor(typeName).kcls as KClass<Object>
+            val argumentsCls = resolveArgumentsCls(reflectionLoader, typeName, fieldName, hasArguments)
+            // takeIf guards against enum GRTs: enums have a Reflection object so reflectionFor succeeds,
+            // but they are not CompositeOutput and must not be treated as composite.
+            val returnTypeKClass = returnTypeName?.let {
+                runCatching {
+                    @Suppress("UNCHECKED_CAST")
+                    reflectionLoader.reflectionFor(it).kcls
+                        .takeIf { cls -> CompositeOutput::class.java.isAssignableFrom(cls.java) } as KClass<CompositeOutput>?
+                }.getOrNull()
+            }
+            val resultType = Type.ofClass(returnTypeKClass ?: CompositeOutput.NotComposite::class)
+
+            return FieldExecutionContextFactory(
+                expectedContextInterface,
+                reflectionLoader,
+                resultType,
+                argumentsCls,
+                objectCls,
+                queryCls,
+                grtConvFactory,
+                graphqlTypeName = typeName,
+                graphqlFieldName = fieldName,
+                knownFragments = knownFragments,
+            )
+        }
+
+        /**
+         * Returns a field execution context factory for a field def.  Could be
+         * a "regular" or "mutation" context factory based on the type of the
+         * field resolver base interface implemented by [resolverClass].
+         *
+         * Called by module bootstrapper only when a field exists and has a resolver on it.
+         * Thus, assumes `typeName.fieldName` is a valid field coordinate in [schema].
+         */
+        @Suppress("UNCHECKED_CAST")
+        fun of(
+            resolverClass: Class<out ResolverBase<*>>,
+            reflectionLoader: ReflectionLoader,
+            schema: EngineSchema,
+            typeName: String,
+            fieldName: String,
+            grtConvFactory: GRTConvFactory,
+            knownFragments: Map<String, FragmentDefinition> = emptyMap(),
+        ): FieldExecutionContextFactory {
+            val fieldDef = schema.schema.getObjectType(typeName)?.getFieldDefinition(fieldName)
+                ?: throw IllegalArgumentException("Called on a missing field coordinate ($typeName.$fieldName).")
+
+            val expectedContextInterface = resolveExpectedContextInterface(resolverClass)
+            val queryCls = reflectionLoader.reflectionFor(schema.schema.queryType.name).kcls as KClass<Query>
+            val objectCls = reflectionLoader.reflectionFor(typeName).kcls as KClass<Object>
+            val argumentsCls = resolveArgumentsCls(reflectionLoader, typeName, fieldName, fieldDef.arguments.isNotEmpty())
+
+            val resultType = Type.ofClass(
+                (GraphQLTypeUtil.unwrapAll(fieldDef.type) as? GraphQLCompositeType)?.let { type ->
+                    reflectionLoader.reflectionFor(type.name).kcls as KClass<CompositeOutput>
+                } ?: CompositeOutput.NotComposite::class
+            )
+
+            return FieldExecutionContextFactory(
+                expectedContextInterface,
+                reflectionLoader,
+                resultType,
+                argumentsCls,
+                objectCls,
+                queryCls,
+                grtConvFactory,
+                graphqlTypeName = typeName,
+                graphqlFieldName = fieldName,
+                knownFragments = knownFragments,
+            )
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        private fun resolveExpectedContextInterface(resolverClass: Class<out ResolverBase<*>>): Class<out BaseFieldExecutionContext<*, *, *>> {
+            return when {
+                MutationResolverBase::class.java.isAssignableFrom(resolverClass) ->
+                    MutationFieldExecutionContext::class.java
+
+                ConnectionResolverBase::class.java.isAssignableFrom(resolverClass) ->
+                    ConnectionFieldExecutionContext::class.java
+
+                FieldResolverBase::class.java.isAssignableFrom(resolverClass) ->
+                    FieldExecutionContext::class.java
+
+                else -> throw IllegalArgumentException(
+                    "Resolver ${resolverClass.name} does not implement a supported field resolver base interface"
+                )
+            }
+        }
+
+        @Suppress("UNCHECKED_CAST")
+        private fun resolveArgumentsCls(
+            reflectionLoader: ReflectionLoader,
+            typeName: String,
+            fieldName: String,
+            hasArguments: Boolean,
+        ): KClass<Arguments> =
+            if (!hasArguments) {
+                Arguments.NoArguments::class
+            } else {
+                val fn = fieldName.replaceFirstChar { if (it.isLowerCase()) it.titlecase(getDefault()) else it.toString() }
+                reflectionLoader.getGRTKClassFor("${typeName}_${fn}_Arguments")
+            } as KClass<Arguments>
+    }
+}

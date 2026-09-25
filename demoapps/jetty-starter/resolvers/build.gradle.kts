@@ -1,11 +1,8 @@
 plugins {
     `java-library`
     kotlin("jvm")
+    alias(libs.plugins.ksp)
     alias(libs.plugins.viaduct.module)
-}
-
-viaductModule {
-    modulePackageSuffix.set("resolvers")
 }
 
 dependencies {

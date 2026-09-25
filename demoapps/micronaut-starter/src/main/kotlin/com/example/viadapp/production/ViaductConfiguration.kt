@@ -3,35 +3,28 @@ package com.example.viadapp.production
 import io.micronaut.context.annotation.Bean
 import io.micronaut.context.annotation.Factory
 import viaduct.service.BasicViaductFactory
-import viaduct.service.SchemaRegistrationInfo
 import viaduct.service.SchemaScopeInfo
-import viaduct.service.TenantRegistrationInfo
 import viaduct.service.api.Viaduct
 
-val SCHEMA_ID = "default"
+val SCHEMA_ID = "publicSchema"
+const val DEFAULT_SCOPE_ID = "default"
+val DEFAULT_SCHEMA = SchemaScopeInfo.Scoped(SCHEMA_ID, setOf(DEFAULT_SCOPE_ID))
 
 /**
  * Micronaut factory that provides the Viaduct instance.
  *
- * This configuration uses dependency injection for the TenantCodeInjector,
- * allowing resolvers to have their dependencies automatically injected.
- *
- * This is used in both production and development modes.
+ * Uses [MicronautTenantModuleInjectorFactory] so Viaduct resolves tenant classes through the
+ * application's shared Micronaut [io.micronaut.context.BeanContext].
  */
 @Factory
 class ViaductConfiguration(
-    private val micronautTenantCodeInjector: MicronautTenantCodeInjector
+    private val tenantModuleInjectorFactory: MicronautTenantModuleInjectorFactory,
 ) {
     @Bean
     fun providesViaduct(): Viaduct {
         return BasicViaductFactory.create(
-            schemaRegistrationInfo = SchemaRegistrationInfo(
-                scopes = listOf(SchemaScopeInfo(SCHEMA_ID)),
-            ),
-            tenantRegistrationInfo = TenantRegistrationInfo(
-                tenantPackagePrefix = "com.example.viadapp",
-                tenantCodeInjector = micronautTenantCodeInjector
-            )
+            tenantModuleInjectorFactory = tenantModuleInjectorFactory,
+            scopedSchemas = listOf(DEFAULT_SCHEMA),
         )
     }
 }

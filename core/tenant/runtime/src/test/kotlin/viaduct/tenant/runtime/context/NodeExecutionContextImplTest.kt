@@ -1,0 +1,81 @@
+package viaduct.tenant.runtime.context
+
+import io.mockk.mockk
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.test.runTest
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import viaduct.api.globalid.GlobalID
+import viaduct.api.mocks.MockInternalContext
+import viaduct.api.mocks.MockReflectionLoader
+import viaduct.api.select.SelectionSet
+import viaduct.api.types.NodeObject
+import viaduct.engine.api.mocks.variables
+import viaduct.service.api.spi.globalid.GlobalIDCodecDefault
+import viaduct.tenant.runtime.globalid.GlobalIdTestSchema
+import viaduct.tenant.runtime.globalid.Query
+import viaduct.tenant.runtime.globalid.User
+import viaduct.tenant.runtime.select.SelectionSetImpl
+
+@ExperimentalCoroutinesApi
+@Suppress("USELESS_CAST")
+class NodeExecutionContextImplTest : ContextTestBase() {
+    private val queryObject = mockk<Query>()
+
+    @Suppress("UNCHECKED_CAST")
+    private val userId: GlobalID<NodeObject> = GlobalID(User.Reflection, "123") as GlobalID<NodeObject>
+
+    private fun mk(
+        userId: GlobalID<NodeObject> = this.userId,
+        selectionSet: SelectionSet<NodeObject> = mockk<SelectionSet<NodeObject>>()
+    ): NodeExecutionContextImpl {
+        val wrapper = createMockingWrapper(
+            schema = GlobalIdTestSchema.schema,
+            queryMock = queryObject
+        )
+
+        return NodeExecutionContextImpl(
+            MockInternalContext(
+                GlobalIdTestSchema.schema,
+                GlobalIDCodecDefault,
+                MockReflectionLoader(Query.Reflection, User.Reflection)
+            ),
+            wrapper,
+            selectionSet,
+            null, // requestContext
+            userId
+        )
+    }
+
+    @Test
+    fun properties() {
+        val ctx = mk()
+        assertEquals(userId, ctx.id)
+    }
+
+    @Test
+    fun selectionsFor() {
+        val ctx = mk()
+        val ss = ctx.selectionsFor(Query.Reflection, "__typename", mapOf("var" to true))
+        assertTrue(ss.contains(Query.Fields.__typename))
+        val inner = (ss as SelectionSetImpl<*>).engineSelectionSet
+        assertEquals(mapOf("var" to true), inner.variables())
+    }
+
+    @Test
+    fun query() =
+        runTest {
+            val ctx = mk()
+            val result = ctx.query(TypenameQuery)
+            assertEquals(queryObject, result)
+        }
+
+    @Test
+    fun ref() {
+        val ctx = mk()
+        // Just verify the method can be called without throwing - actual node resolution
+        // would require more complex setup of engine execution context mocking
+        ctx.ref(userId)
+    }
+}

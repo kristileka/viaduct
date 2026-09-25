@@ -1,0 +1,223 @@
+package viaduct.tenant.codegen.kotlingen.bytecode
+
+import getEscapedFieldName
+import viaduct.apiannotations.VisibleForTest
+import viaduct.codegen.SchemaAnalysis
+import viaduct.codegen.km.kotlinTypeString
+import viaduct.codegen.st.STContents
+import viaduct.codegen.st.stTemplate
+import viaduct.codegen.utils.JavaName
+import viaduct.graphql.schema.ViaductSchema
+import viaduct.tenant.codegen.bytecode.config.InputTypeFactoryConfig
+import viaduct.tenant.codegen.bytecode.config.kmType
+import viaduct.tenant.codegen.util.ConnectionArgumentsInfo
+
+/**
+ * Generates Kotlin source code for an Input or Arguments class.
+ *
+ * @param field The field whose arguments are being generated, if this is an Arguments type.
+ *   Used to detect whether the field returns a Connection type and add the appropriate
+ *   ConnectionArguments interface.
+ */
+@VisibleForTest
+fun KotlinGRTFilesBuilder.inputKotlinGen(
+    desc: InputTypeDescriptor,
+    taggingInterface: String,
+    field: ViaductSchema.Field? = null
+): STContents {
+    val connectionInfo = ConnectionArgumentsInfo.from(field)
+    // Input types carry a backing TypeDef (desc.def); Arguments types do not, but still get a
+    // Reflection + Fields block generated from their field-argument list so that
+    // `SomeArguments.Fields.<arg>` descriptors exist for the public Field.isPresent API.
+    val reflectedType = when {
+        desc.def != null -> reflectedTypeGen(desc.def)
+        desc.containingField != null -> reflectedTypeGenForArguments(desc.className, desc.fields)
+        else -> null
+    }
+    val fieldsObject = when {
+        desc.def != null -> fieldsObjectGen(desc.def)
+        desc.containingField != null -> fieldsObjectGenForArguments(desc.className, desc.fields)
+        else -> null
+    }
+    // The chosen ConnectionArguments interface declares getters for the whole pagination pair, but
+    // the schema may declare only part of it (e.g. `first` without `after`). Synthesize the missing
+    // counterparts so the generated class satisfies the interface. See
+    // SchemaAnalysis.synthesizedConnectionArgumentNames.
+    val synthesizedConnectionArgs =
+        field?.let(SchemaAnalysis::synthesizedConnectionArgumentNames) ?: emptySet()
+    return STContents(
+        inputSTGroup,
+        InputModelImpl(
+            pkg,
+            desc.className,
+            desc.fields,
+            taggingInterface,
+            reflectedType,
+            fieldsObject,
+            baseTypeMapper,
+            connectionArgumentsSupertype = connectionInfo.interfaceToAdd?.let { ", ${it.asJavaName}" } ?: "",
+            overrideFieldNames = connectionInfo.overrideFieldNames,
+            containingField = desc.containingField,
+            synthesizedConnectionArgs = synthesizedConnectionArgs,
+        )
+    )
+}
+
+private interface InputModel {
+    /** Package into which code will be generated. */
+    val pkg: String
+
+    /** Name of the class to be generated. */
+    val className: String
+
+    /** Submodels for each field. */
+    val fields: List<FieldModel>
+
+    /** Tagging interface for this class, either Input or Arguments */
+    val taggingInterface: String
+
+    /** Complete InputTypeFactory call expression for the Builder constructor */
+    val inputTypeCall: String
+
+    /** A rendered template string that describes this types Reflection object */
+    val reflection: String
+
+    /** A rendered template string that describes this type's Fields object */
+    val fieldsObject: String
+
+    /**
+     * Additional supertype for ConnectionArguments interfaces.
+     * Either empty string or ", viaduct.api.types.ForwardConnectionArguments" etc.
+     */
+    val connectionArgumentsSupertype: String
+
+    /** Submodel for "fields" in this type. */
+    class FieldModel private constructor(
+        val escapedName: String,
+        val kotlinType: String,
+        val overrideKeyword: String,
+    ) {
+        constructor(
+            pkg: String,
+            fieldDef: ViaductSchema.HasDefaultValue,
+            baseTypeMapper: viaduct.tenant.codegen.bytecode.config.BaseTypeMapper,
+            isOverride: Boolean = false
+        ) : this(
+            // For fields whose names match Kotlin keywords (e.g., "private"), use Kotlin's back-tick
+            // escaping mechanism.
+            escapedName = getEscapedFieldName(fieldDef.name),
+            kotlinType = fieldDef.kmType(JavaName(pkg).asKmName, baseTypeMapper).kotlinTypeString,
+            // "final override" if this field overrides a ConnectionArguments interface property.
+            overrideKeyword = if (isOverride) "final override " else ""
+        )
+
+        companion object {
+            /**
+             * A synthesized pagination-argument getter that overrides a `ConnectionArguments`
+             * interface property the schema does not declare (e.g. `after` on a `first`-only
+             * field). See [SchemaAnalysis.synthesizedConnectionArgumentNames].
+             */
+            fun synthesizedConnectionArg(argName: String): FieldModel {
+                val kotlinType = when (SchemaAnalysis.connectionArgumentScalarKind(argName)) {
+                    viaduct.codegen.ConnectionArgScalarKind.INT -> "Int?"
+                    viaduct.codegen.ConnectionArgScalarKind.STRING -> "String?"
+                    null -> error("Not a pagination argument: $argName")
+                }
+                return FieldModel(getEscapedFieldName(argName), kotlinType, "final override ")
+            }
+        }
+    }
+}
+
+private val inputSTGroup =
+    stTemplate(
+        """
+    @file:Suppress("warnings")
+
+    package <mdl.pkg>
+
+    import graphql.schema.GraphQLInputObjectType
+    import viaduct.apiannotations.InternalApi
+    import viaduct.api.context.ExecutionContext
+    import viaduct.api.internal.InputTypeFactory
+    import viaduct.api.internal.InputValueBuilder
+    import viaduct.api.internal.InternalContext
+    import viaduct.api.internal.internal
+    import viaduct.api.internal.InputLikeBase
+    import viaduct.api.types.Input
+
+    @OptIn(InternalApi::class)
+    class <mdl.className> internal constructor(
+        override val context: InternalContext,
+        override val inputData: Map\<String, Any?>,
+        override val graphQLInputObjectType: GraphQLInputObjectType,
+    ): InputLikeBase(), <mdl.taggingInterface><mdl.connectionArgumentsSupertype> {
+        init {
+           TODO()
+        }
+
+        <mdl.fields: { f |
+            <f.overrideKeyword>val <f.escapedName>: <f.kotlinType> get() = TODO()
+        }; separator="\n">
+
+        fun toBuilder() = Builder(context, graphQLInputObjectType, this.inputData.toMutableMap())
+
+        object of {
+            operator fun invoke(context: ExecutionContext, block: Builder.() -> Unit): <mdl.className> =
+                Builder(context).apply(block).build()
+        }
+
+        class Builder internal constructor(
+            override val context: InternalContext,
+            override val graphQLInputObjectType: GraphQLInputObjectType,
+            override val inputData: MutableMap\<String, Any?> = TODO()
+        ) : InputLikeBase.Builder(), InputValueBuilder\<<mdl.className>\> {
+
+            constructor(context: ExecutionContext): this(
+                context.internal,
+                <mdl.inputTypeCall>,
+                mutableMapOf()
+            )
+
+            init {
+                TODO()
+            }
+
+            <mdl.fields: { f |
+                fun <f.escapedName>(value: <f.kotlinType>): Builder = TODO()
+            }; separator="\n">
+
+            final override fun build(): <mdl.className> = TODO()
+        }
+
+        <mdl.reflection>
+        <mdl.fieldsObject>
+    }
+"""
+    )
+
+private class InputModelImpl(
+    override val pkg: String,
+    override val className: String,
+    fieldDefs: Iterable<ViaductSchema.HasDefaultValue>,
+    override val taggingInterface: String,
+    reflectedType: STContents?,
+    fieldsObject: STContents?,
+    baseTypeMapper: viaduct.tenant.codegen.bytecode.config.BaseTypeMapper,
+    override val connectionArgumentsSupertype: String = "",
+    overrideFieldNames: Set<String> = emptySet(),
+    containingField: ViaductSchema.Field? = null,
+    synthesizedConnectionArgs: Set<String> = emptySet(),
+) : InputModel {
+    override val fields: List<InputModel.FieldModel> = fieldDefs.map {
+        InputModel.FieldModel(pkg, it, baseTypeMapper, isOverride = it.name in overrideFieldNames)
+    } + synthesizedConnectionArgs.map { InputModel.FieldModel.synthesizedConnectionArg(it) }
+    override val reflection: String = reflectedType?.toString() ?: ""
+    override val fieldsObject: String = fieldsObject?.toString() ?: ""
+    private val inputTypeMethod: String = InputTypeFactoryConfig.getFactoryMethodName(taggingInterface)
+    override val inputTypeCall: String = if (containingField != null) {
+        """InputTypeFactory.argumentsInputType("$className", "${containingField.containingDef.name}", "${containingField.name}", context.internal.schema)"""
+    } else {
+        """InputTypeFactory.$inputTypeMethod("$className", context.internal.schema)"""
+    }
+}

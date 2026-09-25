@@ -4,9 +4,19 @@ description: Implementing batch field resolvers in Viaduct.
 ---
 
 
-Batch field resolvers process multiple field requests **in one pass**, dramatically improving performance when the same
-field is selected across many parent objects. Viaduct guarantees the **input order** of contexts and expects you to
-return results in the **same order**.
+Batch field resolvers process multiple field requests **in one pass**, dramatically improving performance when the same field is selected across many parent objects. Viaduct guarantees the **input order** of contexts and expects you to return results in the **same order**.
+
+## Schema declaration
+
+To opt into batching, add `isBatching: true` to the `@resolver` directive. This tells codegen to generate a `batchResolve` method instead of `resolve`:
+
+```graphql
+type Character implements Node @scope(to: ["default"]) @resolver(isBatching: true) {
+  id: ID!
+  name: String
+  filmCount: Int @resolver(isBatching: true)
+}
+```
 
 ## Where batching fits in the execution flow
 
@@ -23,24 +33,14 @@ return results in the **same order**.
 
 ## Choosing the fragment
 
-The `objectValueFragment` declares the parent fields your resolver needs. Keep it **minimal** — requesting only `id`
-is typical for lookup scenarios. If you require additional, cheap fields (for example, `name` for formatting), add them
-here so they are available on `ctx.objectValue` without extra work.
-
-
-{{ codetag("demoapps/starwars/modules/filmography/src/main/kotlin/com/example/starwars/modules/filmography/characters/resolvers/CharacterFilmCountResolver.kt", "film_count_batch_resolver", lang="kotlin") }}
-
+The `objectValueFragment` declares the parent fields your resolver needs. Keep it **minimal** — requesting only `id` is typical for lookup scenarios. In the example above, the `CharacterFilmCountResolver` only needs the character's internal ID, so its fragment is `fragment _ on Character { id }`. If you require additional, cheap fields (for example, `name` for formatting), add them here so they are available on `ctx.getObjectValue()` without extra work.
 
 ## Implementing batch resolvers in node resolvers
 
-Node resolvers can also be batched. The pattern is similar, but you receive a list of `GlobalID`s instead of
-`Context`s. You can use `GlobalID.toInternalID()` to extract your internal ID
+Node resolvers can also be batched by declaring `@resolver(isBatching: true)` on the type. The pattern is similar, but you receive a list of `GlobalID`s instead of `Context`s. You can use `GlobalID.internalID` to extract your internal ID
 
 
 {{ codetag("demoapps/starwars/modules/filmography/src/main/kotlin/com/example/starwars/modules/filmography/characters/resolvers/CharacterNodeResolver.kt", "node_batch_resolver_example", lang="kotlin") }}
-
-
-> For a node resolver you can only implement `batchResolve` or `resolve` — not both.
 
 ## Error handling and nullability
 
@@ -87,4 +87,4 @@ query {
 - **Don’t** perform per-context DB calls inside `batchResolve`.
 - **Don’t** allocate large intermediate structures unnecessarily — map directly back to contexts.
 
-
+> See [Best Practices](../../../docs/developers/best_practices/index.md) for the consolidated reference. For the complete batch-resolution API and advanced strategies, see the [Batch Resolution developer reference](../../../docs/developers/resolvers/batch_resolution.md).

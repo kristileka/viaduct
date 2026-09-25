@@ -61,7 +61,7 @@ import viaduct.service.ViaductBuilder
 
 val viaduct = ViaductBuilder()
     .withMeterRegistry(meterRegistry)
-    .withTenantAPIBootstrapperBuilder(myBootstrapper)
+    .withTenantModuleInjectorFactory(myInjectorFactory)
     .build()
 ```
 
@@ -171,7 +171,7 @@ compositeMeterRegistry.add(datadogMeterRegistry)
 // Use composite registry with Viaduct
 val viaduct = ViaductBuilder()
     .withMeterRegistry(compositeMeterRegistry)
-    .withTenantAPIBootstrapperBuilder(myBootstrapper)
+    .withTenantModuleInjectorFactory(myInjectorFactory)
     .build()
 ```
 
@@ -182,8 +182,8 @@ val viaduct = ViaductBuilder()
 For SimpleMeterRegistry or testing:
 
 ```kotlin
-// Execute a query
-viaduct.execute(executionInput)
+// Execute a query (executeAsync returns a future, callable from non-coroutine code)
+viaduct.executeAsync(executionInput).join()
 
 // Check metrics
 meterRegistry.meters.forEach { meter ->

@@ -1,0 +1,94 @@
+@file:Suppress("unused", "ClassName")
+
+package viaduct.tenant.runtime.execution.variables.bootstrap.oneofviolation
+
+import viaduct.api.context.VariablesProviderContext
+import viaduct.api.resolver.Resolver
+import viaduct.api.resolver.Variables
+import viaduct.api.resolver.VariablesProvider
+import viaduct.api.types.Arguments
+import viaduct.tenant.runtime.execution.variables.bootstrap.oneofviolation.resolverbases.QueryResolvers
+
+/**
+ * Tests for @oneOf input validation that should cause runtime failures.
+ * This test expects the tenant to build successfully but queries to fail at runtime due to oneof violations.
+ */
+class TempOneOfViolationFeatureAppTest : TempOneOfViolationContractTest() {
+    @Resolver(
+        """
+        fragment _ on Query {
+            intermediary(arg: ${'$'}oneofVar)
+        }
+        """
+    )
+    class Query_FromVariablesProviderResolver : QueryResolvers.FromVariablesProvider() {
+        override suspend fun resolve(ctx: Context): String? = ctx.getObjectValue().getIntermediaryOrThrow()
+
+        @Variables("oneofVar: OneofInput!")
+        class OneOfViolationVars : VariablesProvider<Arguments> {
+            override suspend fun provide(context: VariablesProviderContext<Arguments>): Map<String, Any?> =
+                mapOf(
+                    "oneofVar" to mapOf(
+                        "stringValue" to "test",
+                        "intValue" to 42
+                    )
+                )
+        }
+    }
+
+    @Resolver
+    class Query_IntermediaryResolver : QueryResolvers.Intermediary() {
+        override suspend fun resolve(ctx: Context): String = ctx.arguments.arg.toString()
+    }
+
+    @Resolver
+    class Query_FromArgumentFieldResolver : QueryResolvers.FromArgumentField() {
+        override suspend fun resolve(ctx: Context): String = ctx.arguments.arg.toString()
+    }
+
+    // Builds a @oneOf input with two supplied keys (one null) via the generated Builder. The build()
+    // must fail fast: graphql-java counts supplied keys, not non-null values.
+    @Resolver(
+        """
+        fragment _ on Query {
+            intermediary(arg: ${'$'}oneofVar)
+        }
+        """
+    )
+    class Query_FromBuilderTwoKeysOneNullResolver : QueryResolvers.FromBuilderTwoKeysOneNull() {
+        override suspend fun resolve(ctx: Context): String? = ctx.getObjectValue().getIntermediaryOrThrow()
+
+        @Variables("oneofVar: OneofInput!")
+        class TwoKeysOneNullVars : VariablesProvider<Arguments> {
+            override suspend fun provide(context: VariablesProviderContext<Arguments>): Map<String, Any?> =
+                mapOf(
+                    "oneofVar" to OneofInput.Builder(context)
+                        .stringValue("test")
+                        .intValue(null)
+                        .build()
+                )
+        }
+    }
+
+    // Builds a @oneOf input with a single supplied key whose value is null. build() must fail fast.
+    @Resolver(
+        """
+        fragment _ on Query {
+            intermediary(arg: ${'$'}oneofVar)
+        }
+        """
+    )
+    class Query_FromBuilderSingleNullKeyResolver : QueryResolvers.FromBuilderSingleNullKey() {
+        override suspend fun resolve(ctx: Context): String? = ctx.getObjectValue().getIntermediaryOrThrow()
+
+        @Variables("oneofVar: OneofInput!")
+        class SingleNullKeyVars : VariablesProvider<Arguments> {
+            override suspend fun provide(context: VariablesProviderContext<Arguments>): Map<String, Any?> =
+                mapOf(
+                    "oneofVar" to OneofInput.Builder(context)
+                        .stringValue(null)
+                        .build()
+                )
+        }
+    }
+}

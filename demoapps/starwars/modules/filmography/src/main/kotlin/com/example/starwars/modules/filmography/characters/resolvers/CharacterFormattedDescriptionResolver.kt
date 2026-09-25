@@ -1,8 +1,8 @@
 package com.example.starwars.modules.filmography.characters.resolvers
 
 import com.example.starwars.filmography.resolverbases.CharacterResolvers
-import jakarta.inject.Inject
-import viaduct.api.Resolver
+import io.micronaut.context.annotation.Prototype
+import viaduct.api.resolver.Resolver
 
 /**
  * **Argument-Based Conditional Logic** example as an alternative to Variables in Viaduct.
@@ -12,14 +12,15 @@ import viaduct.api.Resolver
  *
  * ## Key Components:
  *
- * 1. **Standard GraphQL Fragment**: A fragment that fetches all potentially needed fields.
+ * 1. **Multiple named fragment spreads**: a single selection set can spread more than one named
+ *    fragment. This resolver needs all four fields, so it composes two reusable fragments —
+ *    `CharacterIdentityFields` (`name`, `birthYear`) and `CharacterAppearanceFields`
+ *    (`eyeColor`, `hairColor`) — instead of listing the fields inline:
  *
  *    ```graphql
  *    fragment _ on Character {
- *        name
- *        birthYear
- *        eyeColor
- *        hairColor
+ *        ...CharacterIdentityFields
+ *        ...CharacterAppearanceFields
  *    }
  *    ```
  *
@@ -47,64 +48,61 @@ import viaduct.api.Resolver
  * @see ProfileResolver for @Variable fromArgument example
  * @see StatsResolver for VariableProvider example
  */
-// tag::resolver_example[19] Example of argument-based conditional logic for formatted description
+// tag::resolver_example[60] Example of argument-based conditional logic for formatted description
 @Resolver(
     """
     fragment _ on Character {
-        name
-        birthYear
-        eyeColor
-        hairColor
+        ...CharacterIdentityFields
+        ...CharacterAppearanceFields
     }
     """
 )
-class CharacterFormattedDescriptionResolver
-    @Inject
-    constructor() : CharacterResolvers.FormattedDescription() {
-        override suspend fun resolve(ctx: Context): String? {
-            val character = ctx.objectValue
-            val name = character.getName() ?: "Unknown"
-            val format = ctx.arguments.format
+@Prototype
+class CharacterFormattedDescriptionResolver : CharacterResolvers.FormattedDescription() {
+    override suspend fun resolve(ctx: Context): String? {
+        val character = ctx.getObjectValue()
+        val name = character.getNameOrThrow() ?: "Unknown"
+        val format = ctx.arguments.format
 
-            return when (format) {
-                "detailed" -> {
-                    val birthYear = character.getBirthYear()
-                    val eyeColor = character.getEyeColor()
-                    val hairColor = character.getHairColor()
+        return when (format) {
+            "detailed" -> {
+                val birthYear = character.getBirthYearOrThrow()
+                val eyeColor = character.getEyeColorOrThrow()
+                val hairColor = character.getHairColorOrThrow()
 
-                    buildString {
-                        append(name)
-                        birthYear?.let { append(" (born $it)") }
-                        if (eyeColor != null || hairColor != null) {
-                            append(" - ")
-                            eyeColor?.let { append("$it eyes") }
-                            if (eyeColor != null && hairColor != null) append(", ")
-                            hairColor?.let { append("$it hair") }
-                        }
+                buildString {
+                    append(name)
+                    birthYear?.let { append(" (born $it)") }
+                    if (eyeColor != null || hairColor != null) {
+                        append(" - ")
+                        eyeColor?.let { append("$it eyes") }
+                        if (eyeColor != null && hairColor != null) append(", ")
+                        hairColor?.let { append("$it hair") }
                     }
                 }
-
-                "year-only" -> {
-                    val birthYear = character.getBirthYear()
-                    birthYear?.let { "$name (born $it)" } ?: "$name (birth year unknown)"
-                }
-
-                "appearance-only" -> {
-                    val eyeColor = character.getEyeColor()
-                    val hairColor = character.getHairColor()
-
-                    buildString {
-                        append(name)
-                        if (eyeColor != null || hairColor != null) {
-                            append(" - ")
-                            eyeColor?.let { append("$it eyes") }
-                            if (eyeColor != null && hairColor != null) append(", ")
-                            hairColor?.let { append("$it hair") }
-                        }
-                    }
-                }
-
-                else -> name // default format - just name
             }
+
+            "year-only" -> {
+                val birthYear = character.getBirthYearOrThrow()
+                birthYear?.let { "$name (born $it)" } ?: "$name (birth year unknown)"
+            }
+
+            "appearance-only" -> {
+                val eyeColor = character.getEyeColorOrThrow()
+                val hairColor = character.getHairColorOrThrow()
+
+                buildString {
+                    append(name)
+                    if (eyeColor != null || hairColor != null) {
+                        append(" - ")
+                        eyeColor?.let { append("$it eyes") }
+                        if (eyeColor != null && hairColor != null) append(", ")
+                        hairColor?.let { append("$it hair") }
+                    }
+                }
+            }
+
+            else -> name // default format - just name
         }
     }
+}

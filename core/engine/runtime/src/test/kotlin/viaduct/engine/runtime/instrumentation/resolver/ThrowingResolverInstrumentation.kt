@@ -1,0 +1,56 @@
+package viaduct.engine.runtime.instrumentation.resolver
+
+import viaduct.engine.api.instrumentation.resolver.ResolverFunction
+import viaduct.engine.api.instrumentation.resolver.SyncFetchFunction
+import viaduct.engine.api.instrumentation.resolver.ViaductResolverInstrumentation
+
+/**
+ * Test instrumentation that throws exceptions on method calls.
+ * Used to verify that instrumentation failures don't break core operations.
+ */
+class ThrowingResolverInstrumentation(
+    private val exceptionMessage: String = "Failed exception message",
+    private val throwOnCreateState: Boolean = false,
+    private val throwOnInstrumentExecute: Boolean = false,
+    private val throwOnInstrumentFetch: Boolean = false,
+    private val throwOnInstrumentReadSelection: Boolean = false,
+) : ViaductResolverInstrumentation {
+    override fun createInstrumentationState(parameters: ViaductResolverInstrumentation.CreateInstrumentationStateParameters): ViaductResolverInstrumentation.InstrumentationState {
+        if (throwOnCreateState) {
+            throw RuntimeException(exceptionMessage)
+        }
+        return RecordingResolverInstrumentation.RecordingInstrumentationState()
+    }
+
+    override fun <T> instrumentResolverExecution(
+        resolver: ResolverFunction<T>,
+        parameters: ViaductResolverInstrumentation.InstrumentExecuteResolverParameters,
+        state: ViaductResolverInstrumentation.InstrumentationState?,
+    ): ResolverFunction<T> {
+        if (throwOnInstrumentExecute) {
+            throw RuntimeException(exceptionMessage)
+        }
+        return resolver
+    }
+
+    override fun beginFetchSelection(
+        parameters: ViaductResolverInstrumentation.InstrumentFetchSelectionParameters,
+        state: ViaductResolverInstrumentation.InstrumentationState?,
+    ): ViaductResolverInstrumentation.FetchSelectionInstrumentation {
+        if (throwOnInstrumentFetch) {
+            throw RuntimeException(exceptionMessage)
+        }
+        return ViaductResolverInstrumentation.FetchSelectionInstrumentation.NOOP
+    }
+
+    override fun <T> instrumentReadSelection(
+        fetchFn: SyncFetchFunction<T>,
+        parameters: ViaductResolverInstrumentation.InstrumentFetchSelectionParameters,
+        state: ViaductResolverInstrumentation.InstrumentationState?,
+    ): SyncFetchFunction<T> {
+        if (throwOnInstrumentReadSelection) {
+            throw RuntimeException(exceptionMessage)
+        }
+        return fetchFn
+    }
+}

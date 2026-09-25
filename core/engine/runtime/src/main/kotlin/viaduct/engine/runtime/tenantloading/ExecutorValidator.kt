@@ -1,0 +1,128 @@
+package viaduct.engine.runtime.tenantloading
+
+import viaduct.engine.api.Coordinate
+import viaduct.engine.api.EngineSchema
+import viaduct.engine.api.spi.CheckerExecutor
+import viaduct.engine.api.spi.FieldResolverExecutor
+import viaduct.engine.api.spi.NodeResolverExecutor
+import viaduct.engine.runtime.DispatcherRegistry
+import viaduct.engine.runtime.RequiredSelectionSetRegistry
+import viaduct.engine.runtime.validation.Validator
+import viaduct.engine.runtime.validation.Validator.Companion.flatten
+
+/** A concrete implementation of a [Validator] for [DispatcherRegistry] */
+class ExecutorValidator(
+    private val nodeResolverValidator: Validator<NodeResolverExecutorValidationCtx>,
+    private val fieldResolverExecutorValidator: Validator<FieldResolverExecutorValidationCtx>,
+    private val requiredSelectionsValidator: Validator<RequiredSelectionsValidationCtx>,
+    private val checkerExecutorValidator: Validator<CheckerExecutorValidationCtx>,
+) : Validator<ExecutorValidatorContext> {
+    // defaults from schema
+    constructor(schema: EngineSchema) : this(
+        nodeResolverValidator = Validator.Unvalidated,
+        fieldResolverExecutorValidator = listOf(
+            ResolverSelectionSetsAreProperlyTyped(schema),
+            SelectiveResolverNotAllowedOnMutations(schema),
+        ).flatten(),
+        requiredSelectionsValidator = listOf(
+            RequiredSelectionsAreSchematicallyValid(schema),
+            RequiredSelectionsAreAcyclic(schema),
+            FromArgumentVariablesHaveValidPaths(schema),
+            FromFieldVariablesHaveValidPaths(schema)
+        ).flatten(),
+        checkerExecutorValidator = CheckerSelectionSetsAreProperlyTyped(schema),
+    )
+
+    @Suppress("PARAMETER_NAME_CHANGED_ON_OVERRIDE")
+    override fun validate(ctx: ExecutorValidatorContext) {
+        ctx.nodeResolverExecutors.forEach { (typeName, executor) ->
+            nodeResolverValidator.validate(
+                NodeResolverExecutorValidationCtx(typeName, executor)
+            )
+        }
+
+        val rssValidatedCoords = mutableSetOf<Coordinate>()
+        ctx.fieldCheckerExecutors.forEach { (coord, executor) ->
+            checkerExecutorValidator.validate(
+                CheckerExecutorValidationCtx(coord.first, executor)
+            )
+            if (executor.requiredSelectionSets.any { it.value != null } &&
+                rssValidatedCoords.add(coord)
+            ) {
+                requiredSelectionsValidator.validate(
+                    RequiredSelectionsValidationCtx(
+                        coord.first,
+                        coord.second,
+                        ctx.requiredSelectionSetRegistry
+                    )
+                )
+            }
+        }
+
+        ctx.typeCheckerExecutors.forEach { (typeName, executor) ->
+            checkerExecutorValidator.validate(
+                CheckerExecutorValidationCtx(typeName, executor)
+            )
+            if (executor.requiredSelectionSets.any { it.value != null }) {
+                requiredSelectionsValidator.validate(
+                    RequiredSelectionsValidationCtx(
+                        typeName,
+                        null,
+                        ctx.requiredSelectionSetRegistry
+                    )
+                )
+            }
+        }
+
+        ctx.fieldResolverExecutors.forEach { (coord, executor) ->
+            fieldResolverExecutorValidator.validate(
+                FieldResolverExecutorValidationCtx(coord, executor)
+            )
+            if (executor.hasRequiredSelectionSets() &&
+                rssValidatedCoords.add(coord)
+            ) {
+                requiredSelectionsValidator.validate(
+                    RequiredSelectionsValidationCtx(
+                        coord.first,
+                        coord.second,
+                        ctx.requiredSelectionSetRegistry
+                    )
+                )
+            }
+        }
+    }
+}
+
+data class ExecutorValidatorContext(
+    val fieldResolverExecutors: Map<Coordinate, FieldResolverExecutor>,
+    val nodeResolverExecutors: Map<String, NodeResolverExecutor>,
+    val fieldCheckerExecutors: Map<Coordinate, CheckerExecutor>,
+    val typeCheckerExecutors: Map<String, CheckerExecutor>,
+    val requiredSelectionSetRegistry: RequiredSelectionSetRegistry
+)
+
+data class NodeResolverExecutorValidationCtx(
+    val typeName: String,
+    val executor: NodeResolverExecutor,
+)
+
+data class FieldResolverExecutorValidationCtx(
+    val coord: Coordinate,
+    val executor: FieldResolverExecutor,
+)
+
+data class RequiredSelectionsValidationCtx(
+    val typeName: String,
+    val fieldName: String?,
+    val requiredSelectionSetRegistry: RequiredSelectionSetRegistry
+)
+
+data class CheckerExecutorValidationCtx(
+    val typeName: String,
+    val executor: CheckerExecutor
+)
+
+/**
+ * Represents either a field coordinate, or an object type if the 2nd element is null
+ */
+typealias TypeOrFieldCoordinate = Pair<String, String?>

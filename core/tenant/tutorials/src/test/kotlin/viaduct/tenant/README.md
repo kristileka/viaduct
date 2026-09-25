@@ -1,0 +1,280 @@
+# Viaduct Framework Tutorials
+
+A comprehensive, hands-on tutorial series that teaches you how to build GraphQL APIs with the Viaduct framework. Each tutorial builds on the previous one, taking you from basic concepts to advanced optimization patterns.
+
+
+## Tutorial Notes
+
+-  Function: createGlobalIdString is a TEST-ONLY utility method provided by KotlinFeatureAppTestContractBase.
+-  Function: getInternalId is a TEST-ONLY utility method provided by KotlinFeatureAppTestContractBase.
+-  Each test scenario builds a new instance of viaduct.
+
+## Prerequisites
+
+- Basic understanding of GraphQL concepts (queries, mutations, types)
+- Familiarity with Kotlin programming language
+- Understanding of database and API concepts
+
+## Tutorial Series Overview
+
+This series consists of a set of progressive tutorials, each demonstrating core Viaduct concepts through working code examples and tests. Follow them in order for the best learning experience.
+
+## How to Use the Tutorials
+
+Start with Tutorial 1 and work your way through the series in order. Each tutorial builds on concepts from previous ones.
+
+### Navigation Within Files
+Each tutorial file includes navigation comments:
+```kotlin
+/**
+ * PREVIOUS: [viaduct.tenant.tutorial01.SimpleFieldResolverFeatureAppTest]
+ * NEXT: [viaduct.tenant.tutorial03.SimpleResolversFeatureAppTest]
+ */
+```
+
+### Tutorial Structure
+
+Each tutorial follows a consistent format:
+
+- **Learning Objectives** - What you'll master in this tutorial
+- **Viaduct Features Demonstrated** - Framework features you'll use
+- **Concepts Covered** - Technical concepts explained
+- **Working Code** - Complete, runnable examples
+- **Tests** - Demonstrations of functionality
+- **Navigation** - Links to previous and next tutorials
+
+## Complete Tutorial Path
+
+### 1. Basic Field Resolvers
+**File:** [SimpleFieldResolverFeatureAppTest.kt](tutorial01/SimpleFieldResolverFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- The most basic Viaduct resolver pattern
+- How `@resolver` directive generates base classes
+- Relationship between SDL schema and Kotlin code
+
+**Key concepts:** SDL to Kotlin generation, basic resolver implementation
+
+---
+
+### 2. Node Resolvers
+**File:** [SimpleNodeResolverFeatureAppTest.kt](tutorial02/SimpleNodeResolverFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- Node Resolvers for object-by-ID patterns
+- GlobalID system for type-safe object references
+- Integration between Field and Node Resolvers
+
+**Key concepts:** Relay Global Object Identification, type safety with GlobalIDs
+
+---
+
+### 3. Combined Resolvers
+**File:** [SimpleResolversFeatureAppTest.kt](tutorial03/SimpleResolversFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- Combining Node Resolvers and Field Resolvers in one schema
+- `objectValueFragment` for accessing parent object data
+- Computed fields that depend on other fields
+
+**Key concepts:** Separation of object creation vs field computation, dependency resolution
+
+---
+
+### 4. Backing Data
+**File:** [SimpleBackingDataFeatureAppTest.kt](tutorial04/SimpleBackingDataFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- Eliminating redundant expensive operations across multiple fields
+- Sharing complex Kotlin objects between field resolvers
+- `@backingData` directive and custom class specification
+
+**Key concepts:** Performance optimization through data sharing, external service integration
+
+---
+
+### 5. Mutations
+**File:** [SimpleMutationsFeatureAppTest.kt](tutorial05/SimpleMutationsFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- GraphQL mutations for data modification
+- ID extraction from mutation results for chaining operations
+- Node Resolver integration with mutations
+
+**Key concepts:** Create/Read/Update patterns, ID extraction, mutation-to-query workflows
+
+---
+
+### 6. Scopes
+**File:** [SimpleScopesFeatureAppTest.kt](tutorial06/SimpleScopesFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- API security through field-level access control
+- Deploying different API versions for different client types
+- Organizing GraphQL schemas by scope (USER, ADMIN, INTERNAL)
+
+**Key concepts:** Multi-tenant API architecture, security through schema separation
+
+---
+
+### 7. Batch Resolvers
+**File:** [SimpleBatchResolverFeatureAppTest.kt](tutorial07/SimpleBatchResolverFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- Solving the N+1 query problem for related data
+- Batching multiple field requests into single operations
+
+**Key concepts:** N+1 problem solutions, DataLoader pattern, performance optimization
+
+---
+
+### 8. Batch Node Resolvers
+**File:** [BatchNodeResolverFeatureAppTest.kt](tutorial08/BatchNodeResolverFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- Applying batching to Node Resolver operations
+- Optimizing multiple object lookups by GlobalID
+- Handling mixed valid/invalid IDs in batch operations
+
+**Key concepts:** Object-level batching, error isolation, performance monitoring
+
+---
+
+### 9. Variables & Directives
+**File:** [VariablesDirectivesFeatureAppTest.kt](tutorial09/VariablesDirectivesFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- Controlling GraphQL directives (`@include`/`@skip`) dynamically
+- Using variables to conditionally fetch fields at runtime
+- Three patterns: declarative, VariablesProvider, and argument-based
+
+**Key concepts:** Runtime field selection optimization, conditional data access
+
+---
+
+### 10. Variables for Arguments
+**File:** [VariablesForArgumentsFeatureAppTest.kt](tutorial10/VariablesForArgumentsFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- Controlling GraphQL field arguments dynamically using variables
+- Dynamic argument injection into selection sets
+- Conditional argument passing based on business logic
+
+**Key concepts:** Advanced variable usage, argument transformation, conditional behavior
+
+---
+
+### 11. Simple Subqueries
+**File:** [SimpleSubqueriesFeatureAppTest.kt](tutorial11/SimpleSubqueriesFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- Execute subqueries against the Query root from any resolver using `ctx.query()`
+- Execute submutations from mutation resolvers using `ctx.mutation()`
+- Pass variables to subqueries
+- When to use `ctx.query()` vs declarative `@Resolver` fragments
+
+**Key concepts:** Imperative subquery execution, subquery variable scope, mutation submutations, runtime vs planning-time field access
+
+---
+
+### 12. Connections
+**File:** [ConnectionsFeatureAppTest.kt](tutorial12/ConnectionsFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- Building Relay-spec paginated APIs with Connection types
+- `ConnectionBuilder.fromList()` – hand over the full dataset, let the framework paginate
+- `ConnectionBuilder.fromSlice()` – fetch limit+1 rows yourself, pass `hasNextPage` explicitly
+- `ConnectionBuilder.fromEdges()` – construct edges manually for full cursor and PageInfo control
+- Forward pagination (`first`/`after`) and backward pagination (`last`/`before`)
+- Designing rich schemas with `@connection`, `@edge`, and `PageInfo`
+
+**Key concepts:** Relay Connection spec, OffsetCursor encoding, PageInfo, cursor-based pagination
+
+---
+
+### 13. Root Field References
+**File:** [RootFieldRefFeatureAppTest.kt](tutorial13/RootFieldRefFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- Referencing root fields from a resolver with `ctx.ref()`
+- Organizing root fields into namespace types using the `@namespaceType` directive
+- Resolving a field by delegating to another root field on a namespace type
+
+**Key concepts:** Root field references, namespace types, resolver delegation
+
+---
+
+### 14. Named Fragments
+**File:** [NamedFragmentsFeatureAppTest.kt](tutorial14/NamedFragmentsFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- Defining reusable GraphQL fragments in Kotlin with `@GraphQLFragment`
+- Spreading a named fragment (`...FragmentName`) inside a resolver's `objectValueFragment`
+- Composing fragments by nesting one named fragment inside another
+
+**Key concepts:** Fragment reuse across resolvers, fragment composition, module-scoped fragment discovery
+
+---
+
+### 15. GraphQL Operations
+**File:** [GraphQLOperationsFeatureAppTest.kt](tutorial15/GraphQLOperationsFeatureAppTest.kt)
+
+**What you'll learn:**
+
+- Declaring reusable GraphQL operations with `@GraphQLOperation`
+- Running query operations with and without variables via `ctx.query(operation)`
+- Running operations that spread a named fragment
+- Running mutation operations with variables via `ctx.mutation(operation, variables)`
+
+**Key concepts:** Declare-once/execute-many operations, compile-time document validation, operation variables, fragment reuse in operations
+
+---
+
+## Getting the Most Out of These Tutorials
+
+1. **Read the Learning Objectives** first to understand what you'll gain
+2. **Run the tests** to see the code in action
+3. **Study the code comments** for detailed explanations
+4. **Experiment** by modifying examples to test your understanding
+5. **Follow the navigation** to maintain proper learning sequence
+
+## Core Concepts You'll Master
+
+- **GraphQL API Design** - Proper schema design and resolver architecture
+- **Performance Optimization** - Batch resolvers, backing data, and N+1 problem solutions
+- **Security Patterns** - Scoped APIs and access control
+- **Advanced Features** - Variables, directives, and dynamic behavior
+- **Production Readiness** - Error handling, monitoring, and best practices
+
+## Support and Further Learning
+
+Each tutorial is self-contained with comprehensive examples and explanations. The code demonstrates production-ready patterns you can apply to your own Viaduct applications.
+
+For additional support:
+
+- Review the inline code comments for detailed explanations
+- Run the tests to see expected behavior
+- Experiment with the code to deepen understanding
+
+# Demo Applications
+For more detailed, real-world examples of Viaduct in action, explore the complete demo applications located in the demoapps directory at the root of the project. There you'll find two fully-functional applications:
+
+- [Star Wars API](../../../../../../../demoapps/starwars) - A comprehensive GraphQL API demonstrating advanced Viaduct patterns
+- [CLI Starter](../../../../../../../demoapps/cli-starter) - Command-line application starter template
+
+
+Each of these demoapps showcase how to use viaduct in a gradle project.

@@ -53,6 +53,7 @@ If the answer to either of those two questions are "yes", then you're probably d
 ## Filing an issue
 
 When filing an issue, you will be asked to answer the following questions:
+
 * Who is the bug affecting?
 * What is affected by this bug?
 * When does this occur?
@@ -92,12 +93,9 @@ This will publish all Viaduct libraries and Gradle plugins to your local Maven r
 
 ## Binary compatibility validation (BCV)
 
-Viaduct uses the Kotlin Binary Compatibility Validator Gradle plugin
-(`org.jetbrains.kotlinx.binary-compatibility-validator`) to track and enforce
-the public binary API of selected modules.
+Viaduct uses the Kotlin Binary Compatibility Validator Gradle plugin (`org.jetbrains.kotlinx.binary-compatibility-validator`) to track and enforce the public binary API of selected modules.
 
-BCV works by generating and checking `.api` signature files for modules that
-apply the BCV convention plugin `id("conventions.bcv-api")`, like `:tenant:api` and `:service:api`.
+BCV works by generating and checking `.api` signature files for modules that apply the BCV convention plugin `id("conventions.bcv-api")`, like `:tenant:api` and `:service:api`.
 
 Developers should amend those `.api` files when making intentional executing :
 
@@ -113,13 +111,28 @@ Run tests with:
 ./gradlew check
 ```
 
-### Demo Apps
+## Static analysis
 
-To build and test demo apps:
+Viaduct uses parallel static-analysis stacks for Kotlin and Java:
+
+| Language | Formatting | Bug detection | Nullability |
+| --- | --- | --- | --- |
+| Kotlin | ktlint | detekt | Kotlin type system |
+| Java | Google Java Format 1.26.0 | Error Prone | JSpecify annotations enforced by NullAway |
+
+Run the formatting and standalone analysis tasks with:
 
 ```bash
-./gradlew :cli-starter:build :cli-starter:test :starwars:build :starwars:test
+./gradlew ktlintCheck detekt spotlessCheck
 ```
+
+Error Prone and NullAway run as part of Java compilation, including `./gradlew check`, and Java
+compiler and Error Prone warnings fail compilation. Java packages opt in to NullAway by applying
+JSpecify's `@NullMarked`; use `@Nullable` for exceptions within a null-marked scope.
+
+### Demo Apps
+
+Demo apps are standalone Gradle builds, not part of the root composite. `./gradlew check` runs all of them sequentially against published artifacts via the `demoappsStandaloneTest` task. To iterate on a single demo app, see `demoapps/AGENTS.md`.
 
 # Release Process
 
@@ -127,7 +140,7 @@ Releases are listed [here](https://github.com/airbnb/viaduct/releases).
 
 ## Who is responsible for a release?
 
-Releases are performed by maintainers according to the [RELEASE-RUNBOOK.md](RELEASE-RUNBOOK.md).  The release process requires permissions only held by maintainers.  If you are an external contributor and would like to help with a release, please reach out to the core team via a GitHub discussion.
+Releases are performed by maintainers according to the [release runbook](.github/impldocs/release-runbook.md). The release process requires permissions only held by maintainers. If you are an external contributor and would like to help with a release, please reach out to the core team via a GitHub discussion.
 
 ## Versioning
 
@@ -143,9 +156,33 @@ Release artifacts are published to the Gradle Plugin Portal and Maven Central.
 
 ### Maven Central
 
-Runtime libraries are published to Maven Central. Artifacts are grouped under the [`com.airbnb.viaduct`](https://central.sonatype.com/namespace/com.airbnb.viaduct) group ID. The [Viaduct BOM](https://search.maven.org/artifact/com.airbnb.viaduct/bom) is the recommended way to manage versions of Viaduct dependencies.
+Runtime libraries are published to Maven Central. Artifacts are grouped under the [`com.airbnb.viaduct`](https://central.sonatype.com/namespace/com.airbnb.viaduct) group ID.
 
 ### Gradle Plugin Portal
 
 * [application-gradle-plugin](https://plugins.gradle.org/plugin/com.airbnb.viaduct.application-gradle-plugin)
 * [module-gradle-plugin](https://plugins.gradle.org/plugin/com.airbnb.viaduct.module-gradle-plugin)
+
+# Runbook
+
+This section covers administration of the infrastructure used by the Viaduct OSS project.
+
+## Github
+
+Administration is handled by Airbnb's open source committee.
+
+### CI
+
+We use Github Actions to run Viaduct's public [CI jobs](https://github.com/airbnb/viaduct/actions).
+
+## Gradle Plugin Portal
+
+Plugins are published via the `viaduct-maintainers` account owned by Airbnb. https://plugins.gradle.org/u/viaduct-maintainers
+
+## Maven Central/Sonatype
+
+Access to Airbnb's Sonatype namespace is controlled via Airbnb's Github organization. Only members of the Airbnb Github organization can access the namespace.
+
+## Copybara
+
+Viaduct has dual homes: Github and Airbnb's internal monorepo. We use [Copybara](https://github.com/google/copybara) to sync changes between the two source trees. Copybara runs on internal Airbnb infrastructure and is not accessible to outside contributors.

@@ -5,19 +5,18 @@ description: What a module is in this demo, how modules are laid out, and how sc
 
 
 A module:
+
 - Encapsulates its **GraphQL SDL** (`*.graphqls`) under a fixed directory.
 - Owns the **resolvers** that implement the fields declared in that SDL.
 - Contributes its slice of the overall app surface, which is later **assembled** into a central schema.
 
-> The real “visibility” and “security” behavior comes from **schemas** and **scopes**. Modules help you **organize**
-> business subdomains cleanly; schemas/scopes decide what is exposed at runtime.
+> The real “visibility” and “security” behavior comes from **schemas** and **scopes**. Modules help you **organize** business subdomains cleanly; schemas/scopes decide what is exposed at runtime.
 
 ## StarWars modules
 
 ### universe
 
-**Focus:** the in-universe graph of entities and their relationships. Typical modules include `characters`, `planets`,
-`species`, and cross-entity links (for example, a character’s homeworld or species).
+**Focus:** the in-universe graph of entities and their relationships. Typical modules include `characters`, `planets`, `species`, and cross-entity links (for example, a character’s homeworld or species).
 
 **Common fields and patterns:**
 
@@ -25,8 +24,7 @@ A module:
 
 ### filmography
 
-**Focus:** the catalog of films and character appearances. Typical modules cover `films` and derived relationships such
-as “which characters appear in which film”.
+**Focus:** the catalog of films and character appearances. Typical modules cover `films` and derived relationships such as “which characters appear in which film”.
 
 **Common fields and patterns:**
 
@@ -80,6 +78,7 @@ modules/<module>/build/generated-sources/viaduct/resolverBases/...
 ## How modules are assembled
 
 The **builder** :
+
 1. Discovers all SDL files per module (schema partitions).
 2. Registers **schema IDs** that point to a concrete surface (public vs extras).
 3. At runtime, the **controller** chooses a `schemaId` (see `determineSchemaId(scopes)`) and builds an `ExecutionInput`.
@@ -94,4 +93,4 @@ See the **Schemas** and **Scope** pages for runtime selection and visibility rul
 - **Resolvers** implementing the domain’s behavior (`queryresolvers`, `fieldresolvers`, `batchresolvers`, `mutations`).
 - **Tests** providing integration coverage for the module’s surface.
 
-
+> For the full multi-tenancy model — how tenant modules register schemas and resolvers in a shared Viaduct instance — see the [Multi-tenancy service engineer docs](../../../docs/service_engineers/multi_tenancy/index.md).

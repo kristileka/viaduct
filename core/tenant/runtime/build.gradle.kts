@@ -1,0 +1,102 @@
+plugins {
+    id("conventions.kotlin")
+    id("conventions.kotlin-static-analysis")
+    id("feature-app-contracts")
+    id("feature-app-contract-tests")
+    `java-test-fixtures`
+}
+
+viaductFeatureAppContracts {
+    kotlin {
+        contractsFrom(":tenant:runtime")
+    }
+}
+
+tasks.named<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>("compileKotlin") {
+    compilerOptions.moduleName.set("tenant-runtime")
+}
+
+tasks.named<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>("compileTestFixturesKotlin") {
+    compilerOptions.moduleName.set("tenant-runtime_testFixtures")
+}
+
+val testFileBasedBootstrap by tasks.registering(Test::class) {
+    description = "Runs all contract tests using the file-based bootstrap"
+    group = "verification"
+    val testSourceSet = sourceSets.named("test").get()
+    testClassesDirs = testSourceSet.output.classesDirs
+    classpath = testSourceSet.runtimeClasspath
+    useJUnitPlatform {
+        includeTags("feature-app-contract-test")
+    }
+    environment("USE_FILE_BASED_BOOTSTRAP", "true")
+}
+
+tasks.named("check").configure {
+    dependsOn(testFileBasedBootstrap)
+}
+
+dependencies {
+    implementation(libs.caffeine)
+    implementation(libs.graphql.java)
+    implementation(libs.jackson.databind)
+    implementation(libs.jackson.module)
+    implementation(libs.guice)
+    implementation(libs.javax.inject)
+    implementation(libs.viaduct.tenant.api)
+
+    implementation(libs.viaduct.engine.api)
+    implementation(libs.viaduct.shared.bootstrap)
+    implementation(libs.viaduct.engine.runtime)
+    implementation(libs.viaduct.service.api)
+
+    implementation(libs.viaduct.shared.graphql)
+    implementation(libs.viaduct.shared.mapping)
+    implementation(libs.viaduct.tenant.shared)
+    implementation(libs.viaduct.shared.apiannotations)
+    implementation(libs.viaduct.shared.utils)
+    implementation(libs.classgraph)
+    implementation(libs.guava)
+    implementation(libs.slf4j.api)
+    implementation(libs.kotlin.reflect)
+    implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.viaduct.shared.apiannotations)
+
+    testFixturesCompileOnly(libs.junit)
+    testFixturesImplementation(libs.viaduct.engine.api)
+    testFixturesImplementation(testFixtures(libs.viaduct.shared.graphql))
+    testFixturesImplementation(testFixtures(libs.viaduct.service.api))
+    testFixturesImplementation(libs.viaduct.service.runtime)
+    testFixturesImplementation(libs.viaduct.service.wiring)
+    testFixturesImplementation(libs.slf4j.api)
+    testFixturesImplementation(libs.viaduct.engine.runtime)
+    testFixturesImplementation(libs.viaduct.service.api)
+    testFixturesImplementation(libs.viaduct.tenant.api)
+    testFixturesImplementation(libs.viaduct.tenant.wiring)
+    testFixturesApi(testFixtures(libs.viaduct.tenant.api))
+    testFixturesImplementation(libs.graphql.java)
+    testFixturesApi(libs.kotest.property.jvm)
+    testFixturesImplementation(libs.kotlin.reflect)
+    testFixturesImplementation(libs.kotlinx.coroutines.core)
+    testFixturesImplementation(libs.kotlinx.coroutines.jdk8)
+    testImplementation(testFixtures(libs.viaduct.engine.api))
+    testImplementation(testFixtures(libs.viaduct.service.api))
+    testImplementation(testFixtures(libs.viaduct.shared.graphql))
+    testImplementation(testFixtures(libs.viaduct.tenant.api))
+    testImplementation(libs.viaduct.engine.runtime)
+    testImplementation(libs.viaduct.service.runtime)
+    testImplementation(libs.viaduct.shared.arbitrary)
+    testImplementation(testFixtures(libs.viaduct.shared.arbitrary))
+    testImplementation(libs.io.mockk.dsl)
+    testImplementation(libs.io.mockk.jvm)
+    testImplementation(libs.kotest.assertions.core.jvm)
+    testImplementation(libs.kotest.property.jvm)
+    testImplementation(libs.kotlinx.coroutines.jdk8)
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.micrometer.core)
+
+    testImplementation(libs.viaduct.engine.wiring)
+    testImplementation(libs.viaduct.tenant.wiring)
+    testImplementation(libs.guice)
+    testImplementation(libs.slf4j.api)
+}

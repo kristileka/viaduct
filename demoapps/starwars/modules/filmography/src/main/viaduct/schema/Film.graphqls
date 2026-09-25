@@ -1,7 +1,7 @@
 """
 A single film.
 """
-type Film implements Node @scope(to: ["default"]) @resolver {
+type Film implements Node @scope(to: ["default"]) @resolver(isSelective: true) {
   """
   The GlobalID of this film - uniquely identifies this Film in the graph (internal use only)
   """
@@ -73,27 +73,62 @@ type Film implements Node @scope(to: ["default"]) @resolver {
   summary: String @resolver
 
   """
-  Production details including cast and crew (demonstrates computed field)
+  Production details (demonstrates a selective field resolver)
   """
-  productionDetails: String @resolver
+  productionDetails: FilmProductionDetails @resolver(isSelective: true)
 
   """
   Character count summary (demonstrates relationship computation)
   """
   characterCountSummary: String @resolver
+
+  """
+  Identifies which backing data source produced this Film (demonstrates per-tenant
+  dependency injection: this tenant's resolver is bound to its own ExternalDataClient).
+  """
+  dataSource: String @resolver
   """
   Main characters in this film (batch resolver example)
   """
-  mainCharacters: [Character] @resolver
+  mainCharacters: [Character] @resolver(isBatching: true)
+
+  # tag::backing_data_schema[8] @backingData directive usage
+  """
+  Character IDs fetched once from the film-character relationship store.
+  Shared by the characters and characterCountSummary resolvers so both
+  fields avoid making separate findCharactersByFilmId calls.
+  """
+  castData: BackingData
+    @resolver
+    @backingData(class: "com.example.starwars.modules.filmography.films.models.FilmCastData")
+}
+
+"""
+Production information for a film.
+"""
+type FilmProductionDetails @scope(to: ["default"]) {
+  title: String
+  director: String
+  producers: [String]
+  releaseDate: String
 }
 
 extend type Query @scope(to: ["default"]) {
   """
   All films
   """
-  allFilms(limit: Int): [Film]
-    @resolver
-    @backingData(class: "com.example.starwars.modules.filmography.films.queries.AllFilmsQueryResolver")
+  allFilms(limit: Int): [Film] @resolver
+  """
+  All films as a paginated connection (Relay-style cursor pagination).
+  Use `first` to set the page size and `after` to page forward from a cursor.
+  The connection also exposes `totalCount` for the total number of films.
+  """
+  allFilmsConnection(
+    "Maximum number of films to return."
+    first: Int
+    "Cursor to start fetching after (exclusive, for forward pagination)."
+    after: String
+  ): FilmsConnection @resolver
 }
 
 # tag::films_connection_example[13] Example of @connection directive for Films

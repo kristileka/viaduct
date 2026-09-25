@@ -1,0 +1,56 @@
+@file:Suppress("DEPRECATION")
+
+package viaduct.engine
+
+import graphql.execution.DataFetcherExceptionHandler
+import graphql.execution.instrumentation.Instrumentation
+import io.micrometer.core.instrument.MeterRegistry
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import viaduct.engine.api.instrumentation.resolver.ViaductResolverInstrumentation
+import viaduct.engine.api.spi.CoroutineInterop
+import viaduct.engine.api.spi.FieldSelectivityProvider
+import viaduct.engine.api.spi.MaterializedFieldValueReader
+import viaduct.engine.runtime.execution.DefaultCoroutineInterop
+import viaduct.engine.runtime.execution.TenantNameResolver
+import viaduct.engine.runtime.execution.ViaductDataFetcherExceptionHandler
+import viaduct.service.api.spi.ErrorReporter
+import viaduct.service.api.spi.FlagManager
+import viaduct.service.api.spi.GlobalIDCodec
+import viaduct.service.api.spi.ResolverErrorBuilder
+import viaduct.service.api.spi.globalid.GlobalIDCodecDefault
+
+/**
+ * Aggregates the parent-scoped collaborators and tuning knobs used to build [Engine] instances.
+ * The parent injector creates one of these per `StandardViaduct`, and every schema-scoped engine
+ * reuses it while schema-specific state (such as the [viaduct.engine.runtime.DispatcherRegistry])
+ * is supplied separately.
+ */
+@OptIn(ExperimentalCoroutinesApi::class)
+data class EngineConfiguration(
+    val coroutineInterop: CoroutineInterop = DefaultCoroutineInterop,
+    val flagManager: FlagManager = FlagManager.Default,
+    /**
+     * Temporary for airbnb only. Off for OSS.
+     * The engine will bypass the access checker for airbnb during completion
+     * for fields whose query carries the `@bypassPolicyCheck` directive.
+     */
+    val airbnbBypassPolicyCheckDuringCompletion: Boolean = false,
+    val resolverErrorReporter: ErrorReporter = ErrorReporter.NOOP,
+    val resolverErrorBuilder: ResolverErrorBuilder = ResolverErrorBuilder.NOOP,
+    val dataFetcherExceptionHandler: DataFetcherExceptionHandler = ViaductDataFetcherExceptionHandler(
+        ErrorReporter.NOOP,
+        ResolverErrorBuilder.NOOP,
+    ),
+    val meterRegistry: MeterRegistry? = null,
+    val additionalInstrumentation: Instrumentation? = null,
+    val chainInstrumentationWithDefaults: Boolean = false,
+    val resolverInstrumentation: ViaductResolverInstrumentation = ViaductResolverInstrumentation.DEFAULT,
+    val fieldSelectivityProvider: FieldSelectivityProvider = FieldSelectivityProvider.Never,
+    val globalIDCodec: GlobalIDCodec = GlobalIDCodecDefault,
+    val tenantNameResolver: TenantNameResolver = TenantNameResolver(),
+    val materializedFieldValueReader: MaterializedFieldValueReader = MaterializedFieldValueReader.Default,
+) {
+    companion object {
+        val default = EngineConfiguration()
+    }
+}

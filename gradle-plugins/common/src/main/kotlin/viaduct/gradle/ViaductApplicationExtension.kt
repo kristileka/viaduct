@@ -1,15 +1,47 @@
 package viaduct.gradle
 
-open class ViaductApplicationExtension(objects: org.gradle.api.model.ObjectFactory) {
-    /** Kotlin package name for generated GRT classes. */
-    val grtPackageName = objects.property(String::class.java).convention("viaduct.api.grts")
+import org.gradle.api.GradleException
+import org.gradle.api.model.ObjectFactory
+import org.gradle.api.provider.Provider
+import viaduct.apiannotations.ExperimentalApi
+import viaduct.apiannotations.InternalApi
+import viaduct.apiannotations.StableApi
+import viaduct.service.api.scoping.SchemaScoping
+import viaduct.service.api.scoping.ScopingErrorCodes
 
-    /** Kotlin package name prefix for all modules. */
-    val modulePackagePrefix = objects.property(String::class.java)
+@StableApi
+@OptIn(ExperimentalApi::class, InternalApi::class)
+open class ViaductApplicationExtension(objects: ObjectFactory) {
+    private val schemaScopingProperty =
+        objects.property(SchemaScoping::class.java).convention(SchemaScoping.EMPTY)
 
-    /** Port for the development server. Defaults to 8080. Set to 0 for dynamic port allocation. */
-    val servePort = objects.property(Int::class.java).convention(8080)
+    private var scopingDeclared = false
 
-    /** Host address for the development server. Defaults to "0.0.0.0". */
-    val serveHost = objects.property(String::class.java).convention("0.0.0.0")
+    /**
+     * The validated [SchemaScoping] snapshot produced by the `declareScoping { ... }` block, or
+     * [SchemaScoping.EMPTY] if `declareScoping` was never called. Read by `:application` for
+     * downstream wiring (e.g. as a typed task input). Marked [InternalApi] so BCV omits it from
+     * the public-surface listing while keeping the symbol visible across `:common` → `:application`.
+     */
+    @InternalApi
+    val schemaScoping: Provider<SchemaScoping> = schemaScopingProperty
+
+    /**
+     * Declares scope universe and scoped schemas for this application. May be called at most once;
+     * omit it entirely to express "no scoping". Per-ID syntax, duplicate IDs, reserved IDs, and the
+     * cross-property subset check all run immediately inside / at the end of the block; any failure
+     * throws a [GradleException] at the offending DSL line.
+     */
+    @ExperimentalApi
+    fun declareScoping(configure: SchemaScopingBuilder.() -> Unit) {
+        if (scopingDeclared) {
+            throw GradleException(
+                "[${ScopingErrorCodes.SCHEMA_SCOPING_DECLARED_TWICE}] " +
+                    "declareScoping may only be called once. " +
+                    "Compose convention-plugin contributions into a single block.",
+            )
+        }
+        scopingDeclared = true
+        schemaScopingProperty.set(SchemaScopingBuilder().apply(configure).build())
+    }
 }

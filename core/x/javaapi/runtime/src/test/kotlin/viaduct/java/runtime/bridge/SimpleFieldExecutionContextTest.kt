@@ -1,0 +1,193 @@
+package viaduct.java.runtime.bridge
+
+import io.kotest.matchers.types.shouldBeInstanceOf
+import io.mockk.every
+import io.mockk.mockk
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertSame
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
+import viaduct.engine.api.EngineExecutionContext
+import viaduct.engine.api.EngineSchema
+import viaduct.errors.FrameworkException
+import viaduct.errors.TenantUsageException
+import viaduct.java.api.globalid.GlobalID
+import viaduct.java.api.types.GraphQLObject
+import viaduct.java.api.types.NodeObject
+import viaduct.service.api.spi.GlobalIDCodec
+import viaduct.service.api.spi.globalid.GlobalIDCodecDefault
+
+class SimpleFieldExecutionContextTest {
+    @Test
+    fun `getRequestContext returns provided value`() {
+        val requestContext = mapOf("key" to "value")
+        val context = SimpleFieldExecutionContext(
+            requestContext = requestContext
+        )
+
+        assertEquals(requestContext, context.getRequestContext())
+    }
+
+    @Test
+    fun `getRequestContext returns null when not provided`() {
+        val context = SimpleFieldExecutionContext(
+            requestContext = null
+        )
+
+        assertNull(context.getRequestContext())
+    }
+
+    @Test
+    fun `getObjectValue throws FrameworkException when no object value provided`() {
+        val context = SimpleFieldExecutionContext(
+            requestContext = null
+        )
+
+        val ex = assertThrows<FrameworkException> { context.getObjectValue() }
+        assertTrue(ex.message!!.contains("Object value not available"))
+    }
+
+    @Test
+    fun `getObjectValue returns provided object value`() {
+        val testObject = object : GraphQLObject {}
+        val context = SimpleFieldExecutionContext(
+            requestContext = null,
+            objectValue = testObject
+        )
+
+        assertSame(testObject, context.getObjectValue())
+    }
+
+    @Test
+    fun `getQueryValue throws FrameworkException when no query value provided`() {
+        val context = SimpleFieldExecutionContext(
+            requestContext = null
+        )
+
+        val ex = assertThrows<FrameworkException> { context.getQueryValue() }
+        assertTrue(ex.message!!.contains("Query value not available"))
+    }
+
+    @Test
+    fun `getArguments returns NoArguments when no arguments provided`() {
+        val context = SimpleFieldExecutionContext(
+            requestContext = null
+        )
+
+        assertSame(viaduct.java.api.types.Arguments.None, context.getArguments())
+    }
+
+    @Test
+    fun `getArguments returns provided arguments`() {
+        val args = viaduct.java.api.types.Arguments.None
+        val context = SimpleFieldExecutionContext(
+            requestContext = null,
+            arguments = args
+        )
+
+        assertSame(args, context.getArguments())
+    }
+
+    @Test
+    fun `getSelections throws FrameworkException`() {
+        val context = SimpleFieldExecutionContext(
+            requestContext = null
+        )
+
+        val ex = assertThrows<FrameworkException> { context.getSelections() }
+        assertTrue(ex.message!!.contains("Selections access not yet implemented"))
+    }
+
+    // ── InternalContext tests ──
+
+    @Test
+    fun `getSchema returns schema from engineExecutionContext`() {
+        val schema = mockk<EngineSchema>()
+        val engineCtx = mockk<EngineExecutionContext> {
+            every { fullSchema } returns schema
+        }
+        val context = SimpleFieldExecutionContext(
+            requestContext = null,
+            engineExecutionContext = engineCtx
+        )
+
+        assertSame(schema, context.getSchema())
+    }
+
+    @Test
+    fun `getSchema throws when engineExecutionContext is null`() {
+        val context = SimpleFieldExecutionContext(requestContext = null)
+
+        val ex = assertThrows<FrameworkException> { context.getSchema() }
+        assertTrue(ex.message!!.contains("engineExecutionContext"))
+    }
+
+    @Test
+    fun `getGlobalIDCodec returns codec from engineExecutionContext`() {
+        val codec = mockk<GlobalIDCodec>()
+        val engineCtx = mockk<EngineExecutionContext> {
+            every { globalIDCodec } returns codec
+        }
+        val context = SimpleFieldExecutionContext(
+            requestContext = null,
+            engineExecutionContext = engineCtx
+        )
+
+        assertSame(codec, context.getGlobalIDCodec())
+    }
+
+    @Test
+    fun `getGlobalIDCodec throws when engineExecutionContext is null`() {
+        val context = SimpleFieldExecutionContext(requestContext = null)
+
+        val ex = assertThrows<FrameworkException> { context.getGlobalIDCodec() }
+        assertTrue(ex.message!!.contains("engineExecutionContext"))
+    }
+
+    @Test
+    fun `deserializeGlobalID deserializes a serialized id into a typed GlobalID`() {
+        val engineCtx = mockk<EngineExecutionContext> {
+            every { globalIDCodec } returns GlobalIDCodecDefault
+        }
+        val context = SimpleFieldExecutionContext(
+            requestContext = null,
+            engineExecutionContext = engineCtx
+        )
+
+        val gid: GlobalID<NodeObject> =
+            context.deserializeGlobalID(GlobalIDCodecDefault.serialize("NodeObj", "tenant1"))
+
+        gid.shouldBeInstanceOf<GlobalIDImpl<*>>()
+        assertEquals("tenant1", gid.getInternalID())
+        assertEquals("NodeObj", gid.getType().name)
+    }
+
+    @Test
+    fun `deserializeGlobalID throws FrameworkException when engineExecutionContext is null`() {
+        val context = SimpleFieldExecutionContext(requestContext = null)
+
+        val ex = assertThrows<FrameworkException> {
+            context.deserializeGlobalID<NodeObject>(GlobalIDCodecDefault.serialize("NodeObj", "tenant1"))
+        }
+        assertTrue(ex.message!!.contains("deserializeGlobalID requires engineExecutionContext"))
+    }
+
+    @Test
+    fun `deserializeGlobalID wraps codec IllegalArgumentException in TenantUsageException`() {
+        val engineCtx = mockk<EngineExecutionContext> {
+            every { globalIDCodec } returns GlobalIDCodecDefault
+        }
+        val context = SimpleFieldExecutionContext(
+            requestContext = null,
+            engineExecutionContext = engineCtx
+        )
+
+        val ex = assertThrows<TenantUsageException> {
+            context.deserializeGlobalID<NodeObject>("not-valid-base64!!!")
+        }
+        assertTrue(ex.message!!.contains("Invalid GlobalID"))
+        ex.cause.shouldBeInstanceOf<IllegalArgumentException>()
+    }
+}

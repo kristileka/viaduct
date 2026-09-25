@@ -1,0 +1,26 @@
+package viaduct.engine.api.spi
+
+import viaduct.bootstrap.FieldEntryConfig
+import viaduct.bootstrap.NodeEntryConfig
+import viaduct.engine.api.EngineSchema
+
+/**
+ * Tenant API implementations provide this to the engine to create executors from registry entries.
+ *
+ * The engine calls these methods during bootstrapping; the Tenant API implementation is responsible
+ * for constructing the executor from the config data.
+ *
+ * The schema parameter is a temporary addition that will be removed once all executor factories
+ * are fully schema-independent.
+ */
+interface ExecutorFactory {
+    fun createFieldResolverExecutor(
+        configData: FieldEntryConfig,
+        schema: EngineSchema
+    ): FieldResolverExecutor
+
+    fun createNodeResolverExecutor(
+        configData: NodeEntryConfig,
+        schema: EngineSchema
+    ): NodeResolverExecutor
+}

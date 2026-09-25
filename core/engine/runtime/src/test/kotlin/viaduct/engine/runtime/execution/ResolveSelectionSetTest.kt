@@ -1,0 +1,263 @@
+package viaduct.engine.runtime.execution
+
+import io.kotest.matchers.types.shouldBeInstanceOf
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import viaduct.engine.api.EngineObjectData
+import viaduct.engine.api.ResolveSelectionSetOptions
+import viaduct.engine.api.mocks.EngineTestModule
+import viaduct.engine.api.mocks.createEngineObjectData
+import viaduct.engine.api.mocks.runFeatureTest
+
+/**
+ * Test suite for the [viaduct.engine.api.EngineExecutionContext.resolveSelectionSet] API.
+ *
+ * resolveSelectionSet returns an [EngineObjectData.Sync] with all fields eagerly resolved
+ * before the method returns.
+ */
+class ResolveSelectionSetTest {
+    // ==================== resolveSelectionSet ====================
+
+    @Test
+    fun `resolveSelectionSet returns EngineObjectData Sync with scalar fields`() {
+        EngineTestModule(
+            """
+            extend type Query {
+                name: String
+                age: Int
+                container: Container
+            }
+            type Container {
+                result: String
+            }
+            """.trimIndent()
+        ) {
+            fieldWithValue("Query" to "name", "Alice")
+            fieldWithValue("Query" to "age", 30)
+
+            field("Query" to "container") {
+                resolver {
+                    fn { _, _, _, _, _ ->
+                        createEngineObjectData(
+                            schema.schema.getObjectType("Container"),
+                            mapOf()
+                        )
+                    }
+                }
+            }
+
+            field("Container" to "result") {
+                resolver {
+                    fn { _, _, _, _, ctx ->
+                        val selectionSet = ctx.engineSelectionSetFactory
+                            .engineSelectionSet("Query", "name age", emptyMap())
+                        val data = ctx.resolveSelectionSet(selectionSet)
+                        data.shouldBeInstanceOf<EngineObjectData.Sync>()
+                        "name=${data.get("name")}, age=${data.get("age")}"
+                    }
+                }
+            }
+        }.runFeatureTest {
+            runQuery("{ container { result } }")
+                .assertJson("""{"data": {"container": {"result": "name=Alice, age=30"}}}""")
+        }
+    }
+
+    @Test
+    fun `resolveSelectionSet data supports getOrNull`() {
+        EngineTestModule(
+            """
+            extend type Query {
+                name: String
+                container: Container
+            }
+            type Container {
+                result: String
+            }
+            """.trimIndent()
+        ) {
+            fieldWithValue("Query" to "name", "Bob")
+
+            field("Query" to "container") {
+                resolver {
+                    fn { _, _, _, _, _ ->
+                        createEngineObjectData(
+                            schema.schema.getObjectType("Container"),
+                            mapOf()
+                        )
+                    }
+                }
+            }
+
+            field("Container" to "result") {
+                resolver {
+                    fn { _, _, _, _, ctx ->
+                        val selectionSet = ctx.engineSelectionSetFactory
+                            .engineSelectionSet("Query", "name", emptyMap())
+                        val data = ctx.resolveSelectionSet(selectionSet)
+                        data.shouldBeInstanceOf<EngineObjectData.Sync>()
+                        val name = data.getOrNull("name")
+                        assertNotNull(name)
+                        "name=$name"
+                    }
+                }
+            }
+        }.runFeatureTest {
+            runQuery("{ container { result } }")
+                .assertJson("""{"data": {"container": {"result": "name=Bob"}}}""")
+        }
+    }
+
+    @Test
+    fun `resolveSelectionSet data supports getSelections`() {
+        EngineTestModule(
+            """
+            extend type Query {
+                x: Int
+                y: String
+                container: Container
+            }
+            type Container {
+                result: String
+            }
+            """.trimIndent()
+        ) {
+            fieldWithValue("Query" to "x", 1)
+            fieldWithValue("Query" to "y", "two")
+
+            field("Query" to "container") {
+                resolver {
+                    fn { _, _, _, _, _ ->
+                        createEngineObjectData(
+                            schema.schema.getObjectType("Container"),
+                            mapOf()
+                        )
+                    }
+                }
+            }
+
+            field("Container" to "result") {
+                resolver {
+                    fn { _, _, _, _, ctx ->
+                        val selectionSet = ctx.engineSelectionSetFactory
+                            .engineSelectionSet("Query", "x y", emptyMap())
+                        val data = ctx.resolveSelectionSet(selectionSet)
+                        data.shouldBeInstanceOf<EngineObjectData.Sync>()
+                        val selections = data.getSelections().toList()
+                        assertEquals(2, selections.size)
+                        assertTrue(selections.contains("x"))
+                        assertTrue(selections.contains("y"))
+                        "selections=${selections.sorted().joinToString(",")}"
+                    }
+                }
+            }
+        }.runFeatureTest {
+            runQuery("{ container { result } }")
+                .assertJson("""{"data": {"container": {"result": "selections=x,y"}}}""")
+        }
+    }
+
+    @Test
+    fun `resolveSelectionSet works with mutation operation type`() {
+        EngineTestModule(
+            """
+            extend type Query {
+                container: Container
+            }
+            extend type Mutation {
+                doSomething: String
+            }
+            type Container {
+                result: String
+            }
+            """.trimIndent()
+        ) {
+            fieldWithValue("Mutation" to "doSomething", "done")
+
+            field("Query" to "container") {
+                resolver {
+                    fn { _, _, _, _, _ ->
+                        createEngineObjectData(
+                            schema.schema.getObjectType("Container"),
+                            mapOf()
+                        )
+                    }
+                }
+            }
+
+            field("Container" to "result") {
+                resolver {
+                    fn { _, _, _, _, ctx ->
+                        val selectionSet = ctx.engineSelectionSetFactory
+                            .engineSelectionSet("Mutation", "doSomething", emptyMap())
+                        val data = ctx.resolveSelectionSet(selectionSet, ResolveSelectionSetOptions.MUTATION)
+                        data.shouldBeInstanceOf<EngineObjectData.Sync>()
+                        "mutationResult=${data.get("doSomething")}"
+                    }
+                }
+            }
+        }.runFeatureTest {
+            runQuery("{ container { result } }")
+                .assertJson("""{"data": {"container": {"result": "mutationResult=done"}}}""")
+        }
+    }
+
+    @Test
+    fun `resolveSelectionSet returns EngineObjectData Sync for nested objects`() {
+        EngineTestModule(
+            """
+            extend type Query {
+                person: Person
+                container: Container
+            }
+            type Person {
+                name: String
+                age: Int
+            }
+            type Container {
+                result: String
+            }
+            """.trimIndent()
+        ) {
+            field("Query" to "person") {
+                resolver {
+                    fn { _, _, _, _, _ ->
+                        createEngineObjectData(
+                            schema.schema.getObjectType("Person"),
+                            mapOf("name" to "Dave", "age" to 40)
+                        )
+                    }
+                }
+            }
+
+            field("Query" to "container") {
+                resolver {
+                    fn { _, _, _, _, _ ->
+                        createEngineObjectData(
+                            schema.schema.getObjectType("Container"),
+                            mapOf()
+                        )
+                    }
+                }
+            }
+
+            field("Container" to "result") {
+                resolver {
+                    fn { _, _, _, _, ctx ->
+                        val selectionSet = ctx.engineSelectionSetFactory
+                            .engineSelectionSet("Query", "person { name age }", emptyMap())
+                        val data = ctx.resolveSelectionSet(selectionSet)
+                        data.shouldBeInstanceOf<EngineObjectData.Sync>()
+                        val person = data.get("person").shouldBeInstanceOf<EngineObjectData.Sync>()
+                        "name=${person.get("name")}, age=${person.get("age")}"
+                    }
+                }
+            }
+        }.runFeatureTest {
+            runQuery("{ container { result } }")
+                .assertJson("""{"data": {"container": {"result": "name=Dave, age=40"}}}""")
+        }
+    }
+}

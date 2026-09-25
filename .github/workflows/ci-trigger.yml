@@ -1,0 +1,24 @@
+name: CI Check
+# Orchestrator that composes CI atomics into a single "run everything" check.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  build-and-test:
+    uses: ./.github/workflows/build-and-test.yml
+
+  demoapps-ci-check:
+    uses: ./.github/workflows/demoapps-ci-check.yml
+
+  bcv-api-check:
+    uses: ./.github/workflows/bcv-api-check.yml

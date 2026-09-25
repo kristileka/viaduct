@@ -1,0 +1,192 @@
+package com.example.tenant.resolverbases;
+
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import graphql.schema.GraphQLInputObjectType;
+import viaduct.engine.api.EngineSchema;
+import viaduct.java.api.annotations.ResolverFor;
+import viaduct.java.api.context.ConnectionFieldExecutionContext;
+import viaduct.java.api.context.FieldExecutionContext;
+import viaduct.java.api.context.RootFieldCall;
+import viaduct.java.api.context.SelectiveFieldExecutionContext;
+import viaduct.java.api.documents.MutationFromAnnotation;
+import viaduct.java.api.documents.QueryFromAnnotation;
+import viaduct.java.api.globalid.GlobalID;
+import viaduct.java.api.internal.InternalContext;
+import viaduct.java.api.internal.BaseUnbatchedFieldResolver;
+import viaduct.java.api.reflect.Type;
+import viaduct.java.api.resolvers.ConnectionResolverBase;
+import viaduct.java.api.resolvers.FieldResolverBase;
+import viaduct.java.api.types.Arguments;
+import viaduct.java.api.types.CompositeOutput;
+import viaduct.java.api.types.GraphQLObject;
+import viaduct.java.api.types.NodeCompositeOutput;
+import viaduct.java.api.types.NodeObject;
+import viaduct.service.api.spi.GlobalIDCodec;
+import com.example.grts.*;
+
+/**
+ * Generated resolver base classes for Mutation type.
+ */
+@SuppressWarnings({"JavaLangClash", "SameNameButDifferent"})
+public final class MutationResolvers {
+
+    private MutationResolvers() {
+        // Utility class
+    }
+
+        @ResolverFor(typeName = "Mutation", fieldName = "createOrder", isSelective = false, isBatching = false)
+        public abstract static class CreateOrder
+            implements FieldResolverBase<com.example.grts.Order, com.example.grts.Mutation, com.example.grts.Query, com.example.grts.Mutation_CreateOrder_Arguments, com.example.grts.Order>, BaseUnbatchedFieldResolver {
+
+            /**
+             * Context for Mutation.createOrder resolver.
+             * Provides type-safe access to object value, query value, arguments, and selections.
+             */
+            public static final class Context
+                implements FieldResolverBase.Context<com.example.grts.Mutation, com.example.grts.Query, com.example.grts.Mutation_CreateOrder_Arguments, com.example.grts.Order>, InternalContext {
+
+                private final FieldExecutionContext<com.example.grts.Mutation, com.example.grts.Query, com.example.grts.Mutation_CreateOrder_Arguments, com.example.grts.Order> inner;
+
+                public Context(FieldExecutionContext<com.example.grts.Mutation, com.example.grts.Query, com.example.grts.Mutation_CreateOrder_Arguments, com.example.grts.Order> inner) {
+                    this.inner = inner;
+                }
+
+                @Override
+                public com.example.grts.Mutation getObjectValue() {
+                    return inner.getObjectValue();
+                }
+
+                @Override
+                public com.example.grts.Query getQueryValue() {
+                    return inner.getQueryValue();
+                }
+
+                @Override
+                public com.example.grts.Mutation_CreateOrder_Arguments getArguments() {
+                    return inner.getArguments();
+                }
+
+                @Override
+                public <T extends NodeCompositeOutput> GlobalID<T> globalIDFor(Type<T> type, String internalID) {
+                    return inner.globalIDFor(type, internalID);
+                }
+
+                @Override
+                public <T extends NodeCompositeOutput> String serialize(GlobalID<T> globalID) {
+                    return inner.serialize(globalID);
+                }
+
+                @Override
+                public Object getRequestContext() {
+                    return inner.getRequestContext();
+                }
+
+                @Override
+                public <T extends NodeObject> String globalIDStringFor(Type<T> type, String internalID) {
+                    return inner.globalIDStringFor(type, internalID);
+                }
+
+                @Override
+                public <T extends NodeCompositeOutput> T ref(GlobalID<T> id) {
+                    return inner.ref(id);
+                }
+
+                @Override
+                public <T extends GraphQLObject> T ref(RootFieldCall<T> call) {
+                    return inner.ref(call);
+                }
+
+                @Override
+                public <T> CompletableFuture<T> query(String selections, Map<String, Object> variables, Class<T> targetClass) {
+                    return inner.query(selections, variables, targetClass);
+                }
+
+                @Override
+                public <T> CompletableFuture<T> mutation(String selections, Map<String, Object> variables, Class<T> targetClass) {
+                    return inner.mutation(selections, variables, targetClass);
+                }
+
+                @Override
+                public <T> CompletableFuture<T> query(QueryFromAnnotation operation, Map<String, Object> variables, Class<T> targetClass) {
+                    return inner.query(operation, variables, targetClass);
+                }
+
+                @Override
+                public <T> CompletableFuture<T> mutation(MutationFromAnnotation operation, Map<String, Object> variables, Class<T> targetClass) {
+                    return inner.mutation(operation, variables, targetClass);
+                }
+
+                public CompletableFuture<com.example.grts.Query> query(String selections) {
+                    return inner.query(selections, java.util.Map.of(), com.example.grts.Query.class);
+                }
+
+                public CompletableFuture<com.example.grts.Query> query(String selections, Map<String, Object> variables) {
+                    return inner.query(selections, variables, com.example.grts.Query.class);
+                }
+
+                public CompletableFuture<com.example.grts.Query> query(QueryFromAnnotation operation) {
+                    return inner.query(operation, java.util.Map.of(), com.example.grts.Query.class);
+                }
+
+                public CompletableFuture<com.example.grts.Query> query(QueryFromAnnotation operation, Map<String, Object> variables) {
+                    return inner.query(operation, variables, com.example.grts.Query.class);
+                }
+                public CompletableFuture<com.example.grts.Mutation> mutation(String selections) {
+                    return inner.mutation(selections, java.util.Map.of(), com.example.grts.Mutation.class);
+                }
+
+                public CompletableFuture<com.example.grts.Mutation> mutation(String selections, Map<String, Object> variables) {
+                    return inner.mutation(selections, variables, com.example.grts.Mutation.class);
+                }
+
+                public CompletableFuture<com.example.grts.Mutation> mutation(MutationFromAnnotation operation) {
+                    return inner.mutation(operation, java.util.Map.of(), com.example.grts.Mutation.class);
+                }
+
+                public CompletableFuture<com.example.grts.Mutation> mutation(MutationFromAnnotation operation, Map<String, Object> variables) {
+                    return inner.mutation(operation, variables, com.example.grts.Mutation.class);
+                }
+
+                @Override
+                public EngineSchema getSchema() {
+                    return InternalContext.from(inner).getSchema();
+                }
+
+                @Override
+                public GraphQLInputObjectType getArgumentsInputType(
+                        String name, String containingTypeName, String fieldName) {
+                    return InternalContext.from(inner)
+                            .getArgumentsInputType(name, containingTypeName, fieldName);
+                }
+
+                @Override
+                public GlobalIDCodec getGlobalIDCodec() {
+                    return InternalContext.from(inner).getGlobalIDCodec();
+                }
+
+                @Override
+                public <T extends NodeCompositeOutput> GlobalID<T> deserializeGlobalID(String serialized) {
+                    return InternalContext.from(inner).deserializeGlobalID(serialized);
+                }
+            }
+
+            /**
+             * Resolves the createOrder field value for a single parent object.
+             * Override this method to implement single-item resolution.
+             *
+             * @param ctx the execution context
+             * @return a future that completes with the resolved value
+             */
+            public abstract CompletableFuture<com.example.grts.Order> resolve(Context ctx);
+
+            @Override
+            @SuppressWarnings("unchecked")
+            public final CompletableFuture<?> invokeFieldResolver(
+                FieldExecutionContext<?, ?, ?, ?> context) {
+                return resolve(new Context((FieldExecutionContext<com.example.grts.Mutation, com.example.grts.Query, com.example.grts.Mutation_CreateOrder_Arguments, com.example.grts.Order>) context));
+            }
+        }
+
+}

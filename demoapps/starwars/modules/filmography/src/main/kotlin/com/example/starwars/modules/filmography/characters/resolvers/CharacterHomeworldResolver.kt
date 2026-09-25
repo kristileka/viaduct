@@ -2,11 +2,12 @@ package com.example.starwars.modules.filmography.characters.resolvers
 
 import com.example.starwars.filmography.resolverbases.CharacterResolvers
 import com.example.starwars.modules.filmography.characters.models.CharacterRepository
+import io.micronaut.context.annotation.Prototype
 import jakarta.inject.Inject
 import viaduct.api.FieldValue
-import viaduct.api.Resolver
 import viaduct.api.context.globalIDFor
 import viaduct.api.grts.Planet
+import viaduct.api.resolver.Resolver
 
 /**
  * This ia a basic **Batch Resolution** to solving the N+1 query problem.
@@ -45,10 +46,11 @@ import viaduct.api.grts.Planet
  *
  * For 100 characters: 101 queries → 2 queries (50x improvement)
  */
-// tag::resolver_example[35] Resolver example
+// tag::resolver_example[39] Resolver example
 @Resolver(
     objectValueFragment = "fragment _ on Character { id }"
 )
+@Prototype
 class CharacterHomeworldResolver
     @Inject
     constructor(
@@ -57,7 +59,7 @@ class CharacterHomeworldResolver
         override suspend fun batchResolve(contexts: List<Context>): List<FieldValue<Planet?>> {
             // Extract character IDs from contexts
             val characterIds = contexts.map { ctx ->
-                ctx.objectValue.getId().internalID
+                ctx.getObjectValue().getIdOrThrow().internalID
             }
 
             // Batch lookup: find characters and their homeworld IDs
@@ -68,12 +70,12 @@ class CharacterHomeworldResolver
             // Return results in the same order as contexts
             return contexts.map { ctx ->
                 // Obtain character ID from current context
-                val characterId = ctx.objectValue.getId().internalID
+                val characterId = ctx.getObjectValue().getIdOrThrow().internalID
 
                 // Lookup the character and its homeworld data
                 val character = charactersById[characterId]
                 val planet = character?.homeworldId?.let {
-                    ctx.nodeFor(ctx.globalIDFor<Planet>(it))
+                    ctx.ref(ctx.globalIDFor<Planet>(it))
                 }
 
                 // Build and return the Planet object or null

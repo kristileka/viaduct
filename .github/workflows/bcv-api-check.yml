@@ -1,0 +1,62 @@
+# .github/workflows/bcv-api-check.yml
+name: API Compatibility
+
+on:
+    workflow_dispatch:
+    workflow_call:
+        outputs:
+            run_id:
+                description: "GitHub Actions run ID"
+                value: ${{ jobs.api-compatibility.outputs.run_id }}
+
+permissions:
+    contents: read
+
+concurrency:
+    # A called workflow's `github` context is the invoking run's, so `github.workflow` is the top-level
+    # workflow name — keying on it stops distinct entry points sharing one group and cancelling each other.
+    group: bcv-api-check-${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+    api-compatibility:
+        runs-on: ubuntu-latest
+        name: Binary API compatibility
+        outputs:
+            run_id: ${{ steps.emit.outputs.run_id }}
+
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                  fetch-depth: 0
+
+            - uses: ./.github/actions/setup-build
+
+            - name: Emit run ID
+              id: emit
+              run: echo "run_id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+              shell: bash
+
+            - name: Run binary API check (apiCheck)
+              run: |
+                  set -euo pipefail
+
+                  echo "[api-check] Running binary API compatibility check via Gradle..."
+                  if ./gradlew runApiCheck; then
+                    echo "[api-check] OK"
+                  else
+                    echo " "
+                    echo "[api-check] Binary API check failed."
+                    echo " "
+                    echo "This check validates the public Kotlin API definitions for modules that enforce binary compatibility (i.e., :api modules)."
+                    echo "If you intentionally changed a public API covered by this check, you must:"
+                    echo " "
+                    echo "  1) Regenerate the API dumps locally:"
+                    echo "       ./gradlew runApiDump"
+                    echo " "
+                    echo "  2) Commit the updated .api files"
+                    echo " "
+                    echo "::error title=Binary API changes detected::Public APIs covered by the binary compatibility check changed. If intentional, regenerate and commit updated .api dumps."
+                    exit 1
+                  fi
+              shell: bash

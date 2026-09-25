@@ -22,6 +22,9 @@ from generate_changelog import (
     render_section,
     render_breaking_changes,
     generate_changelog,
+    capitalize_first,
+    dedupe_entries,
+    _get_base_commit_keys,
     CommitInfo,
     ChangelogEntry,
     BOT_USERNAMES,
@@ -249,6 +252,17 @@ class TestExtractAuthors(unittest.TestCase):
         authors = extract_authors(commit)
         self.assertEqual(authors, [])
 
+    def test_duplicate_author_and_coauthor_deduplicated(self):
+        commit = CommitInfo(
+            sha="abc123",
+            message="Fix bug",
+            body='',
+            author_email="john@example.com",
+            co_authors_raw="John <john@example.com>"
+        )
+        authors = extract_authors(commit)
+        self.assertEqual(authors, ["@john"])
+
     def test_mixed_valid_and_invalid_coauthors(self):
         commit = CommitInfo(
             sha="abc123",
@@ -400,6 +414,19 @@ class TestParseCommit(unittest.TestCase):
         self.assertNotIn("AIRBNB", entry.message)
 
 
+    def test_pr_reference_preserved_in_description(self):
+        commit = CommitInfo(
+            sha="abc123",
+            message="ci: add standalone demoapp tests workflow (#296)",
+            body='',
+            author_email="john.doe@example.com",
+            co_authors_raw=""
+        )
+        entry = parse_commit(commit, self.parser)
+        self.assertIsNotNone(entry)
+        self.assertIn("(#296)", entry.description)
+
+
 class TestGroupEntriesByType(unittest.TestCase):
     def test_groups_by_type(self):
         entries = [
@@ -430,16 +457,231 @@ class TestRenderSection(unittest.TestCase):
         self.assertIn("- Fix bug 1 by @john", result)
         self.assertIn("- Fix bug 2 by @jane", result)
 
+    def test_render_section_capitalizes_lowercase_descriptions(self):
+        entries = [
+            ChangelogEntry("a", "m1", ["@john"], "fix", None, "fix bug in parser", False, None, LevelBump.PATCH),
+            ChangelogEntry("b", "m2", ["@jane"], "fix", None, "add validation", False, None, LevelBump.PATCH),
+        ]
+        result = render_section("fix", entries)
+        self.assertIn("- Fix bug in parser by @john", result)
+        self.assertIn("- Add validation by @jane", result)
+
+
+class TestDedupeEntries(unittest.TestCase):
+    def _entry(self, sha, description, authors=("@geo",), change_type="feat"):
+        return ChangelogEntry(
+            sha=sha,
+            message=description,
+            authors=list(authors),
+            change_type=change_type,
+            scope=None,
+            description=description,
+            is_breaking=False,
+            breaking_description=None,
+            bump=LevelBump.MINOR,
+        )
+
+    def test_drops_pr_duplicate_when_sha_twin_exists(self):
+        sha_entry = self._entry("3b4c18b7", "strict missing-resolver validation at startup (3b4c18b7)")
+        pr_entry = self._entry("0000000", "strict missing-resolver validation at startup (#333)")
+        result = dedupe_entries([sha_entry, pr_entry])
+        self.assertEqual(result, [sha_entry])
+
+    def test_drops_pr_duplicate_regardless_of_order(self):
+        sha_entry = self._entry("3b4c18b7", "strict missing-resolver validation at startup (3b4c18b7)")
+        pr_entry = self._entry("0000000", "strict missing-resolver validation at startup (#333)")
+        result = dedupe_entries([pr_entry, sha_entry])
+        self.assertEqual(result, [sha_entry])
+
+    def test_keeps_pr_entry_when_no_sha_twin(self):
+        # No internal commit pair — keep the PR entry as-is
+        pr_entry = self._entry("0000000", "external contribution (#400)", authors=("@external",))
+        result = dedupe_entries([pr_entry])
+        self.assertEqual(result, [pr_entry])
+
+    def test_does_not_dedupe_when_authors_differ(self):
+        # Same description but different authors — treat as distinct changes
+        sha_entry = self._entry("3b4c18b7", "rename SomeClass (3b4c18b7)", authors=("@alice",))
+        pr_entry = self._entry("0000000", "rename SomeClass (#333)", authors=("@bob",))
+        result = dedupe_entries([sha_entry, pr_entry])
+        self.assertEqual(result, [sha_entry, pr_entry])
+
+    def test_does_not_dedupe_when_descriptions_differ(self):
+        a = self._entry("aaaaaaaa", "fix parser bug (aaaaaaaa)")
+        b = self._entry("bbbbbbbb", "fix lexer bug (bbbbbbbb)")
+        result = dedupe_entries([a, b])
+        self.assertEqual(result, [a, b])
+
+    def test_keeps_two_sha_entries_with_same_description(self):
+        # Two distinct internal commits with identical descriptions —
+        # neither has a (#NNN) marker, so neither is the dedupe target.
+        a = self._entry("aaaaaaaa", "bump deps (aaaaaaaa)")
+        b = self._entry("bbbbbbbb", "bump deps (bbbbbbbb)")
+        result = dedupe_entries([a, b])
+        self.assertEqual(result, [a, b])
+
+    def test_preserves_relative_order_of_kept_entries(self):
+        e1 = self._entry("11111111", "first change (11111111)")
+        sha_entry = self._entry("3b4c18b7", "shared change (3b4c18b7)")
+        pr_entry = self._entry("0000000", "shared change (#333)")
+        e2 = self._entry("22222222", "later change (22222222)")
+        result = dedupe_entries([e1, pr_entry, sha_entry, e2])
+        self.assertEqual(result, [e1, sha_entry, e2])
+
+
+class TestCapitalizeFirst(unittest.TestCase):
+    def test_capitalizes_lowercase_first_char(self):
+        self.assertEqual(capitalize_first("fix bug"), "Fix bug")
+
+    def test_preserves_already_capitalized(self):
+        self.assertEqual(capitalize_first("Fix bug"), "Fix bug")
+
+    def test_preserves_rest_of_string(self):
+        # Don't lowercase subsequent capitals (acronyms, type names, etc.)
+        self.assertEqual(capitalize_first("rename GraphQL types"), "Rename GraphQL types")
+
+    def test_empty_string(self):
+        self.assertEqual(capitalize_first(""), "")
+
+    def test_single_char(self):
+        self.assertEqual(capitalize_first("a"), "A")
+
+    def test_non_letter_first_char_unchanged(self):
+        self.assertEqual(capitalize_first("(scope) fix"), "(scope) fix")
+
+
+class TestCherryPickDedup(unittest.TestCase):
+    """Tests for cherry-pick deduplication via _get_base_commit_keys."""
+
+    def _commit(self, sha, message, author_email="john.doe@example.com"):
+        return CommitInfo(
+            sha=sha, message=message, body="",
+            author_email=author_email, co_authors_raw="",
+        )
+
+    @patch("generate_changelog.get_commits_between_tags")
+    def test_get_base_commit_keys_collects_normalized_keys(self, mock_get_commits):
+        mock_get_commits.return_value = iter([
+            self._commit("aaa111", "feat: add widget (AIRBNB)"),
+            self._commit("bbb222", "fix: parser crash (AIRBNB)"),
+        ])
+        keys = _get_base_commit_keys("origin/release/v1.0.0", "HEAD")
+        # Called with reversed args: get_commits_between_tags("HEAD", "origin/release/v1.0.0")
+        mock_get_commits.assert_called_once_with("HEAD", "origin/release/v1.0.0")
+        # Descriptions are normalized: conventional prefix stripped, trailing (sha) stripped
+        self.assertIn(("add widget", ("@john.doe",)), keys)
+        self.assertIn(("parser crash", ("@john.doe",)), keys)
+
+    @patch("generate_changelog.get_commits_between_tags")
+    def test_get_base_commit_keys_skips_ignored_commits(self, mock_get_commits):
+        mock_get_commits.return_value = iter([
+            self._commit("aaa111", "ignore: test only"),
+            self._commit("bbb222", "feat: real change (AIRBNB)"),
+        ])
+        keys = _get_base_commit_keys("tag1", "tag2")
+        self.assertEqual(len(keys), 1)
+        self.assertIn(("real change", ("@john.doe",)), keys)
+
+    @patch("generate_changelog.get_commits_between_tags")
+    def test_cherry_pick_filtered_from_changelog(self, mock_get_commits):
+        """A commit cherry-picked onto the prev release is excluded from the next changelog."""
+        base_cherry_pick = self._commit("aaa1111", "feat: add widget (AIRBNB)")
+        original_on_main = self._commit("bbb2222", "feat: add widget (AIRBNB)")
+        new_commit = self._commit("ccc3333", "feat: new thing (AIRBNB)")
+
+        def side_effect(tag1, tag2):
+            if tag1 == "HEAD" and tag2 == "origin/release/v1.0.0":
+                # Reverse range: commits unique to previous release branch
+                return iter([base_cherry_pick])
+            else:
+                # Forward range: commits in the new release
+                return iter([original_on_main, new_commit])
+
+        mock_get_commits.side_effect = side_effect
+        changelog = generate_changelog("origin/release/v1.0.0", "HEAD")
+        self.assertIn("New thing", changelog)
+        self.assertNotIn("Add widget", changelog)
+
+    @patch("generate_changelog.get_commits_between_tags")
+    def test_cherry_pick_not_filtered_when_authors_differ(self, mock_get_commits):
+        """Same message but different author is NOT filtered (author protection)."""
+        base_cherry_pick = self._commit("aaa1111", "feat: add widget (AIRBNB)", author_email="alice@example.com")
+        original_on_main = self._commit("bbb2222", "feat: add widget (AIRBNB)", author_email="bob@example.com")
+
+        def side_effect(tag1, tag2):
+            if tag1 == "HEAD" and tag2 == "origin/release/v1.0.0":
+                return iter([base_cherry_pick])
+            else:
+                return iter([original_on_main])
+
+        mock_get_commits.side_effect = side_effect
+        changelog = generate_changelog("origin/release/v1.0.0", "HEAD")
+        self.assertIn("Add widget", changelog)
+
+    @patch("generate_changelog.get_commits_between_tags")
+    def test_cherry_pick_with_pr_ref_still_filtered(self, mock_get_commits):
+        """Cherry-pick on release has (AIRBNB), original on main has (#123) — still deduped."""
+        base_cherry_pick = self._commit("aaa1111", "feat: add widget (AIRBNB)")
+        original_on_main = self._commit("bbb2222", "feat: add widget (#123)")
+
+        def side_effect(tag1, tag2):
+            if tag1 == "HEAD" and tag2 == "origin/release/v1.0.0":
+                return iter([base_cherry_pick])
+            else:
+                return iter([original_on_main])
+
+        mock_get_commits.side_effect = side_effect
+        changelog = generate_changelog("origin/release/v1.0.0", "HEAD")
+        self.assertNotIn("Add widget", changelog)
+
+
+class TestGenerateChangelog(unittest.TestCase):
+    def _commit(self, sha, message, author_email="john.doe@example.com", body="", co_authors_raw=""):
+        return CommitInfo(
+            sha=sha,
+            message=message,
+            body=body,
+            author_email=author_email,
+            co_authors_raw=co_authors_raw,
+        )
+
+    @patch("generate_changelog.get_commits_between_tags")
+    def test_omits_version_header(self, mock_get_commits):
+        def side_effect(tag1, tag2):
+            if tag1 == "HEAD" and tag2 == "v0.31.0":
+                return iter([])  # no cherry-picks on previous release
+            return iter([self._commit("abc1234", "feat: add a thing")])
+
+        mock_get_commits.side_effect = side_effect
+        changelog = generate_changelog("v0.31.0", "HEAD")
+        self.assertNotIn("# Version", changelog)
+
+    @patch("generate_changelog.get_commits_between_tags")
+    def test_empty_changelog(self, mock_get_commits):
+        mock_get_commits.return_value = iter([])
+        changelog = generate_changelog("v1.2.2", "HEAD")
+        self.assertEqual(changelog, "No changes.\n")
+
 
 class TestRenderBreakingChanges(unittest.TestCase):
     def test_render_breaking_changes(self):
         entries = [
-            ChangelogEntry("a", "m1", ["@john"], "fix", None, "d1", True, "Breaking change description", LevelBump.MAJOR),
+            ChangelogEntry("a", "m1", ["@john"], "fix", None, "subject description", True, "body trailer description", LevelBump.MAJOR),
         ]
         result = render_breaking_changes(entries)
         self.assertIn("## Breaking Changes", result)
-        self.assertIn("Breaking change description", result)
+        self.assertIn("Subject description", result)
+        self.assertNotIn("body trailer description", result)
         self.assertIn("@john", result)
+
+    def test_breaking_change_uses_subject_with_sha(self):
+        # subject description already has SHA from (AIRBNB) substitution — body trailer does not
+        entries = [
+            ChangelogEntry("abc1234", "m1", ["@alice"], "refactor", None, "rename SomeClass (abc1234)", True, "SomeClass renamed to OtherClass.", LevelBump.MAJOR),
+        ]
+        result = render_breaking_changes(entries)
+        self.assertIn("Rename SomeClass (abc1234)", result)
+        self.assertNotIn("SomeClass renamed to OtherClass.", result)
 
 
 if __name__ == '__main__':

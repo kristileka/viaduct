@@ -2,17 +2,10 @@
 // tag::plugins-config[7] How plugins for viaduct are setup.
 plugins {
     alias(libs.plugins.kotlinJvm)
+    alias(libs.plugins.ksp)
     alias(libs.plugins.viaduct.application)
     alias(libs.plugins.viaduct.module)
     application
-}
-
-viaductApplication {
-    modulePackagePrefix.set("com.example.viadapp")
-}
-
-viaductModule {
-    modulePackageSuffix.set("resolvers")
 }
 
 dependencies {
@@ -21,7 +14,12 @@ dependencies {
 
     implementation(libs.logback.classic)
     implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.kotlin.reflect)
     implementation(libs.jackson.databind)
+
+    implementation(libs.kotlinx.coroutines.jdk8)
+    implementation(libs.kotlin.reflect)
+    implementation(libs.reactive.streams)
 
     testImplementation(libs.junit.jupiter)
     testImplementation(libs.junit.jupiter.engine)

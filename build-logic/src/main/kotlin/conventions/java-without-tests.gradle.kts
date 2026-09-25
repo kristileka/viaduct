@@ -1,50 +1,24 @@
 package conventions
 
+import buildroot.registerForOrchestrationAggregate
+
 plugins {
     idea
     java
-    checkstyle
-    id("com.github.spotbugs")
+    id("conventions.java-static-analysis")
 }
-
-val libs = extensions.getByType(VersionCatalogsExtension::class.java).named("libs")
 
 java {
     toolchain {
         languageVersion = JavaLanguageVersion.of(17)
     }
-    // Note: The java-stub.md document specifies source/target compatibility 1.8,
-    // but this causes JVM-target mismatch when mixed with Kotlin (which uses target 17).
-    // Using target 17 for now - can be revisited if pure-Java projects need 1.8.
-    sourceCompatibility = JavaVersion.VERSION_17
-    targetCompatibility = JavaVersion.VERSION_17
 }
 
-checkstyle {
-    toolVersion = "10.12.4"
-    // Find config file relative to actual OSS root, not the included build
-    val ossRoot = if (rootProject.name == "core") {
-        rootProject.projectDir.parentFile.parentFile
-    } else {
-        rootProject.projectDir
-    }
-    configFile = file("$ossRoot/config/checkstyle/checkstyle.xml")
-    isIgnoreFailures = false
-}
+// Each project sets its own archive base name from its own path; not configured from a build root.
+base.archivesName.convention(project.path.removePrefix(":").replace(":", "-"))
 
-spotbugs {
-    toolVersion = "4.8.1"
-    effort = com.github.spotbugs.snom.Effort.MAX
-    reportLevel = com.github.spotbugs.snom.Confidence.LOW
-}
-
-tasks.withType<com.github.spotbugs.snom.SpotBugsTask>().configureEach {
-    reports {
-        create("html") {
-            required.set(true)
-        }
-        create("xml") {
-            required.set(false)
-        }
-    }
-}
+// Self-report this project's lifecycle-base tasks for orchestration aggregation.
+registerForOrchestrationAggregate("build", "build")
+registerForOrchestrationAggregate("check", "check")
+registerForOrchestrationAggregate("clean", "clean")
+registerForOrchestrationAggregate("classes", "classes")

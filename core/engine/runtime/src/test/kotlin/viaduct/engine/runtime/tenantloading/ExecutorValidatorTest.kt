@@ -1,0 +1,152 @@
+package viaduct.engine.runtime.tenantloading
+
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertDoesNotThrow
+import org.junit.jupiter.api.assertThrows
+import viaduct.engine.api.RequiredSelectionSet
+import viaduct.engine.api.mocks.MockCheckerExecutor
+import viaduct.engine.api.mocks.MockCheckerExecutorFactory
+import viaduct.engine.api.mocks.MockFieldUnbatchedResolverExecutor
+import viaduct.engine.api.mocks.MockNodeBatchResolverExecutor
+import viaduct.engine.api.mocks.MockSchema
+import viaduct.engine.api.mocks.MockTenantModuleBootstrapper
+import viaduct.engine.api.mocks.toDispatcherRegistryFactory
+import viaduct.engine.api.select.SelectionsParser
+import viaduct.engine.api.spi.CheckerExecutorFactory
+import viaduct.engine.runtime.validation.Validator
+
+class ExecutorValidatorTest {
+    private val moduleBootstrap = MockTenantModuleBootstrapper(
+        fieldResolverExecutors = listOf(
+            "Foo" to "field" to MockFieldUnbatchedResolverExecutor(
+                RequiredSelectionSet(SelectionsParser.parse("Foo", "y"), emptyList(), false),
+                resolverId = "Foo.field",
+            )
+        ),
+        nodeResolverExecutors = listOf(
+            "Foo" to MockNodeBatchResolverExecutor("Foo")
+        ),
+        fullSchema = MockSchema.minimal,
+    )
+
+    private fun test(
+        modules: List<MockTenantModuleBootstrapper> = listOf(moduleBootstrap),
+        checkerExecutorFactory: CheckerExecutorFactory = MockCheckerExecutorFactory(),
+        nodeResolverValidator: Validator<NodeResolverExecutorValidationCtx> = Validator.Unvalidated,
+        resolverExecutorValidator: Validator<FieldResolverExecutorValidationCtx> = Validator.Unvalidated,
+        requiredSelectionSetValidator: Validator<RequiredSelectionsValidationCtx> = Validator.Unvalidated,
+        checkerExecutorValidator: Validator<CheckerExecutorValidationCtx> = Validator.Unvalidated
+    ) {
+        val validator = ExecutorValidator(nodeResolverValidator, resolverExecutorValidator, requiredSelectionSetValidator, checkerExecutorValidator)
+        modules.toDispatcherRegistryFactory(validator, checkerExecutorFactory)
+            .create(MockSchema.mk("type Foo implements Node { id: ID! field: Int }"))
+    }
+
+    @Test
+    fun `passes on validator success`() {
+        assertDoesNotThrow {
+            test()
+        }
+    }
+
+    @Test
+    fun `default set rejects selective resolver on a mutation namespace field`() {
+        val mutationSchema = MockSchema.mk(
+            """
+            extend type Query { empty: Int }
+            extend type Mutation { stayFoo: StayFooMutations }
+            type StayFooMutations @namespaceType { doThing(id: ID!): String }
+            """.trimIndent()
+        )
+        val bootstrap = MockTenantModuleBootstrapper(
+            fieldResolverExecutors = listOf(
+                "StayFooMutations" to "doThing" to MockFieldUnbatchedResolverExecutor(
+                    isSelective = true,
+                    resolverId = "StayFooMutations.doThing",
+                )
+            ),
+            fullSchema = mutationSchema,
+        )
+        assertThrows<Exception> {
+            listOf(bootstrap).toDispatcherRegistryFactory(ExecutorValidator(mutationSchema), MockCheckerExecutorFactory())
+                .create(mutationSchema)
+        }
+    }
+
+    @Test
+    fun `fails on node resolver validator failure`() {
+        assertThrows<IllegalArgumentException> {
+            test(nodeResolverValidator = Validator.Invalid)
+        }
+    }
+
+    @Test
+    fun `fails on resolverExecutor validator failure`() {
+        assertThrows<IllegalArgumentException> {
+            test(resolverExecutorValidator = Validator.Invalid)
+        }
+    }
+
+    @Test
+    fun `fails on requiredSelectionSet validator failure for resolver`() {
+        assertThrows<IllegalArgumentException> {
+            test(requiredSelectionSetValidator = Validator.Invalid)
+        }
+    }
+
+    @Test
+    fun `fails on requiredSelectionSet validator failure for field checker`() {
+        val validator = ExecutorValidator(Validator.Unvalidated, Validator.Invalid, Validator.Unvalidated, Validator.Unvalidated)
+        emptyList<MockTenantModuleBootstrapper>().toDispatcherRegistryFactory(
+            validator,
+            MockCheckerExecutorFactory(
+                mapOf(
+                    "Foo" to "field" to MockCheckerExecutor(
+                        mapOf("rss" to RequiredSelectionSet(SelectionsParser.parse("Foo", "x"), emptyList(), true))
+                    )
+                )
+            )
+        ).create(MockSchema.minimal)
+    }
+
+    @Test
+    fun `fails on requiredSelectionSet validator failure for type checker`() {
+        val validator = ExecutorValidator(Validator.Unvalidated, Validator.Invalid, Validator.Unvalidated, Validator.Unvalidated)
+        emptyList<MockTenantModuleBootstrapper>().toDispatcherRegistryFactory(
+            validator,
+            MockCheckerExecutorFactory(
+                null,
+                mapOf(
+                    "Foo" to MockCheckerExecutor(
+                        mapOf("rss" to RequiredSelectionSet(SelectionsParser.parse("Foo", "x"), emptyList(), true))
+                    )
+                )
+            )
+        ).create(MockSchema.minimal)
+    }
+
+    @Test
+    fun `fails on field checkerExecutor validator failure`() {
+        assertThrows<IllegalArgumentException> {
+            test(
+                checkerExecutorFactory = MockCheckerExecutorFactory(
+                    mapOf("Foo" to "field" to MockCheckerExecutor())
+                ),
+                checkerExecutorValidator = Validator.Invalid
+            )
+        }
+    }
+
+    @Test
+    fun `fails on type checkerExecutor validator failure`() {
+        assertThrows<IllegalArgumentException> {
+            test(
+                checkerExecutorFactory = MockCheckerExecutorFactory(
+                    mapOf(),
+                    mapOf("Foo" to MockCheckerExecutor())
+                ),
+                checkerExecutorValidator = Validator.Invalid
+            )
+        }
+    }
+}

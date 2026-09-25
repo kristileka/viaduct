@@ -2,11 +2,9 @@
 
 > Doc type: Reference
 
-This is a sample GraphQL application built using [Viaduct](https://github.com/airbnb/viaduct), a composable GraphQL
-server in Kotlin.
+This is a sample GraphQL application built using [Viaduct](https://github.com/airbnb/viaduct), a composable GraphQL server in Kotlin.
 
-This app models the Star Wars universe with characters, films, species, planets, and starships. It demonstrates
-how to implement resolvers, field-level context, pagination, fragments, and mock data using Viaduct’s conventions.
+This app models the Star Wars universe with characters, films, species, planets, and starships. It demonstrates how to implement resolvers, field-level context, pagination, fragments, and mock data using Viaduct’s conventions.
 
 ## Requirements
 
@@ -49,11 +47,9 @@ query {
 
 #### Scoped queries
 
-The `ViaductGraphQLController.kt` applies scope metadata from the `X-Viaduct-Scopes` header
-into the GraphQL context.
+The `ViaductGraphQLController.kt` applies scope metadata from the `X-Viaduct-Scopes` header into the GraphQL context.
 
-Some fields—like `Species.culturalNotes` are marked with `@scope(to: ["extras"])`. These will only resolve
-if the `"extras"` scope is present in the context.
+Some fields—like `Species.culturalNotes` are marked with `@scope(to: ["extras"])`. These will only resolve if the `"extras"` scope is present in the context.
 
 Use a query like:
 
@@ -96,8 +92,7 @@ query {
 > Fields such as `filmCount` and `richSummary` are computed by Character resolvers. @See `CharacterResolvers.kt`,
 `SpeciesBatchResolver.kt` and `FilmCountBatchResolver.kt`.
 
-Resolution is batched by Viaduct’s resolver execution model (and/or DataLoaders if configured), which helps avoid N+1
-patterns when the query asks these derived fields across multiple characters.
+Resolution is batched by Viaduct’s resolver execution model (and/or DataLoaders if configured), which helps avoid N+1 patterns when the query asks these derived fields across multiple characters.
 
 #### Film query with characters
 
@@ -118,22 +113,11 @@ query {
 
 ## Nodes and global IDs
 
-A central concept in Viaduct is the `Node`: any object retrievable by a globally unique `ID`. Every `Node` has
-an `id` field.
+A central concept in Viaduct is the `Node`: any object retrievable by a globally unique `ID`. Every `Node` has an `id` field, which we call its _global ID_.
 
-Internally, a Viaduct `ID` consists of as base64-encoded string :
+Externally, global IDs are serialized as strings in an intentionally opaque format: neither tenant code nor external clients should attempt to decode these strings. See the [Global IDs developer reference](https://viaduct.airbnb.tech/docs/developers/globalids/) for more details.
 
-```
-TypeName:LocalId
-```
-
-For example:
-
-```
-Character:5 → "Q2hhcmFjdGVyOjU="
-```
-
-In GraphiQL you can use the key icon in the toolbar (🔑) to encode or decode these IDs.
+When issuing queries manually via GraphiQL, you will need to encode these IDs to provide input and decode them to inspect output. You can do this using the key button (🔑) in the toolbar.
 
 #### Example: look up a character by ID
 
@@ -177,8 +161,6 @@ query {
 }
 ```
 
-> If you decode the id from base64, you can notice that the id `UGxhbmV0OjQ=` is decoded to `"Planet:4"`.
-
 Which returns:
 
 ```json
@@ -190,7 +172,3 @@ Which returns:
   }
 }
 ```
-
-## Technical deep dive
-
-For a deeper technical explanation of how the system works, see the [Getting Started Guide](https://viaduct.airbnb.tech/docs/getting_started/).

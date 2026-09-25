@@ -1,8 +1,12 @@
 package conventions
 
+import buildroot.registerForOrchestrationAggregate
+
 plugins {
+    id("conventions.kotlin-compile-config")
     id("conventions.kotlin-without-tests")
     id("conventions.jacoco")
+    id("conventions.test-retry")
 }
 
 val libs = extensions.getByType(VersionCatalogsExtension::class.java).named("libs")
@@ -10,7 +14,6 @@ val libs = extensions.getByType(VersionCatalogsExtension::class.java).named("lib
 dependencies {
     testImplementation(libs.findLibrary("junit").get())
     testImplementation(libs.findLibrary("junit-params").get())
-    testImplementation(libs.findLibrary("kotlin-test").get())
 
     testRuntimeOnly(libs.findLibrary("junit-engine").get())
     testRuntimeOnly(libs.findLibrary("junit-launcher").get())
@@ -19,3 +22,6 @@ dependencies {
 tasks.named<Test>("test") {
     useJUnitPlatform()
 }
+
+registerForOrchestrationAggregate("test", "test")
+registerForOrchestrationAggregate("testClasses", "testClasses")

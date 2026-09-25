@@ -1,0 +1,258 @@
+package viaduct.arbitrary.graphql
+
+import graphql.schema.GraphQLObjectType
+import io.kotest.property.Arb
+import io.kotest.property.RandomSource
+import io.kotest.property.arbitrary.arbitrary
+import io.kotest.property.arbitrary.of
+import viaduct.arbitrary.common.Config
+import viaduct.arbitrary.graphql.FieldResolver.Instrumented
+import viaduct.engine.api.Coordinate
+import viaduct.engine.api.EngineExecutionContext
+import viaduct.engine.api.EngineSchema
+import viaduct.engine.api.RequiredSelectionSet
+import viaduct.engine.api.ResolverMetadata
+import viaduct.engine.api.gj
+import viaduct.engine.api.spi.FieldResolverExecutor
+
+/**
+ * Generate resolvers for object fields in the provided schema,
+ * capable of resolving their own output selection set.
+ *
+ * The generated [FieldResolverExecutor]s will be for any object field
+ * with the `@resolver` directive, or for any object field without `@resolver`
+ * if [UndeclaredFieldResolverWeight] is configured.
+ *
+ * FieldResolverExecutors produced by this generator may have required selection
+ * sets. While this method can produce single-shot resolvers that do not
+ * form cycles with themselves, it cannot guarantee that a resolver does not form invalid
+ * RSS cycles with other resolvers produced by this generator.
+ *
+ * If many cycle-free resolvers are needed, see [Arb.Companion.viaduct]
+ */
+fun Arb.Companion.fieldResolverExecutor(
+    schema: EngineSchema,
+    cfg: Config = Config.default
+): Arb<FieldResolverExecutor> =
+    arbitrary { rs ->
+        val env = ViaductGenEnv(schema, cfg, rs)
+        val coord = Arb.of(env.resolverConfig.fieldResolvers).bind()
+        env.fieldResolverExecutorGen.gen(coord)
+    }
+
+/**
+ * Generate resolvers for the specified coordinate in the provided schema.
+ *
+ * Resolvers produced by this generator will always resolve their own output selection set
+ */
+fun Arb.Companion.fieldResolverExecutor(
+    schema: EngineSchema,
+    coord: Coordinate,
+    cfg: Config = Config.default
+): Arb<FieldResolverExecutor> {
+    require(schema.schema.typeMap[coord.first] is GraphQLObjectType)
+    require(!coord.second.startsWith("__"))
+    requireNotNull(schema.schema.getFieldDefinition(coord.gj))
+
+    return arbitrary { rs ->
+        val resolverConfig = ResolverConfigImpl(schema, cfg, rs).let { config ->
+            if (coord in config.fieldResolvers) {
+                config
+            } else {
+                config.plus(ResolverConfigImpl(schema, fieldResolvers = setOf(coord), nodeResolvers = emptySet()))
+            }
+        }
+        val env = ViaductGenEnv(schema, cfg, rs, resolverConfig)
+        env.fieldResolverExecutorGen.gen(coord)
+    }
+}
+
+internal fun interface FieldResolverExecutorGen {
+    fun gen(coord: Coordinate): FieldResolverExecutor
+
+    companion object {
+        operator fun invoke(env: ViaductGenEnv): FieldResolverExecutorGen =
+            FieldResolverExecutorGen { coord ->
+                val objectSelectionSet = env.requiredSelectionSetGen.gen(coord, coord.first, forChecker = false, 0)
+                val querySelectionSet = env.requiredSelectionSetGen.gen(coord, env.schemas.schema.queryType.name, forChecker = false, 0)
+                val isSelective = env.resolverConfig.isSelective(coord)
+                val isBatching = env.resolverConfig.isBatching(coord)
+
+                val fieldResolver = env.fork().let { env ->
+                    env.cfg[FieldResolverFactory]
+                        .createFieldResolver(
+                            FieldResolver.Factory.Params(
+                                env.schemas.viaductSchema,
+                                env.fieldResolverValueGen,
+                                env.resolverConfig,
+                                env.coordinateIndex,
+                                isSelective,
+                                env.rs.sampleWeight(env.cfg[ExerciseRequiredSelectionsWeight]),
+                                coord,
+                                objectSelectionSet,
+                                querySelectionSet,
+                                env.cfg,
+                                env.rs
+                            )
+                        )
+                }
+
+                FieldResolverExecutorImpl(
+                    coord,
+                    isSelective,
+                    isBatching,
+                    objectSelectionSet,
+                    querySelectionSet,
+                    fieldResolver
+                )
+            }
+    }
+}
+
+private class FieldResolverExecutorImpl(
+    coord: Coordinate,
+    override val isSelective: Boolean,
+    override val isBatching: Boolean,
+    override val objectSelectionSet: RequiredSelectionSet? = null,
+    override val querySelectionSet: RequiredSelectionSet? = null,
+    private val fieldResolver: FieldResolver
+) : FieldResolverExecutor {
+    override val resolverId: String = "${coord.first}.${coord.second}"
+    override val metadata: ResolverMetadata = ResolverMetadata.forModern(resolverId)
+
+    override suspend fun batchResolve(
+        selectors: List<FieldResolverExecutor.Selector>,
+        context: EngineExecutionContext
+    ): Map<FieldResolverExecutor.Selector, Result<Any?>> =
+        selectors.associateWith { selector ->
+            runCatching {
+                fieldResolver(selector, context)
+            }
+        }
+}
+
+fun interface FieldResolver {
+    suspend operator fun invoke(
+        selector: FieldResolverExecutor.Selector,
+        ctx: EngineExecutionContext
+    ): Any?
+
+    /**
+     * A [FieldResolver] wrapper that records every invocation via [recorder].
+     * Use in tests to assert that a resolver was called and to inspect the arguments it received.
+     */
+    class Instrumented(private val underlying: FieldResolver) : FieldResolver {
+        /** The arguments passed to a single invocation. */
+        data class Args(
+            val selector: FieldResolverExecutor.Selector,
+            val ctx: EngineExecutionContext
+        )
+
+        val recorder = CallRecorder { args: Args -> underlying(args.selector, args.ctx) }
+
+        override suspend fun invoke(
+            selector: FieldResolverExecutor.Selector,
+            ctx: EngineExecutionContext
+        ): Any? = recorder(Args(selector, ctx))
+    }
+
+    interface Factory {
+        /**
+         * Parameters passed to [Factory.createFieldResolver].
+         *
+         * @property schema The schema the resolver operates on.
+         * @property fieldResolverValueGen Generates the return value for the resolved field.
+         * @property resolverConfig All resolver coordinates in the schema, including selectivity metadata.
+         * @property coordinateIndex The shared ordering used to keep generated dependencies acyclic.
+         * @property selective If true, the resolver may omit values for some selections,
+         *   simulating a resolver that does not always populate every requested field.
+         * @property exerciseRequiredSelections If true, the resolver reads from its required
+         *   selection sets before returning, ensuring any RSS-gated data paths are exercised.
+         * @property coordinate The specific field coordinate this resolver handles.
+         * @property objectSelectionSet Optional required selection set for the parent object.
+         * @property querySelectionSet Optional required selection set for the query root.
+         * @property cfg Arbitrary generation configuration.
+         * @property rs Random source used during value generation.
+         */
+        data class Params(
+            val schema: EngineSchema,
+            val fieldResolverValueGen: FieldResolverValueGen,
+            val resolverConfig: ResolverConfig,
+            val coordinateIndex: CoordinateIndex,
+            val selective: Boolean,
+            val exerciseRequiredSelections: Boolean,
+            val coordinate: Coordinate,
+            val objectSelectionSet: RequiredSelectionSet?,
+            val querySelectionSet: RequiredSelectionSet?,
+            val cfg: Config,
+            val rs: RandomSource
+        )
+
+        fun createFieldResolver(params: Params): FieldResolver
+
+        object Arbitrary : Factory {
+            override fun createFieldResolver(params: Params): FieldResolver = Resolver(params)
+
+            private class Resolver(val params: Params) : FieldResolver {
+                private val localSeed = params.rs.random.nextLong()
+
+                override suspend fun invoke(
+                    selector: FieldResolverExecutor.Selector,
+                    ctx: EngineExecutionContext
+                ): Any? {
+                    val localRandom = if (params.rs.sampleWeight(params.cfg[DeterministicResolveWeight])) {
+                        RandomSource.seeded(localSeed)
+                    } else {
+                        params.rs
+                    }
+
+                    if (params.exerciseRequiredSelections) {
+                        params.objectSelectionSet?.also { rss ->
+                            EngineDataExerciser.exercise(selector.syncObjectValueGetter(), ctx, rss)
+                        }
+                        params.querySelectionSet?.also { rss ->
+                            EngineDataExerciser.exercise(selector.syncQueryValueGetter(), ctx, rss)
+                        }
+                    }
+
+                    localRandom.maybeDelay(params.cfg[ResolverLatencyMillis])
+                    maybeThrowResolverException(params.cfg, FieldResolverExceptionWeight, localRandom)
+
+                    val gen = ResolverValueGen(
+                        params.schema,
+                        params.resolverConfig,
+                        params.cfg,
+                        params.coordinateIndex,
+                        localRandom
+                    )
+                    val result = gen.gen(
+                        params.coordinate,
+                        params.selective,
+                        selector.selections,
+                        EngineCtx(ctx)
+                    )
+
+                    return result
+                }
+            }
+        }
+
+        /**
+         * A [Factory] that can be programmatically introspected.
+         * Calls handled by this [Factory] will be included in the output of [Viaduct.dump].
+         */
+        class Instrumented(private val underlying: Factory = Arbitrary) : Factory {
+            val resolvers = mutableMapOf<Coordinate, FieldResolver.Instrumented>()
+
+            val recorder = CallRecorder.sync { params: Params ->
+                val resolver = Instrumented(underlying.createFieldResolver(params))
+                resolvers[params.coordinate] = resolver
+                resolver
+            }
+
+            fun resolver(coord: Coordinate): FieldResolver.Instrumented = requireNotNull(resolvers[coord])
+
+            override fun createFieldResolver(params: Params): FieldResolver = recorder(params)
+        }
+    }
+}

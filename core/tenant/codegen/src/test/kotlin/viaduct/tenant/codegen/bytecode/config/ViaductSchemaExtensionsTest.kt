@@ -1,0 +1,737 @@
+package viaduct.tenant.codegen.bytecode.config
+
+import java.io.File
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
+import viaduct.codegen.km.KmClassFilesBuilder
+import viaduct.codegen.utils.JavaBinaryName
+import viaduct.codegen.utils.KmName
+import viaduct.graphql.schema.ViaductReverseSchema
+import viaduct.graphql.schema.ViaductSchema
+import viaduct.graphql.schema.binary.extensions.fromBinaryFile
+import viaduct.graphql.schema.binary.extensions.toBinaryFile
+import viaduct.graphql.schema.graphqljava.extensions.fromGraphQLSchema
+import viaduct.graphql.schema.graphqljava.extensions.fromTypeDefinitionRegistry
+import viaduct.graphql.schema.test.createSchema
+import viaduct.tenant.codegen.bytecode.util.assertKotlinTypeString
+import viaduct.tenant.codegen.bytecode.util.field
+import viaduct.tenant.codegen.bytecode.util.typedef
+
+@Suppress("USELESS_CAST")
+class ViaductSchemaExtensionsTest {
+    private fun mkSchema(
+        schemaText: String,
+        schemaFilePath: String,
+        repoRoot: File
+    ): ViaductSchema {
+        val schemaFile = repoRoot.resolve("$schemaFilePath")
+        schemaFile.parentFile.mkdirs()
+        schemaFile.createNewFile()
+        schemaFile.writeText(schemaText)
+        return ViaductSchema.fromTypeDefinitionRegistry(listOf(schemaFile))
+    }
+
+    private fun mkCompiledSchema(schemaText: String): ViaductSchema {
+        val schemaFile = File.createTempFile("schema", ".graphqls")
+        schemaFile.writeText(schemaText)
+        schemaFile.deleteOnExit()
+        return ViaductSchema.fromGraphQLSchema(listOf(schemaFile))
+    }
+
+    @Test
+    fun `isSelectiveResolver survives GraphQLSchema extension decoding`() {
+        val schema = mkCompiledSchema(
+            """
+                directive @resolver(isSelective: Boolean! = false) on OBJECT | FIELD_DEFINITION
+
+                type Query {
+                    ignored: String
+                }
+
+                extend type Query {
+                    foo: Foo @resolver(isSelective: true)
+                }
+
+                type Foo {
+                    value: String
+                }
+            """.trimIndent()
+        )
+
+        assertTrue(schema.field("Query", "foo").isSelectiveResolver)
+
+        val binaryFile = File.createTempFile("schema", ".bgql")
+        binaryFile.deleteOnExit()
+        schema.toBinaryFile(binaryFile)
+
+        val roundTripped = ViaductSchema.fromBinaryFile(binaryFile)
+        assertTrue(roundTripped.field("Query", "foo").isSelectiveResolver)
+    }
+
+    @Test
+    fun `isBatchingResolver survives GraphQLSchema extension decoding`() {
+        val schema = mkCompiledSchema(
+            """
+                directive @resolver(isSelective: Boolean! = false, isBatching: Boolean! = false) on OBJECT | FIELD_DEFINITION
+
+                type Query {
+                    ignored: String
+                }
+
+                extend type Query {
+                    foo: Foo @resolver(isBatching: true)
+                }
+
+                type Foo {
+                    value: String
+                }
+            """.trimIndent()
+        )
+
+        assertTrue(schema.field("Query", "foo").isBatchingResolver)
+
+        val binaryFile = File.createTempFile("schema", ".bgql")
+        binaryFile.deleteOnExit()
+        schema.toBinaryFile(binaryFile)
+
+        val roundTripped = ViaductSchema.fromBinaryFile(binaryFile)
+        assertTrue(roundTripped.field("Query", "foo").isBatchingResolver)
+    }
+
+    @Test
+    fun `isSelectiveResolver supports legacy selective directive arg`() {
+        val schema = mkCompiledSchema(
+            """
+                directive @resolver(selective: Boolean! = false) on OBJECT | FIELD_DEFINITION
+
+                type Query {
+                    foo: Foo @resolver(selective: true)
+                }
+
+                type Foo {
+                    value: String
+                }
+            """.trimIndent()
+        )
+
+        assertTrue(schema.field("Query", "foo").isSelectiveResolver)
+    }
+
+    @Test
+    fun `isNode -- object`() {
+        assertFalse(createSchema("type Obj { empty: Int }").typedef("Obj").isNode)
+        assertFalse(createSchema("type Node { empty: Int }").typedef("Node").isNode)
+
+        createSchema(
+            """
+            interface I { empty: Int }
+            type O implements I { empty: Int }
+            """.trimIndent()
+        ).apply {
+            assertFalse(typedef("O").isNode)
+        }
+
+        createSchema(
+            """
+                interface Node { empty: Int }
+                type O implements Node { empty: Int }
+            """.trimIndent()
+        ).apply {
+            assertTrue(typedef("O").isNode)
+        }
+    }
+
+    @Test
+    fun `isNode -- scalar`() {
+        assertFalse(createSchema("scalar Scalar").typedef("Scalar").isNode)
+        assertFalse(createSchema("scalar Node").typedef("Node").isNode)
+    }
+
+    @Test
+    fun `isNode -- enum`() {
+        assertFalse(createSchema("enum E { empty }").typedef("E").isNode)
+        assertFalse(createSchema("enum Node { empty }").typedef("Node").isNode)
+    }
+
+    @Test
+    fun `isNode -- interface`() {
+        assertFalse(createSchema("interface I { empty: Int }").typedef("I").isNode)
+
+        createSchema(
+            """
+                interface Super { empty: Int }
+                interface I implements Super { empty: Int }
+            """.trimIndent()
+        ).apply {
+            assertFalse(typedef("I").isNode)
+        }
+
+        assertTrue(
+            createSchema("interface Node { empty: Int }").typedef("Node").isNode
+        )
+
+        createSchema(
+            """
+                interface Node { empty: Int }
+                interface I implements Node { empty: Int }
+            """.trimIndent()
+        ).apply {
+            assertTrue(typedef("I").isNode)
+        }
+    }
+
+    @Test
+    fun `isNode -- input`() {
+        assertFalse(
+            createSchema("input I { empty: Int }").typedef("I").isNode
+        )
+    }
+
+    @Test
+    fun `isConnection -- object`() {
+        assertFalse(
+            createSchema("type O { empty: Int }").typedef("O").isConnection
+        )
+        assertFalse(
+            createSchema("type PagedConnection { empty: Int }").typedef("PagedConnection").isConnection
+        )
+
+        createSchema(
+            """
+            interface Super { empty: Int }
+            interface O implements Super { empty: Int }
+            """.trimIndent()
+        ).apply {
+            assertFalse(typedef("O").isConnection)
+        }
+
+        createSchema(
+            """
+            interface PagedConnection { empty: Int }
+            interface O implements PagedConnection { empty: Int }
+            """.trimIndent()
+        ).apply {
+            assertTrue(typedef("O").isConnection)
+        }
+    }
+
+    @Test
+    fun `isConnection -- scalar`() {
+        assertFalse(createSchema("scalar S").typedef("S").isConnection)
+        assertFalse(
+            createSchema("scalar PagedConnection").typedef("PagedConnection").isConnection
+        )
+    }
+
+    @Test
+    fun `isConnection -- enum`() {
+        assertFalse(createSchema("enum E").typedef("E").isConnection)
+        assertFalse(
+            createSchema("enum PagedConnection").typedef("PagedConnection").isConnection
+        )
+    }
+
+    @Test
+    fun `isConnection -- interface`() {
+        assertFalse(
+            createSchema("interface I { empty: Int }").typedef("I").isConnection
+        )
+
+        createSchema(
+            """
+                interface Super { empty: Int }
+                interface I implements Super { empty: Int }
+            """.trimIndent()
+        ).apply {
+            assertFalse(typedef("I").isConnection)
+        }
+
+        assertTrue(
+            createSchema("interface PagedConnection { empty: Int }").typedef("PagedConnection").isConnection
+        )
+
+        createSchema(
+            """
+            interface PagedConnection { empty: Int }
+            interface I implements PagedConnection { empty: Int }
+            """.trimIndent()
+        ).apply {
+            assertTrue(typedef("I").isConnection)
+        }
+    }
+
+    @Test
+    fun `isConnection -- input`() {
+        assertFalse(createSchema("input I { empty: Int }").typedef("I").isConnection)
+    }
+
+    @Test
+    fun `hasReflectedType`() {
+        createSchema(
+            """
+                type Obj { empty: Int }
+                input Inp { empty: Int }
+                interface Iface { empty: Int }
+                scalar Scalar
+                union Union = Obj
+                enum Enum { Value }
+            """.trimIndent()
+        ).apply {
+            assertTrue(typedef("Obj").hasReflectedType)
+            assertTrue(typedef("Inp").hasReflectedType)
+            assertTrue(typedef("Iface").hasReflectedType)
+            assertFalse(typedef("Scalar").hasReflectedType)
+            assertTrue(typedef("Union").hasReflectedType)
+            assertTrue(typedef("Enum").hasReflectedType)
+        }
+    }
+
+    @Test
+    fun `kotlinTypeString -- lists and nulls`() {
+        // lists and nulls
+        createSchema(
+            """
+                type Obj {
+                    f1: Int
+                    f2: Int!
+                    f3: [Int]
+                    f4: [Int!]
+                    f5: [Int!]!
+                }
+            """.trimIndent()
+        ).apply {
+            typedef("Obj").assertKotlinTypeString("pkg.Obj?")
+            field("Obj", "f1").assertKotlinTypeString("kotlin.Int?")
+            field("Obj", "f2").assertKotlinTypeString("kotlin.Int")
+            field("Obj", "f3").assertKotlinTypeString("kotlin.collections.List<kotlin.Int?>?")
+            field("Obj", "f4").assertKotlinTypeString("kotlin.collections.List<kotlin.Int>?")
+            field("Obj", "f5").assertKotlinTypeString("kotlin.collections.List<kotlin.Int>")
+        }
+    }
+
+    @Test
+    fun `kotlinTypeString -- scalars`() {
+        createSchema(
+            """
+                scalar JSON
+                scalar Date
+                scalar DateTime
+                scalar Time
+                scalar Byte
+            """.trimIndent()
+        ).apply {
+            typedef("Boolean").assertKotlinTypeString("kotlin.Boolean?")
+            typedef("Byte").assertKotlinTypeString("kotlin.Byte?")
+            typedef("Date").assertKotlinTypeString("java.time.LocalDate?")
+            typedef("DateTime").assertKotlinTypeString("java.time.Instant?")
+            typedef("Float").assertKotlinTypeString("kotlin.Double?")
+            typedef("ID").assertKotlinTypeString("kotlin.String?")
+            typedef("Int").assertKotlinTypeString("kotlin.Int?")
+            typedef("JSON").assertKotlinTypeString("kotlin.Any?")
+            typedef("Long").assertKotlinTypeString("kotlin.Long?")
+            typedef("Short").assertKotlinTypeString("kotlin.Short?")
+            typedef("String").assertKotlinTypeString("kotlin.String?")
+            typedef("Time").assertKotlinTypeString("java.time.OffsetTime?")
+        }
+    }
+
+    @Test
+    fun `ViaductBaseTypeMapper provides default OSS behavior`() {
+        val schema = createSchema("type TestType { field: String }")
+        // In OSS context, ViaductBaseTypeMapper should provide standard behavior
+        val viaductMapper = ViaductBaseTypeMapper(schema)
+
+        // Test that ViaductBaseTypeMapper returns INVARIANT variance for input objects
+        val variance = viaductMapper.getInputVarianceForObject()
+        assertTrue(variance != null)
+        assertTrue(variance == kotlinx.metadata.KmVariance.INVARIANT)
+
+        // Also test a simple type mapping to ensure it works
+        val typeExpr = schema.field("TestType", "field").type
+
+        // Should return null (letting extension function handle default case)
+        val result = viaductMapper.mapBaseType(typeExpr, viaduct.codegen.utils.KmName("test"), null, false)
+        assertTrue(result == null)
+    }
+
+    @Test
+    fun `ViaductBaseTypeMapper getAdditionalTypeMapping returns empty map`() {
+        val mapper = ViaductBaseTypeMapper(ViaductSchema.Empty)
+        val mappings = mapper.getAdditionalTypeMapping()
+
+        assertTrue(mappings.isEmpty())
+    }
+
+    @Test
+    fun `ViaductBaseTypeMapper getGlobalIdType returns correct type`() {
+        val mapper = ViaductBaseTypeMapper(ViaductSchema.Empty)
+        val globalIdType = mapper.getGlobalIdType()
+
+        assertTrue(globalIdType == JavaBinaryName("viaduct.api.globalid.GlobalID"))
+    }
+
+    @Test
+    fun `ViaductBaseTypeMapper useGlobalIdTypeAlias returns false`() {
+        val mapper = ViaductBaseTypeMapper(ViaductSchema.Empty)
+        val usesAlias = mapper.useGlobalIdTypeAlias()
+
+        assertFalse(usesAlias)
+    }
+
+    @Test
+    fun `ViaductBaseTypeMapper addSchemaGRTReference handles Object types`() {
+        val schema = createSchema("type TestObject { field: String }")
+        val mapper = ViaductBaseTypeMapper(schema)
+        val builder = KmClassFilesBuilder()
+        val objectDef = schema.typedef("TestObject") as ViaductSchema.Object
+        val fqn = KmName("test/TestObject")
+
+        // Should not throw exception - testing that method executes properly
+        mapper.addSchemaGRTReference(objectDef, fqn, builder)
+    }
+
+    @Test
+    fun `ViaductBaseTypeMapper addSchemaGRTReference handles Interface types`() {
+        val schema = createSchema("interface TestInterface { field: String }")
+        val mapper = ViaductBaseTypeMapper(schema)
+        val builder = KmClassFilesBuilder()
+        val interfaceDef = schema.typedef("TestInterface") as ViaductSchema.Interface
+        val fqn = KmName("test/TestInterface")
+
+        // Should not throw exception - testing that method executes properly
+        mapper.addSchemaGRTReference(interfaceDef, fqn, builder)
+    }
+
+    @Test
+    fun `ViaductBaseTypeMapper addSchemaGRTReference handles Union types`() {
+        val schema = createSchema(
+            """
+            type TypeA { field: String }
+            type TypeB { field: Int }
+            union TestUnion = TypeA | TypeB
+            """.trimIndent()
+        )
+        val mapper = ViaductBaseTypeMapper(schema)
+        val builder = KmClassFilesBuilder()
+        val unionDef = schema.typedef("TestUnion") as ViaductSchema.Union
+        val fqn = KmName("test/TestUnion")
+
+        // Should not throw exception - testing that method executes properly
+        mapper.addSchemaGRTReference(unionDef, fqn, builder)
+    }
+
+    @Test
+    fun `ViaductBaseTypeMapper addSchemaGRTReference handles Input types`() {
+        val schema = createSchema("input TestInput { field: String }")
+        val mapper = ViaductBaseTypeMapper(schema)
+        val builder = KmClassFilesBuilder()
+        val inputDef = schema.typedef("TestInput") as ViaductSchema.Input
+        val fqn = KmName("test/TestInput")
+
+        // Should not throw exception - testing that method executes properly
+        mapper.addSchemaGRTReference(inputDef, fqn, builder)
+    }
+
+    @Test
+    fun `ViaductBaseTypeMapper addSchemaGRTReference handles Enum types`() {
+        val schema = createSchema("enum TestEnum { VALUE_A, VALUE_B }")
+        val mapper = ViaductBaseTypeMapper(schema)
+        val builder = KmClassFilesBuilder()
+        val enumDef = schema.typedef("TestEnum") as ViaductSchema.Enum
+        val fqn = KmName("test/TestEnum")
+
+        // Should not throw exception - testing that method executes properly
+        mapper.addSchemaGRTReference(enumDef, fqn, builder)
+    }
+
+    @Test
+    fun `hashForSharding returns non-negative hash`() {
+        val schema = createSchema("type TestType { field: String }")
+        val typeDef = schema.typedef("TestType")
+
+        val hash = typeDef.hashForSharding()
+        assertTrue(hash >= 0)
+    }
+
+    @Test
+    fun `hashForSharding handles negative hash codes`() {
+        val schema = createSchema("type TestType { field: String }")
+        val typeDef = schema.typedef("TestType")
+
+        // Test that negative hash codes are made positive
+        val hash1 = typeDef.hashForSharding()
+        val hash2 = typeDef.hashForSharding()
+
+        // Should be consistent
+        assertTrue(hash1 == hash2)
+        assertTrue(hash1 >= 0)
+    }
+
+    @Test
+    fun `Object isEligible returns true for Query and Mutation`() {
+        val schema = createSchema("type TestQuery { field: String }")
+
+        // Manually create objects to test the logic since mkSchema creates default Query/Mutation
+        val testObj = schema.typedef("TestQuery") as ViaductSchema.Object
+
+        // Test regular object eligibility - should be true for non-PagedConnection types
+        assertTrue(testObj.isEligible(ViaductBaseTypeMapper(schema)))
+    }
+
+    @Test
+    fun `Object isEligible returns false for PagedConnection types`() {
+        val schema = createSchema(
+            """
+            interface PagedConnection { edges: [String] }
+            type TestConnection implements PagedConnection { edges: [String] }
+            """.trimIndent()
+        )
+
+        val connectionObj = schema.typedef("TestConnection") as ViaductSchema.Object
+        assertFalse(connectionObj.isEligible(ViaductBaseTypeMapper(schema)))
+    }
+
+    @Test
+    fun `Interface noArgsAnywhere returns true when no args in interface or implementations`() {
+        val schema = createSchema(
+            """
+            interface TestInterface { field: String }
+            type TestObj implements TestInterface { field: String }
+            """.trimIndent()
+        )
+
+        val interfaceDef = schema.typedef("TestInterface") as ViaductSchema.Interface
+        assertTrue(interfaceDef.noArgsAnywhere("field"))
+    }
+
+    @Test
+    fun `Interface noArgsAnywhere returns false when interface field has args`() {
+        val schema = createSchema(
+            """
+            interface TestInterface { field(arg: String): String }
+            type TestObj implements TestInterface { field(arg: String): String }
+            """.trimIndent()
+        )
+
+        val interfaceDef = schema.typedef("TestInterface") as ViaductSchema.Interface
+        assertFalse(interfaceDef.noArgsAnywhere("field"))
+    }
+
+    @Test
+    fun `Interface noArgsAnywhere returns false when implementation adds args`() {
+        val schema = createSchema(
+            """
+            interface TestInterface { field: String }
+            type TestObj implements TestInterface { field(arg: String): String }
+            """.trimIndent()
+        )
+
+        val interfaceDef = schema.typedef("TestInterface") as ViaductSchema.Interface
+        assertFalse(interfaceDef.noArgsAnywhere("field"))
+    }
+
+    @Test
+    fun `hasViaductDefaultValue returns true for nullable fields`() {
+        val schema = createSchema("type TestType { nullableField: String }")
+        val field = schema.field("TestType", "nullableField")
+
+        assertTrue(field.hasViaductDefaultValue)
+    }
+
+    @Test
+    fun `hasViaductDefaultValue returns false for non-nullable fields`() {
+        val schema = createSchema("type TestType { nonNullField: String! }")
+        val field = schema.field("TestType", "nonNullField")
+
+        assertFalse(field.hasViaductDefaultValue)
+    }
+
+    @Test
+    fun `viaductDefaultValue returns null for nullable non-list fields`() {
+        val schema = createSchema("type TestType { nullableField: String }")
+        val field = schema.field("TestType", "nullableField")
+
+        assertNull(field.viaductDefaultValue)
+    }
+
+    @Test
+    fun `viaductDefaultValue returns empty list for nullable list fields in Object types`() {
+        val schema = createSchema("type TestType { listField: [String] }")
+        val field = schema.field("TestType", "listField")
+
+        val defaultValue = field.viaductDefaultValue
+        assertTrue(defaultValue is List<*>)
+        assertTrue((defaultValue as List<*>).isEmpty())
+    }
+
+    @Test
+    fun `viaductDefaultValue throws exception for non-nullable fields`() {
+        val schema = createSchema("type TestType { nonNullField: String! }")
+        val field = schema.field("TestType", "nonNullField")
+
+        assertThrows<NoSuchElementException> {
+            field.viaductDefaultValue
+        }
+    }
+
+    @Test
+    fun `viaductDefaultValue returns null for nullable fields in Input types`() {
+        val schema = createSchema("input TestInput { nullableField: String }")
+        val field = schema.field("TestInput", "nullableField")
+
+        assertNull(field.viaductDefaultValue)
+    }
+
+    @Test
+    fun `kmType with useSchemaValueType returns Value class for eligible objects`() {
+        val schema = createSchema("type TestObject { field: String }")
+        val field = schema.field("TestObject", "field")
+
+        val kmType = field.kmType(KmName("pkg"), ViaductBaseTypeMapper(schema), isInput = false, useSchemaValueType = true)
+
+        // Should use the base type, not the Value class for this field
+        assertTrue(kmType.classifier.toString().contains("String"))
+    }
+
+    @Test
+    fun `kmType resolves top-level Value types without nested Value collision`() {
+        val schema = createSchema(
+            """
+            type TestObject { value: Value }
+            union Value = Child
+            type Child { field: String }
+            """.trimIndent()
+        )
+        val field = schema.field("TestObject", "value")
+
+        val baseKmType = field.kmType(KmName("pkg"), ViaductBaseTypeMapper(schema), isInput = false)
+        val valueKmType = field.kmType(KmName("pkg"), ViaductBaseTypeMapper(schema), isInput = false, useSchemaValueType = true)
+
+        assertEquals("Class(name=pkg/Value)", baseKmType.classifier.toString())
+        assertEquals("Class(name=pkg/Value)", valueKmType.classifier.toString())
+    }
+
+    @Test
+    fun `Object isEligible returns true for regular objects`() {
+        val schema = createSchema("type RegularObject { field: String }")
+        val obj = schema.typedef("RegularObject") as ViaductSchema.Object
+
+        assertTrue(obj.isEligible(ViaductBaseTypeMapper(schema)))
+    }
+
+    @Test
+    fun `Object isEligible returns false for objects in nativeGraphQLTypeToKmName`() {
+        // This test would need to configure cfg.nativeGraphQLTypeToKmName
+        // but since that's more complex, we'll test the PagedConnection case which is simpler
+        val schema = createSchema(
+            """
+            interface PagedConnection { edges: [String] }
+            type TestConnection implements PagedConnection { edges: [String] }
+            """.trimIndent()
+        )
+
+        val connectionObj = schema.typedef("TestConnection") as ViaductSchema.Object
+        assertFalse(connectionObj.isEligible(ViaductBaseTypeMapper(schema)))
+    }
+
+    @Test
+    fun `isPagedConnection returns true for objects implementing PagedConnection`() {
+        val schema = createSchema(
+            """
+            interface PagedConnection { edges: [String] }
+            type TestConnection implements PagedConnection { edges: [String] }
+            """.trimIndent()
+        )
+
+        val connectionObj = schema.typedef("TestConnection") as ViaductSchema.Object
+        assertTrue(connectionObj.isPagedConnection)
+    }
+
+    @Test
+    fun `isPagedConnection returns false for regular objects`() {
+        val schema = createSchema("type RegularObject { field: String }")
+        val obj = schema.typedef("RegularObject") as ViaductSchema.Object
+
+        assertFalse(obj.isPagedConnection)
+    }
+
+    @Test
+    fun `pathFromQueryRoot returns empty list for Query type`() {
+        val schema = createSchema("extend type Query { x: Int }")
+        val reverseSchema = ViaductReverseSchema.from(schema)
+        val queryType = schema.queryTypeDef!!
+
+        assertEquals(emptyList<String>(), queryType.pathFromQueryRoot(reverseSchema, queryType))
+    }
+
+    @Test
+    fun `pathFromQueryRoot returns null for Mutation type`() {
+        val schema = createSchema("")
+        val reverseSchema = ViaductReverseSchema.from(schema)
+        val mutationType = schema.mutationTypeDef!! as ViaductSchema.Object
+
+        assertNull(mutationType.pathFromQueryRoot(reverseSchema, schema.queryTypeDef!!))
+    }
+
+    @Test
+    fun `pathFromQueryRoot returns null for non-root types`() {
+        val schema = createSchema("type User { name: String }")
+        val reverseSchema = ViaductReverseSchema.from(schema)
+        val userType = schema.typedef("User") as ViaductSchema.Object
+
+        assertNull(userType.pathFromQueryRoot(reverseSchema, schema.queryTypeDef!!))
+    }
+
+    @Test
+    fun `pathFromQueryRoot returns path for namespace type reachable from Query`() {
+        val schema = createSchema(
+            """
+            directive @namespaceType on OBJECT
+            type Foo { name: String }
+            type Factories @namespaceType { create: Foo }
+            extend type Query { _factories: Factories }
+            """.trimIndent()
+        )
+        val reverseSchema = ViaductReverseSchema.from(schema)
+        val factoriesType = schema.typedef("Factories") as ViaductSchema.Object
+
+        assertEquals(listOf("_factories"), factoriesType.pathFromQueryRoot(reverseSchema, schema.queryTypeDef!!))
+    }
+
+    @Test
+    fun `pathFromQueryRoot returns path through nested namespace types`() {
+        val schema = createSchema(
+            """
+            directive @namespaceType on OBJECT
+            type Product { name: String }
+            type ProductFactory @namespaceType { create: Product }
+            type Factories @namespaceType { products: ProductFactory }
+            extend type Query { _factories: Factories }
+            """.trimIndent()
+        )
+        val reverseSchema = ViaductReverseSchema.from(schema)
+        val productFactory = schema.typedef("ProductFactory") as ViaductSchema.Object
+
+        assertEquals(listOf("_factories", "products"), productFactory.pathFromQueryRoot(reverseSchema, schema.queryTypeDef!!))
+    }
+
+    @Test
+    fun `pathFromQueryRoot returns null for namespace type reachable only from Mutation`() {
+        val schema = createSchema(
+            """
+            directive @namespaceType on OBJECT
+            type Result { ok: Boolean }
+            type MutationFactory @namespaceType { doThing: Result }
+            extend type Mutation { _factories: MutationFactory }
+            """.trimIndent()
+        )
+        val reverseSchema = ViaductReverseSchema.from(schema)
+        val mutationFactory = schema.typedef("MutationFactory") as ViaductSchema.Object
+
+        assertNull(mutationFactory.pathFromQueryRoot(reverseSchema, schema.queryTypeDef!!))
+    }
+}

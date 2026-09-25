@@ -1,0 +1,218 @@
+package viaduct.ksp.validation
+
+import com.google.devtools.ksp.processing.CodeGenerator
+import com.google.devtools.ksp.processing.Dependencies
+import com.google.devtools.ksp.processing.KSPLogger
+import com.google.devtools.ksp.processing.Resolver
+import com.google.devtools.ksp.processing.SymbolProcessor
+import com.google.devtools.ksp.processing.SymbolProcessorEnvironment
+import com.google.devtools.ksp.symbol.KSAnnotated
+import com.google.devtools.ksp.symbol.KSAnnotation
+import com.google.devtools.ksp.symbol.KSClassDeclaration
+import com.google.devtools.ksp.symbol.KSFile
+import java.lang.IllegalArgumentException
+
+/**
+ * Processes @Resolver annotations at compile-time.
+ *
+ * Responsibilities:
+ * 1. Extract fragments (objectValueFragment, queryValueFragment) and @Variable declarations
+ * 2. Handle conversion from shorthand to longhand form if necessary
+ * 3. Validate variable declarations (source constraints, path resolution, unused/unbound variables)
+ * 4. Generate resolver-extracted-fragments.graphql containing all extracted [ResolverFragmentSpec]
+ *
+ * GraphQL schema validation of required selection sets (field/type existence and fragment
+ * type-shape checks) is intentionally *not* done here. The compilation schema is loaded once per
+ * tenant at assembly time (see `TenantModuleConfigAssembler`), which is both faster than loading
+ * it on every leaf compile and able to resolve cross-leaf `@GraphQLFragment` spreads that a single
+ * leaf cannot see.
+ */
+class ResolverSelectionSetProcessor(
+    environment: SymbolProcessorEnvironment,
+) : SymbolProcessor {
+    private val codeGenerator: CodeGenerator = environment.codeGenerator
+    private val logger: KSPLogger = environment.logger
+    private val fragmentsOutputFile: String? = environment.options[FRAGMENTS_OUTPUT_OPTION]
+
+    // Track if we've already generated the file in this compilation session
+    private var hasGeneratedFragments = false
+
+    @Suppress("PARAMETER_NAME_CHANGED_ON_OVERRIDE")
+    override fun process(kspResolver: Resolver): List<KSAnnotated> {
+        // Extract @Resolver annotations from all declarations
+        val annotationSpecs = mutableListOf<ResolverAnnotationSpec>()
+        val resolverFiles = mutableSetOf<KSFile>()
+
+        kspResolver.getAllFiles().forEach { file ->
+            resolverFiles.add(file)
+            file.declarations.forEach { declaration ->
+                if (declaration is KSClassDeclaration) {
+                    declaration.getResolverAnnotationSpec(file.fileName)?.let { spec ->
+                        annotationSpecs.add(spec)
+                    }
+                }
+            }
+        }
+
+        // Perform schema-free validation (variable declarations and references)
+        validateResolvers(annotationSpecs)
+
+        // Generate GraphQL fragments file only if output option is provided
+        val fragmentSpecs = annotationSpecs.flatMap { it.fragments }
+        if (fragmentsOutputFile != null && fragmentSpecs.isNotEmpty() && !hasGeneratedFragments) {
+            generateResolverFragmentsGraphQL(resolverFiles, fragmentSpecs, fragmentsOutputFile)
+            hasGeneratedFragments = true
+        }
+
+        return emptyList()
+    }
+
+    internal fun generateResolverFragmentsGraphQL(
+        resolverFiles: MutableSet<KSFile>,
+        resolverSpecs: List<ResolverFragmentSpec>,
+        outputFileName: String,
+    ) {
+        try {
+            val dependencies = Dependencies(
+                aggregating = false,
+                sources = resolverFiles.toTypedArray()
+            )
+
+            val file = codeGenerator.createNewFile(
+                dependencies = dependencies,
+                packageName = "",
+                fileName = outputFileName,
+                extensionName = "graphql"
+            )
+
+            file.writer().use { writer ->
+                resolverSpecs.forEach { writer.write(it.toString()) }
+            }
+
+            logger.loggingResolverProcessor("Generated resolver fragments GraphQL schema with {0} resolvers", resolverSpecs.size)
+        } catch (e: Exception) {
+            logger.errorResolverProcessor("Failed to generate resolver fragments GraphQL: {0}", e)
+        }
+    }
+
+    internal fun KSClassDeclaration.getResolverAnnotationSpec(sourceFileName: String): ResolverAnnotationSpec? {
+        val resolverAnnotations = this.annotations.filter { it.shortName.asString() == "Resolver" }
+
+        if (resolverAnnotations.toList().size > 1) {
+            throw IllegalArgumentException("Only one @Resolver annotation is allowed. ${this.packageName}.${this.simpleName} has multiple.")
+        }
+
+        val resolverAnnotation = resolverAnnotations.firstOrNull() ?: return null
+
+        val fragments = mutableListOf<ResolverFragmentSpec>()
+        var variables = emptyList<ResolverVariableSpec>()
+
+        resolverAnnotation.arguments.forEach { argument ->
+            val argName = argument.name?.asString() ?: return@forEach
+            when (argName) {
+                "objectValueFragment" -> {
+                    ResolverFragmentSpec.fromResolverAnnotationArgument(
+                        fragmentType = ResolverFragmentType.OBJECT,
+                        argumentValue = argument.value,
+                        ksclass = this,
+                        sourceFileName = sourceFileName
+                    )?.let { fragments.add(it) }
+                }
+                "queryValueFragment" -> {
+                    ResolverFragmentSpec.fromResolverAnnotationArgument(
+                        fragmentType = ResolverFragmentType.QUERY,
+                        argumentValue = argument.value,
+                        ksclass = this,
+                        sourceFileName = sourceFileName
+                    )?.let { fragments.add(it) }
+                }
+                "variables" -> {
+                    val varAnnotations = argument.value as? List<*> ?: emptyList<Any>()
+                    variables = varAnnotations.filterIsInstance<KSAnnotation>().map { varAnn ->
+                        ResolverVariableSpec(
+                            name = varAnn.getArgString("name")!!,
+                            fromObjectField = varAnn.getArgStringOrNull("fromObjectField"),
+                            fromQueryField = varAnn.getArgStringOrNull("fromQueryField"),
+                            fromArgument = varAnn.getArgStringOrNull("fromArgument"),
+                        )
+                    }
+                }
+            }
+        }
+
+        // Extract variable names from nested @Variables class
+        val variablesAnnotations = this.declarations
+            .filterIsInstance<KSClassDeclaration>()
+            .flatMap { it.annotations.filter { a -> a.shortName.asString() == "Variables" } }
+            .toList()
+
+        if (variablesAnnotations.size > 1) {
+            throw IllegalArgumentException(
+                "Resolver class ${this.qualifiedName?.asString()} must have at most one @Variables annotation across its nested classes"
+            )
+        }
+
+        val variablesProviderVarNames = variablesAnnotations.firstOrNull()?.let { annotation ->
+            @Suppress("UNCHECKED_CAST")
+            val typesList = annotation.arguments.firstOrNull { it.name?.asString() == "types" }?.value as? List<String> ?: emptyList()
+            if (typesList.isNotEmpty()) parseVariableNamesFromTypes(typesList) else emptySet()
+        } ?: emptySet()
+
+        val typeName = this.simpleName.asString()
+        val metadata = Metadata(
+            packageName = this.packageName.asString(),
+            className = typeName,
+            sourceFileName = sourceFileName,
+            typeName = fragments.firstOrNull()?.metadata?.typeName ?: typeName,
+            fragmentType = fragments.firstOrNull()?.metadata?.fragmentType ?: ResolverFragmentType.OBJECT,
+        )
+
+        return ResolverAnnotationSpec(
+            fragments = fragments,
+            variables = variables,
+            metadata = metadata,
+            variablesProviderVarNames = variablesProviderVarNames,
+        )
+    }
+
+    /**
+     * Validates resolver @Variable declarations and references. This is schema-free; GraphQL
+     * schema validation of the fragments themselves happens at assembly time.
+     */
+    private fun validateResolvers(annotationSpecs: List<ResolverAnnotationSpec>) {
+        val errors = mutableListOf<String>()
+
+        ValidateResolverVariables(annotationSpecs)
+            .validateAndReportErrors()?.let { errors.add(it) }
+
+        if (errors.isNotEmpty()) {
+            throw IllegalStateException(errors.joinToString("\n"))
+        }
+    }
+}
+
+/** KSP processor option key. When present, its value is used as the output file name for the extracted resolver fragments. */
+const val FRAGMENTS_OUTPUT_OPTION = "fragmentsOutputFile"
+
+/** Duplicated from viaduct.api.Variable.UNSET_STRING_VALUE — cannot import due to no dep on tenant-api */
+internal const val VARIABLE_UNSET_STRING_VALUE = "XY!#* N0T S3T!"
+
+private fun KSAnnotation.getArgString(argName: String): String? = arguments.find { it.name?.asString() == argName }?.value as? String
+
+private fun KSAnnotation.getArgStringOrNull(argName: String): String? = getArgString(argName)?.takeIf { it != VARIABLE_UNSET_STRING_VALUE }
+
+internal fun parseVariableNamesFromTypes(types: List<String>): Set<String> =
+    types
+        .filter { it.isNotBlank() }
+        .map { entry ->
+            val parts = entry.trim().split(":")
+            require(parts.size == 2) {
+                "Invalid @Variables entry '${entry.trim()}' — expected format 'name: Type'"
+            }
+            val name = parts[0].trim()
+            require(name.isNotEmpty()) {
+                "Invalid @Variables entry '${entry.trim()}' — variable name is empty"
+            }
+            name
+        }
+        .toSet()

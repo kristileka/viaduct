@@ -1,0 +1,129 @@
+package viaduct.x.javaapi.codegen;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import viaduct.graphql.schema.ViaductSchema;
+import viaduct.tenant.codegen.graphql.schema.ScopeAndTenantLocalSchemaFilter;
+
+/**
+ * Main entry point for Java GRTs (GraphQL Representational Types) code generation. This class
+ * handles the generation logic and can be called from CLI or programmatically. Uses ViaductSchema
+ * as the schema abstraction layer.
+ */
+public class JavaGRTsCodegen {
+
+  private final GraphQLSchemaParser parser;
+
+  public JavaGRTsCodegen() {
+    this.parser = new GraphQLSchemaParser();
+  }
+
+  /** Result of the code generation process. */
+  public record Result(
+      int enumCount,
+      int objectCount,
+      int inputCount,
+      int interfaceCount,
+      int unionCount,
+      int argumentCount,
+      List<File> generatedFiles) {
+    public int totalCount() {
+      return enumCount + objectCount + inputCount + interfaceCount + unionCount + argumentCount;
+    }
+  }
+
+  /**
+   * Generates Java GRTs from GraphQL schema files with optional root type inclusion.
+   *
+   * <p>GRT types are written to {@code grtOutputDir} in package subdirectories.
+   *
+   * @param schemaFiles list of GraphQL schema files to parse
+   * @param grtOutputDir output directory for generated GRT files (written to package subdirs)
+   * @param grtPackage Java package name for generated GRT types
+   * @param includeRootTypes if true, includes Query, Mutation, Subscription types in generation
+   * @return result containing counts of generated types
+   * @throws IOException if there's an error reading or writing files
+   */
+  public Result generate(
+      List<File> schemaFiles, File grtOutputDir, String grtPackage, boolean includeRootTypes)
+      throws IOException {
+    return generate(schemaFiles, grtOutputDir, grtPackage, includeRootTypes, null);
+  }
+
+  /**
+   * Generates Java GRTs, optionally filtering the schema to a set of applied scopes first.
+   *
+   * @param appliedScopes when non-null and non-empty, the schema is projected to just the
+   *     types/fields in at least one of these scopes before generation (via the shared {@link
+   *     ScopeAndTenantLocalSchemaFilter}). Null or empty means no filtering.
+   * @see #generate(List, File, String, boolean)
+   */
+  public Result generate(
+      List<File> schemaFiles,
+      File grtOutputDir,
+      String grtPackage,
+      boolean includeRootTypes,
+      Set<String> appliedScopes)
+      throws IOException {
+    // Ensure output directory exists
+    if (!grtOutputDir.exists() && !grtOutputDir.mkdirs()) {
+      throw new IOException("Failed to create GRT output directory: " + grtOutputDir);
+    }
+
+    // Parse schemas into ViaductSchema, then optionally filter to the requested scopes.
+    ViaductSchema schema = SchemaScopeFilter.parseAndFilter(parser, schemaFiles, appliedScopes);
+
+    List<File> generatedFiles = new ArrayList<>();
+
+    // Generate enums
+    List<EnumModel> enumModels = parser.extractEnums(schema, grtPackage);
+    for (EnumModel model : enumModels) {
+      generatedFiles.add(JavaGRTGenerator.EnumGenerator.generateToFile(model, grtOutputDir));
+    }
+
+    // Generate objects (with optional root type inclusion)
+    List<ObjectModel> objectModels = parser.extractObjects(schema, grtPackage, includeRootTypes);
+    for (ObjectModel model : objectModels) {
+      generatedFiles.add(JavaGRTGenerator.ObjectGenerator.generateToFile(model, grtOutputDir));
+    }
+
+    // Generate inputs
+    List<InputModel> inputModels = parser.extractInputs(schema, grtPackage);
+    for (InputModel model : inputModels) {
+      generatedFiles.add(JavaGRTGenerator.InputGenerator.generateToFile(model, grtOutputDir));
+    }
+
+    // Generate interfaces
+    List<InterfaceModel> interfaceModels = parser.extractInterfaces(schema, grtPackage);
+    for (InterfaceModel model : interfaceModels) {
+      generatedFiles.add(JavaGRTGenerator.InterfaceGenerator.generateToFile(model, grtOutputDir));
+    }
+
+    // Generate unions
+    List<UnionModel> unionModels = parser.extractUnions(schema, grtPackage);
+    for (UnionModel model : unionModels) {
+      generatedFiles.add(JavaGRTGenerator.UnionGenerator.generateToFile(model, grtOutputDir));
+    }
+
+    // Generate argument types (resolver bases reference these)
+    String mutationTypeName =
+        schema.getMutationTypeDef() != null ? schema.getMutationTypeDef().getName() : null;
+    List<ArgumentModel> argumentModels =
+        parser.extractArguments(schema, grtPackage, mutationTypeName);
+    for (ArgumentModel model : argumentModels) {
+      generatedFiles.add(JavaGRTGenerator.ArgumentGenerator.generateToFile(model, grtOutputDir));
+    }
+
+    return new Result(
+        enumModels.size(),
+        objectModels.size(),
+        inputModels.size(),
+        interfaceModels.size(),
+        unionModels.size(),
+        argumentModels.size(),
+        generatedFiles);
+  }
+}

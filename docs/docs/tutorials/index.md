@@ -1,12 +1,12 @@
 ---
-title: Tutorials
-description: Step-by-step guides to using Viaduct
+title: Worked Examples
+description: Step-by-step examples for learning Viaduct patterns
 ---
 
 
-## Tutorials
+## Worked Examples
 
-These step-by-step guides will teach you how to build powerful GraphQL APIs with minimal code.
+These step-by-step examples will teach you how to build powerful GraphQL APIs with minimal code.
 
 ### How It Works:
 
@@ -18,11 +18,11 @@ These step-by-step guides will teach you how to build powerful GraphQL APIs with
 
 4. **Get a working API** - Type-safe, performant GraphQL server
 
-### Tutorial Path
+### Example Path
 
-Follow these tutorials in order to master Viaduct's resolver patterns:
+Follow these examples in order to master Viaduct's resolver patterns. The complete set of feature-app tutorials lives in [`core/tenant/tutorials/src/test/kotlin/viaduct/tenant`](https://github.com/airbnb/viaduct/tree/main/core/tenant/tutorials/src/test/kotlin/viaduct/tenant); the entries below are the curated path we recommend working through first.
 
-#### 1. [Field Resolver Tutorial](https://github.com/airbnb/viaduct/blob/main/tenant/runtime/src/test/kotlin/viaduct/tenant/runtime/tutorials/fieldresolver/SimpleFieldResolverFeatureAppTest.kt)
+#### [Field Resolver Tutorial](https://github.com/airbnb/viaduct/blob/main/core/tenant/tutorials/src/test/kotlin/viaduct/tenant/tutorial01/SimpleFieldResolverFeatureAppTest.kt)
 
 **Start here!** Learn the most basic resolver type.
 
@@ -34,7 +34,7 @@ Follow these tutorials in order to master Viaduct's resolver patterns:
 
 - **Generated classes**: `QueryResolvers.*`
 
-#### 2. [Node Resolver Tutorial](https://github.com/airbnb/viaduct/blob/main/tenant/runtime/src/test/kotlin/viaduct/tenant/runtime/tutorials/noderesolver/SimpleNodeResolverFeatureAppTest.kt)
+#### [Node Resolver Tutorial](https://github.com/airbnb/viaduct/blob/main/core/tenant/tutorials/src/test/kotlin/viaduct/tenant/tutorial02/SimpleNodeResolverFeatureAppTest.kt)
 
 Learn the foundation of Viaduct's object system.
 
@@ -48,7 +48,7 @@ Learn the foundation of Viaduct's object system.
 
 - **Why it matters**: Foundation for all object resolution in Viaduct
 
-#### 3. [Simple Resolvers Tutorial](https://github.com/airbnb/viaduct/blob/main/tenant/runtime/src/test/kotlin/viaduct/tenant/runtime/tutorials/simpleresolvers/SimpleResolversFeatureAppTest.kt)
+#### [Simple Resolvers Tutorial](https://github.com/airbnb/viaduct/blob/main/core/tenant/tutorials/src/test/kotlin/viaduct/tenant/tutorial03/SimpleResolversFeatureAppTest.kt)
 
 See how Field and Node resolvers work together.
 
@@ -62,7 +62,19 @@ See how Field and Node resolvers work together.
 
 - **Advanced feature**: Field resolvers accessing parent object data
 
-### Key Concepts Across All Tutorials
+#### [Subqueries Tutorial](https://github.com/airbnb/viaduct/blob/main/core/tenant/tutorials/src/test/kotlin/viaduct/tenant/tutorial11/SimpleSubqueriesFeatureAppTest.kt)
+
+Execute subqueries against the Query and Mutation roots from inside a resolver.
+
+- **What you'll learn**: How to use `ctx.query()` and `ctx.mutation()` to issue imperative subqueries
+
+- **Key concepts**: `ctx.query()`, `ctx.mutation()`, subquery variable scoping, when to use subqueries vs declarative `@Resolver` fragments
+
+- **Example**: A field resolver that fetches data from the Query root at runtime; a mutation resolver that calls another mutation via `ctx.mutation()`
+
+- **Why it matters**: Enables resolvers to fetch related data that isn't known at query planning time
+
+### Key Concepts Across These Examples
 
 #### The `@resolver` Directive
 
@@ -94,7 +106,7 @@ Viaduct's built-in global object identification:
 
 - **Type-safe**: Can't accidentally use wrong ID for wrong type
 
-- **Utilities**: `ctx.globalIDFor()` to create, `ctx.nodeFor()` to resolve
+- **Utilities**: `ctx.globalIDFor()` to create, `ctx.ref()` to resolve
 
 - **Standard**: Follows Relay specification for global object identification
 
@@ -110,4 +122,4 @@ Field resolvers can access parent object data:
 
 - Framework automatically fetches required fields
 
-- Available via type-safe `ctx.objectValue.getFirstname()`
+- Available via type-safe `ctx.getObjectValue().getFirstNameOrThrow()`

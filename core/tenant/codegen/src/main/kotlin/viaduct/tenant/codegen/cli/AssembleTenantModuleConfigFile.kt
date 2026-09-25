@@ -1,0 +1,105 @@
+@file:Suppress("DEPRECATION") // Jackson configure() deprecated in newer versions
+
+package viaduct.tenant.codegen.cli
+
+import com.github.ajalt.clikt.core.CliktCommand
+import com.github.ajalt.clikt.parameters.options.default
+import com.github.ajalt.clikt.parameters.options.multiple
+import com.github.ajalt.clikt.parameters.options.option
+import com.github.ajalt.clikt.parameters.options.required
+import com.github.ajalt.clikt.parameters.options.split
+import com.github.ajalt.clikt.parameters.types.file
+import java.io.File
+
+/**
+ * Aggregation CLI that combines per-file KSP descriptors into a single tenant module
+ * config file at `META-INF/viaduct/modules/<tenantpkg>.json`.
+ *
+ * Deserializes each per-file [PerSourceDescriptorFile], maps them to a typed [ExecutionRegistry],
+ * then serializes that — so the JSON shape is always governed by the real data model and a
+ * schema change in [ExecutionRegistry] becomes a build error here, not a runtime surprise.
+ *
+ * Invoked via process-isolated Gradle worker from the Gradle assembly task.
+ */
+class AssembleTenantModuleConfigFile : CliktCommand(
+    name = "assemble-tenant-module-config-file",
+) {
+    private val descriptorDir: File by option("--descriptor-dir")
+        .file(mustExist = true, canBeFile = false)
+        .required()
+
+    private val tenantPackage: String by option("--tenant-package")
+        .required()
+
+    private val tenantPackagePrefix: String? by option("--tenant-package-prefix")
+
+    private val tenantMetadataFile: File? by option(
+        "--tenant-metadata-file",
+        help = "JSON tenant metadata applied to every field and node: {\"name\":\"tenant\"}; absent or {} records unknown ownership.",
+    ).file(mustExist = true, canBeDir = false)
+
+    private val executorFactory: String by option("--executor-factory")
+        .default("")
+
+    /**
+     * Stable name of the tenant API producing this config — the tenant-API half of the config key.
+     * Independent of `--executor-factory`, which selects only how the config is materialized.
+     *
+     * Required, matching [AssembleTenantModuleConfigJar]: each build system keeps exactly one default
+     * (the Bazel attr, the Gradle task convention), so this tool is never ambiguous about which slot
+     * it writes.
+     *
+     * Must be a valid Java identifier — see `ExecutionRegistryConfigFile.apiName` for why.
+     */
+    private val apiName: String by option("--api-name")
+        .required()
+
+    private val schemaBinary: File? by option("--schema-binary")
+        .file(mustExist = true, canBeFile = true)
+
+    private val schemaFiles: List<File> by option("--schema-files")
+        .file(mustExist = true, canBeDir = false)
+        .split(",")
+        .default(emptyList())
+
+    private val forbiddenSelectionDirectives: List<String> by option(
+        "--forbidden-selection-directive",
+        help = "Directive names (no @ prefix) that must not appear on any field selected by a " +
+            "required selection set, @GraphQLOperation, or @GraphQLFragment. Repeatable; validation " +
+            "runs only when schema files are provided."
+    )
+        .multiple()
+
+    private val outputDir: File by option("--output-dir")
+        .file(mustExist = false, canBeFile = false)
+        .required()
+
+    override fun run() {
+        descriptorDir.walkTopDown()
+            .filter { it.isFile && it.extension != "json" }
+            .forEach { echo("WARNING: unexpected file in descriptor dir (not a .json): ${it.name}", err = true) }
+
+        val descriptorJsons = descriptorDir.walkTopDown()
+            .filter { it.isFile && it.extension == "json" }
+            .sortedBy { it.relativeTo(descriptorDir).path.replace(File.separatorChar, '/') }
+            .map(File::readText)
+            .toList()
+        TenantModuleConfigAssembler.writeRegistry(
+            descriptorJsons = descriptorJsons,
+            executorFactory = executorFactory,
+            apiName = apiName,
+            tenantPackage = tenantPackage,
+            tenantPackagePrefix = tenantPackagePrefix,
+            tenantMetadata = TenantModuleConfigAssembler.readTenantMetadata(tenantMetadataFile),
+            schemaBinary = schemaBinary,
+            schemaFiles = schemaFiles,
+            outputDir = outputDir,
+            forbiddenSelectionDirectives = forbiddenSelectionDirectives.toSet(),
+        )
+    }
+
+    object Main {
+        @JvmStatic
+        fun main(args: Array<String>) = AssembleTenantModuleConfigFile().main(args)
+    }
+}

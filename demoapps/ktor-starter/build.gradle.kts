@@ -6,11 +6,7 @@ plugins {
 }
 
 application {
-    mainClass.set("com.example.viadapp.ViaductApplicationKt")
-}
-
-viaductApplication {
-    modulePackagePrefix.set("com.example.viadapp")
+    mainClass.set("com.example.viadapp.ViaductServiceKt")
 }
 
 dependencies {
@@ -23,16 +19,17 @@ dependencies {
     implementation(libs.reactor.core)
 
     implementation(libs.ktor.server.core.jvm)
-    implementation(libs.ktor.server.jetty)
+    implementation(libs.ktor.server.jetty.jakarta)
     implementation(libs.ktor.server.content.negotiation)
     implementation(libs.ktor.serialization.jackson)
     implementation(libs.ktor.server.core)
     implementation(libs.ktor.server.config.yaml)
 
-    implementation(project(":resolvers"))
+    runtimeOnly(libs.logback.classic)
 
+    // Import JUnit BOM to control all JUnit versions consistently
+    testImplementation(enforcedPlatform(libs.junit.bom))
     testImplementation(libs.ktor.server.test.host)
-    testImplementation(libs.kotlin.test.junit)
     testImplementation(libs.junit.jupiter)
 
     testRuntimeOnly(libs.junit.platform.launcher)

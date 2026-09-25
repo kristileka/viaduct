@@ -1,9 +1,11 @@
 plugins {
     id("buildroot.orchestration")
     id("buildroot.versioning")
+    id("conventions.bcv-module")
 }
 
 tasks.register("publishPlugins") {
-    dependsOn(":application-plugin:publishPlugins")
-    dependsOn(":module-plugin:publishPlugins")
+    dependsOn(":settings:publishPlugins")
+    dependsOn(":application:publishPlugins")
+    dependsOn(":module:publishPlugins")
 }

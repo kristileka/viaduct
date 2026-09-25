@@ -3,10 +3,11 @@ package com.example.starwars.modules.filmography.films.resolvers
 import com.example.starwars.filmography.resolverbases.FilmResolvers
 import com.example.starwars.modules.filmography.characters.models.CharacterRepository
 import com.example.starwars.modules.filmography.films.models.FilmCharactersRepository
+import io.micronaut.context.annotation.Prototype
 import jakarta.inject.Inject
-import viaduct.api.Resolver
 import viaduct.api.context.globalIDFor
 import viaduct.api.grts.Species
+import viaduct.api.resolver.Resolver
 
 /**
  * Example of a relationship field resolver in the Film type.
@@ -16,6 +17,7 @@ import viaduct.api.grts.Species
  * @resolver("fragment _ on Film { id }"): Fragment syntax for accessing film ID
  */
 @Resolver("id")
+@Prototype
 class FilmSpeciesResolver
     @Inject
     constructor(
@@ -23,7 +25,7 @@ class FilmSpeciesResolver
         private val filmCharactersRepository: FilmCharactersRepository
     ) : FilmResolvers.Species() {
         override suspend fun resolve(ctx: Context): List<Species?>? {
-            val filmId = ctx.objectValue.getId().internalID
+            val filmId = ctx.getObjectValue().getIdOrThrow().internalID
 
             val characterIds = filmCharactersRepository.findCharactersByFilmId(filmId)
 
@@ -31,7 +33,7 @@ class FilmSpeciesResolver
 
             return speciesIds.map {
                 val globalId = ctx.globalIDFor<Species>(it)
-                ctx.nodeFor(globalId)
+                ctx.ref(globalId)
             }
         }
     }

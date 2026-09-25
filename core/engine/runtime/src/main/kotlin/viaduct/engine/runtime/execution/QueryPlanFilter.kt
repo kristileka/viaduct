@@ -1,0 +1,301 @@
+package viaduct.engine.runtime.execution
+
+import graphql.GraphQLContext
+import graphql.execution.CoercedVariables
+import graphql.language.Field as GJField
+import graphql.language.InlineFragment as GJInlineFragment
+import graphql.language.TypeName as GJTypeName
+import graphql.schema.GraphQLCompositeType
+import graphql.schema.GraphQLObjectType
+import graphql.schema.GraphQLTypeUtil
+import java.util.Locale
+import viaduct.engine.api.EngineSchema
+import viaduct.engine.runtime.EngineExecutionContextExtensions.fieldRssOriginFilteringKillSwitchEnabled
+import viaduct.engine.runtime.EngineExecutionContextExtensions.incrementalExecutionEnabled
+import viaduct.engine.runtime.execution.constraints.Constraints
+import viaduct.engine.runtime.mat.KeyTree
+import viaduct.engine.runtime.result.ObjectEngineResult
+import viaduct.graphql.utils.collectVariableReferences
+import viaduct.utils.collections.MaskedSet
+
+/**
+ * Builds a plan from an existing plan after keeping only fields present in [shape].
+ *
+ * The projection is performed independently for every concrete object type in [shape]. This is
+ * important for abstract output types: a selection owned on one implementation must not be
+ * widened to every implementation of the interface or union.
+ *
+ * @param shape is the field shape to keep.
+ * @param source is a detached selection set. When null, the plan's root selection set is used.
+ * @param projectionType restricts [source] to one concrete runtime type. The filtered selection
+ * set is then owned by that type.
+ */
+internal fun QueryPlan.filterTo(
+    shape: KeyTree,
+    context: QueryPlanFilterCtx,
+    source: QueryPlan.SelectionSet? = null,
+    projectionType: GraphQLObjectType? = null,
+): QueryPlan {
+    val effectiveSource = source ?: selectionSet
+    val filtered = QueryPlanFilter(
+        this,
+        shape,
+        context,
+    )
+        .filter(effectiveSource, projectionType)
+    val newVariablesResolvers = variablesResolvers
+        .filter { vr -> vr.variableNames.any { it in filtered.activeVariableNames } }
+    val newChildPlanIds = newVariablesResolvers
+        .mapNotNull { it.requiredSelectionSet?.id }
+        .distinct()
+
+    return copy(
+        selectionSet = filtered.selectionSet,
+        fragments = QueryPlan.Fragments.empty,
+        variablesResolvers = newVariablesResolvers,
+        childPlanIds = newChildPlanIds,
+        variableDefinitions = variableDefinitions.filter { it.name in filtered.activeVariableNames },
+    )
+}
+
+internal data class QueryPlanFilterCtx(
+    val schema: EngineSchema,
+    val variables: CoercedVariables = CoercedVariables.emptyVariables(),
+    val graphQLContext: GraphQLContext = GraphQLContext.getDefault(),
+    val locale: Locale = Locale.getDefault(),
+    val fieldRssOriginFilteringKillSwitchEnabled: Boolean = true,
+    val collectFields: CollectFields = CollectFields.cached(),
+    val incrementalExecutionEnabled: Boolean = false,
+) {
+    constructor(parameters: ExecutionParameters) : this(
+        schema = parameters.engineExecutionContext.activeSchema,
+        variables = parameters.coercedVariables,
+        graphQLContext = parameters.executionContext.graphQLContext,
+        locale = parameters.executionContext.locale,
+        fieldRssOriginFilteringKillSwitchEnabled =
+            parameters.engineExecutionContext.fieldRssOriginFilteringKillSwitchEnabled,
+        collectFields = parameters.constants.collectFields,
+        incrementalExecutionEnabled = parameters.engineExecutionContext.incrementalExecutionEnabled,
+    )
+}
+
+private class QueryPlanFilter(
+    private val sourcePlan: QueryPlan,
+    private val shape: KeyTree,
+    private val context: QueryPlanFilterCtx,
+) {
+    fun filter(
+        source: QueryPlan.SelectionSet,
+        projectionType: GraphQLObjectType?,
+    ): FilteredQueryPlan {
+        val filtered = projectSelectionSet(source, shape, projectionType)
+        val activeVariableNames = filtered.selectionSet
+            .toAstSelectionSet()
+            .collectVariableReferences()
+        return FilteredQueryPlan(
+            selectionSet = filtered.selectionSet,
+            activeVariableNames = activeVariableNames,
+            // Field child plans stay attached to their fields. Top-level child plan IDs are rebuilt
+            // from active variable resolvers after filtering, so there is no value to carry here.
+        )
+    }
+
+    private fun projectSelectionSet(
+        source: QueryPlan.SelectionSet,
+        shape: KeyTree,
+        projectionType: GraphQLObjectType? = null,
+    ): FilteredSelectionSet {
+        val selections = mutableListOf<QueryPlan.Selection>()
+        val fieldsByType = shape.keysByType()
+
+        val concreteSourceType = projectionType ?: (source.parentType as? GraphQLObjectType)
+        if (concreteSourceType != null) {
+            check(fieldsByType.keys.all { it == concreteSourceType }) {
+                "Selection set on `${concreteSourceType.name}` cannot be projected to another concrete type"
+            }
+            val fields = fieldsByType[concreteSourceType]
+            if (fields != null) {
+                val branch = projectForType(source, concreteSourceType, fields)
+                selections += branch.selectionSet.selections
+            }
+        } else {
+            for ((concreteType, fields) in fieldsByType) {
+                val branch = projectForType(source, concreteType, fields)
+
+                val inlineAst = GJInlineFragment.newInlineFragment()
+                    .typeCondition(GJTypeName(concreteType.name))
+                    .build()
+                selections += QueryPlan.InlineFragment(
+                    selectionSet = branch.selectionSet,
+                    constraints = Constraints(emptyList(), listOf(concreteType)),
+                    inlineFragment = inlineAst,
+                )
+            }
+        }
+
+        return FilteredSelectionSet(
+            selectionSet = QueryPlan.SelectionSet(
+                parentType = concreteSourceType ?: source.parentType,
+                selections = selections,
+                enclosingVariableReferences = source.enclosingVariableReferences,
+                conditionallyExcludedCoordinates = source.conditionallyExcludedCoordinates,
+            ),
+        )
+    }
+
+    private fun projectForType(
+        selectionSet: QueryPlan.SelectionSet,
+        concreteType: GraphQLObjectType,
+        fields: Map<ObjectEngineResult.Key, KeyTree>,
+    ): FilteredSelectionSet {
+        val fieldSources = activeFieldSourcesByResponseKey(selectionSet, concreteType)
+        val collected = context.collectFields(
+            schema = context.schema,
+            selectionSet = selectionSet,
+            variables = context.variables,
+            parentType = concreteType,
+            fragments = sourcePlan.fragments,
+            fieldRssOriginFilteringKillSwitchEnabled = context.fieldRssOriginFilteringKillSwitchEnabled,
+            incrementalExecutionEnabled = context.incrementalExecutionEnabled,
+        )
+        val selections = mutableListOf<QueryPlan.Selection>()
+
+        for (field in collected.collectedFieldsMap.values) {
+            val resolvedField = field.resolveField(
+                schema = context.schema.schema,
+                parentType = concreteType,
+                variables = context.variables,
+                graphQLContext = context.graphQLContext,
+                locale = context.locale,
+            )
+            val childShape = fields[field.oerKey(resolvedField.arguments)] ?: continue
+            val childType =
+                GraphQLTypeUtil.unwrapAll(resolvedField.fieldDefinition.type)
+                    as? GraphQLCompositeType
+            require(childShape.isEmpty() || childType != null) {
+                "Field `${concreteType.name}.${field.fieldName}` has child selections but is not composite"
+            }
+            val sources = fieldSources.getValue(field.responseKey)
+            val projection = projectFieldOccurrences(
+                field = field,
+                sourceFields = sources,
+                concreteType = concreteType,
+                childShape = childShape,
+                childType = childType,
+            )
+            selections += projection.selectionSet.selections
+        }
+        // Every retained type branch must remain valid GraphQL, including branches whose
+        // selections were removed by runtime directives or resolver-boundary projection.
+        if (selections.isEmpty()) {
+            selections += emptyCompositeSelectionSet(concreteType).selections
+        }
+
+        return FilteredSelectionSet(
+            selectionSet = QueryPlan.SelectionSet(
+                parentType = concreteType,
+                selections = selections,
+                enclosingVariableReferences = selectionSet.enclosingVariableReferences,
+                conditionallyExcludedCoordinates = selectionSet.conditionallyExcludedCoordinates,
+            ),
+        )
+    }
+
+    private fun projectFieldOccurrences(
+        field: CollectedField,
+        sourceFields: List<QueryPlan.Field>,
+        concreteType: GraphQLObjectType,
+        childShape: KeyTree,
+        childType: GraphQLCompositeType?,
+    ): FilteredSelectionSet {
+        val selections = mutableListOf<QueryPlan.Selection>()
+
+        for (sourceField in sourceFields) {
+            val childProjection = if (childType == null) {
+                null
+            } else {
+                sourceField.selectionSet
+                    ?.let { projectSelectionSet(it, childShape) }
+                    ?.takeUnless {
+                        !childShape.isEmpty() && it.selectionSet.selections.isEmpty()
+                    }
+                    ?: continue
+            }
+            selections += sourceField.copy(
+                constraints = Constraints.Unconstrained.withDirectives(sourceField.field.directives),
+                selectionSet = childProjection?.selectionSet,
+                childPlans = field.childPlans,
+                fieldTypeChildPlans = field.fieldTypeChildPlans,
+                metadata = field.collectedFieldMetadata,
+            )
+        }
+
+        return FilteredSelectionSet(
+            selectionSet = QueryPlan.SelectionSet(concreteType, selections),
+        )
+    }
+
+    private fun emptyCompositeSelectionSet(type: GraphQLCompositeType): QueryPlan.SelectionSet {
+        val field = GJField.newField("__typename").build()
+        return QueryPlan.SelectionSet(
+            parentType = type,
+            selections =
+                listOf(
+                    QueryPlan.Field(
+                        resultKey = "__typename",
+                        constraints = Constraints.Unconstrained,
+                        field = field,
+                        selectionSet = null,
+                        childPlans = emptyList(),
+                        fieldTypeChildPlans = FieldTypeChildPlans.empty,
+                    )
+                ),
+        )
+    }
+
+    private fun activeFieldSourcesByResponseKey(
+        selectionSet: QueryPlan.SelectionSet,
+        concreteType: GraphQLObjectType,
+    ): Map<String, List<QueryPlan.Field>> {
+        val result = linkedMapOf<String, MutableList<QueryPlan.Field>>()
+        val pending = ArrayDeque(selectionSet.selections)
+        val visitedFragments = mutableSetOf<String>()
+        val constraintsCtx = Constraints.Ctx(context.variables, MaskedSet(listOf(concreteType)))
+
+        while (pending.isNotEmpty()) {
+            val selection = pending.removeFirst()
+            when (selection.constraints.solve(constraintsCtx)) {
+                Constraints.Resolution.Drop -> continue
+                Constraints.Resolution.Unsolved -> error("Could not project selection: $selection")
+                Constraints.Resolution.Collect -> Unit
+            }
+
+            when (selection) {
+                is QueryPlan.Field -> {
+                    val sources = result.getOrPut(selection.resultKey) { mutableListOf() }
+                    sources += selection
+                }
+                is QueryPlan.InlineFragment ->
+                    pending.addAll(0, selection.selectionSet.selections)
+                is QueryPlan.FragmentSpread -> {
+                    if (!visitedFragments.add(selection.name)) continue
+                    pending.addAll(
+                        0,
+                        sourcePlan.fragments.getValue(selection.name).selectionSet.selections,
+                    )
+                }
+            }
+        }
+
+        return result
+    }
+}
+
+private data class FilteredQueryPlan(
+    val selectionSet: QueryPlan.SelectionSet,
+    val activeVariableNames: Set<String>,
+)
+
+private class FilteredSelectionSet(
+    val selectionSet: QueryPlan.SelectionSet,
+)

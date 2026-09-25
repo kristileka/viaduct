@@ -2,10 +2,11 @@ package com.example.starwars.modules.universe.starships.resolvers
 
 import com.example.starwars.modules.universe.starships.models.StarshipBuilder
 import com.example.starwars.modules.universe.starships.models.StarshipsRepository
-import com.example.starwars.universe.NodeResolvers
+import com.example.starwars.universe.resolverbases.NodeResolvers
+import io.micronaut.context.annotation.Prototype
 import jakarta.inject.Inject
-import viaduct.api.Resolver
 import viaduct.api.grts.Starship
+import viaduct.api.resolver.Resolver
 
 /**
  * Node resolver for the Starship type in the Star Wars GraphQL API.
@@ -13,6 +14,7 @@ import viaduct.api.grts.Starship
  * This resolver handles fetching a Starship by its global ID.
  */
 @Resolver
+@Prototype
 class StarshipNodeResolver
     @Inject
     constructor(

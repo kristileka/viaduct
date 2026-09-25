@@ -1,9 +1,13 @@
 [versions]
-kotlin = "2.1.0"
-ksp = "2.1.0-1.0.29"
+kotlin = "2.1.20"
+ksp = "2.1.20-1.0.32"
 micronaut = "4.7.4"
 micronautCore = "4.7.4"
-kotest = "5.8.0"
+kotest = "6.1.4"
+junit5 = "5.11.3"
+junitPlatform = "1.11.3"
+graphql-java-extension = "24.0"
+coroutines = "1.5.2"
 
 [plugins]
 kotlinJvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
@@ -15,16 +19,26 @@ viaduct-module = { id = "com.airbnb.viaduct.module-gradle-plugin", version.ref =
 [libraries]
 # Common libraries
 kotlin-reflect = { group = "org.jetbrains.kotlin", name = "kotlin-reflect" }
-viaduct-serve = { group = "com.airbnb.viaduct", name = "serve", version.ref = "viaduct" }
+viaduct-api = { group = "com.airbnb.viaduct", name = "api", version.ref = "viaduct" }
+viaduct-runtime = { group = "com.airbnb.viaduct", name = "runtime", version.ref = "viaduct" }
+
+# Bring-your-own-version runtime deps that Viaduct's fat jars exclude — a runnable consumer must supply them.
+kotlinx-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "coroutines" }
+kotlinx-coroutines-jdk8 = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-jdk8", version.ref = "coroutines" }
+reactive-streams = { group = "org.reactivestreams", name = "reactive-streams", version = "1.0.4" }
 
 # Micronaut
 micronaut-inject = { module = "io.micronaut:micronaut-inject", version.ref = "micronautCore" }
 micronaut-inject-kotlin = { module = "io.micronaut:micronaut-inject-kotlin", version.ref = "micronautCore" }
 micronaut-context = { module = "io.micronaut:micronaut-context", version.ref = "micronautCore" }
 
+# GraphQL
+graphql-java-extended-scalars = { module = "com.graphql-java:graphql-java-extended-scalars", version.ref = "graphql-java-extension" }
+
 # Testing
-junit-platform-launcher = { group = "org.junit.platform", name = "junit-platform-launcher" }
+junit-bom = { group = "org.junit", name = "junit-bom", version.ref = "junit5" }
+junit-platform-launcher = { group = "org.junit.platform", name = "junit-platform-launcher", version.ref = "junitPlatform" }
 kotlin-test-junit = { group = "org.jetbrains.kotlin", name = "kotlin-test-junit", version.ref = "kotlin" }
-junit-jupiter = { group = "org.junit.jupiter", name = "junit-jupiter" }
+junit-jupiter = { group = "org.junit.jupiter", name = "junit-jupiter", version.ref = "junit5" }
 kotest-runner-junit = { group = "io.kotest", name = "kotest-runner-junit5", version.ref = "kotest" }
 kotest-assertions-core = { group = "io.kotest", name = "kotest-assertions-core", version.ref = "kotest" }

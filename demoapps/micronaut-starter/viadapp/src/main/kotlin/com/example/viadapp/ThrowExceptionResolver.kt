@@ -1,11 +1,11 @@
 package com.example.viadapp
 
 import com.example.viadapp.resolverbases.QueryResolvers
-import viaduct.api.Resolver
+import jakarta.inject.Singleton
+import viaduct.api.resolver.Resolver
 
 @Resolver
+@Singleton
 class ThrowExceptionResolver : QueryResolvers.ThrowException() {
-    override suspend fun resolve(ctx: Context): String {
-        error("This is a resolver error")
-    }
+    override suspend fun resolve(ctx: Context): Nothing = error("This is a resolver error")
 }

@@ -1,0 +1,430 @@
+package viaduct.engine.runtime
+
+import graphql.execution.instrumentation.Instrumentation
+import graphql.language.FragmentDefinition
+import graphql.schema.DataFetchingEnvironment
+import graphql.schema.GraphQLObjectType
+import graphql.util.FpKit
+import io.micrometer.core.instrument.MeterRegistry
+import java.util.concurrent.ConcurrentHashMap
+import java.util.function.Supplier
+import viaduct.engine.api.Caller
+import viaduct.engine.api.CompleteSelectionSetOptions
+import viaduct.engine.api.Engine
+import viaduct.engine.api.EngineExecutionContext
+import viaduct.engine.api.EngineObjectData
+import viaduct.engine.api.EngineSchema
+import viaduct.engine.api.EngineSelectionSet
+import viaduct.engine.api.ExecutionAttribution
+import viaduct.engine.api.RequiredSelectionSet
+import viaduct.engine.api.ResolutionPolicy
+import viaduct.engine.api.ResolveRootFieldReferenceOptions
+import viaduct.engine.api.ResolveSelectionSetOptions
+import viaduct.engine.api.ResolverType
+import viaduct.engine.api.RootFieldReference
+import viaduct.engine.api.SubqueryExecutionException
+import viaduct.engine.api.instrumentation.resolver.ResolverInstrumentationContext
+import viaduct.engine.api.spi.FieldResolverExecutor
+import viaduct.engine.api.spi.FieldSelectivityProvider
+import viaduct.engine.api.spi.MaterializedFieldValueReader
+import viaduct.engine.api.spi.NodeResolverExecutor
+import viaduct.engine.runtime.result.ObjectEngineResult
+import viaduct.engine.runtime.select.EngineSelectionSetFactoryImpl
+import viaduct.service.api.spi.ErrorReporter
+import viaduct.service.api.spi.FlagManager
+import viaduct.service.api.spi.GlobalIDCodec
+
+interface SelectionSetCompletionEngine {
+    suspend fun completeSelectionSet(
+        executionHandle: EngineExecutionContext.ExecutionHandle,
+        selectionSet: RequiredSelectionSet,
+        targetResult: ObjectEngineResult?,
+        arguments: Map<String, Any?>,
+        options: CompleteSelectionSetOptions,
+    ): graphql.ExecutionResult
+}
+
+/**
+ * Factory for creating an engine-execution context.
+ * Basically holds version-scoped state.
+ */
+class EngineExecutionContextFactory(
+    private val fullSchema: EngineSchema,
+    private val dispatcherRegistry: DispatcherRegistry,
+    private val resolverInstrumentation: Instrumentation,
+    private val flagManager: FlagManager,
+    private val engine: Engine,
+    private val globalIDCodec: GlobalIDCodec,
+    private val meterRegistry: MeterRegistry?,
+    fieldSelectivityProvider: FieldSelectivityProvider = FieldSelectivityProvider.Never,
+    private val resolverErrorReporter: ErrorReporter = ErrorReporter.NOOP,
+    private val materializedFieldValueReader: MaterializedFieldValueReader,
+) {
+    // Constructing this is expensive, so do it just once per schema-version
+    private val engineSelectionSetFactory: EngineSelectionSet.Factory = EngineSelectionSetFactoryImpl(fullSchema)
+    private val fieldSelectivity: IsResolverSelective =
+        IsResolverSelective.fromRegistry(dispatcherRegistry) or
+            IsResolverSelective(fieldSelectivityProvider::isSelective)
+    private val ownedSelectionProjector = ResolverSelectionProjector(fullSchema, dispatcherRegistry)
+
+    fun create(
+        scopedSchema: EngineSchema,
+        requestContext: Any?
+    ): EngineExecutionContext {
+        val isResolverSelective = fieldSelectivity
+
+        return EngineExecutionContextImpl(
+            fullSchema,
+            scopedSchema,
+            requestContext,
+            engineSelectionSetFactory,
+            dispatcherRegistry,
+            resolverInstrumentation,
+            ConcurrentHashMap<FieldDataLoaderKey, FieldDataLoader>(),
+            ConcurrentHashMap<String, NodeDataLoader>(),
+            flagManager.isEnabled(FlagManager.Flags.KILLSWITCH_FIELD_RSS_ORIGIN_FILTERING),
+            flagManager.isEnabled(FlagManager.Flags.ENABLE_MAT_RESOLUTION),
+            resolverErrorReporter,
+            flagManager.isEnabled(FlagManager.Flags.ENABLE_RESOLVER_OUTPUT_MISSING_FIELD_ERRORS),
+            engine,
+            globalIDCodec,
+            meterRegistry,
+            isResolverSelective,
+            ownedSelectionProjector,
+            materializedFieldValueReader,
+            incrementalExecutionEnabled = flagManager.isEnabled(FlagManager.Flags.ENABLE_INCREMENTAL_EXECUTION),
+        )
+    }
+}
+
+/**
+ * Runtime implementation of [EngineExecutionContext].
+ *
+ * This class holds all execution state and is copied as we traverse the execution tree.
+ * Each copy maintains references to shared request-scoped state (like [fieldDataLoaders])
+ * while allowing field-scoped state (like [fieldScopeSupplier]) to vary.
+ *
+ * ## Copying
+ *
+ * Use [EngineExecutionContextExtensions.copy] to create copies with modified field scope or DFE.
+ * Copies automatically preserve the [executionHandle], so there is no need to manually set it.
+ *
+ * ## Execution Handle
+ *
+ * The [_executionHandle] backing field is mutable internally but exposed as read-only
+ * via the [executionHandle] property. The handle is set eagerly when an
+ * [viaduct.engine.runtime.execution.ExecutionParameters] is created, ensuring that any subsequent
+ * copies preserve the correct handle.
+ *
+ * @see EngineExecutionContextFactory for creation
+ * @see EngineExecutionContextExtensions for extension functions
+ */
+class EngineExecutionContextImpl internal constructor(
+    override val fullSchema: EngineSchema,
+    override val scopedSchema: EngineSchema,
+    override val requestContext: Any?,
+    override val engineSelectionSetFactory: EngineSelectionSet.Factory,
+    val dispatcherRegistry: DispatcherRegistry,
+    val resolverInstrumentation: Instrumentation,
+    internal val fieldDataLoaders: ConcurrentHashMap<FieldDataLoaderKey, FieldDataLoader>,
+    internal val nodeDataLoaders: ConcurrentHashMap<String, NodeDataLoader>,
+    val fieldRssOriginFilteringKillSwitchEnabled: Boolean,
+    val matResolutionEnabled: Boolean,
+    val resolverOutputMissingFieldReporter: ErrorReporter,
+    val resolverOutputMissingFieldErrorsEnabled: Boolean,
+    override val engine: Engine,
+    override val globalIDCodec: GlobalIDCodec,
+    private val meterRegistry: MeterRegistry?,
+    val isResolverSelective: IsResolverSelective,
+    private val ownedSelectionProjector: ResolverSelectionProjector,
+    internal val materializedFieldValueReader: MaterializedFieldValueReader,
+    var dataFetchingEnvironment: DataFetchingEnvironment? = null,
+    override val activeSchema: EngineSchema = fullSchema,
+    internal val fieldScopeSupplier: Supplier<out EngineExecutionContext.FieldExecutionScope> = FpKit.intraThreadMemoize { FieldExecutionScopeImpl() },
+    executionHandle: EngineExecutionContext.ExecutionHandle? = null,
+    internal val matBatchDepth: Int = 0,
+    internal val currentResolver: Caller? = null,
+    val incrementalExecutionEnabled: Boolean = false,
+) : InternalEngineExecutionContext {
+    public override val impl: EngineExecutionContextImpl get() = this
+
+    companion object {
+        const val SUBQUERY_EXECUTION_METER_NAME = "viaduct.subquery.execution"
+    }
+
+    // Backing field for executionHandle - mutable internally, but exposed as val on interface
+    @Suppress("PropertyName")
+    internal var _executionHandle: EngineExecutionContext.ExecutionHandle? = executionHandle
+    override val executionHandle: EngineExecutionContext.ExecutionHandle?
+        get() = _executionHandle
+
+    /** Returns [executionHandle], or throws if called before execution started. */
+    private fun requireExecutionHandle(): EngineExecutionContext.ExecutionHandle =
+        executionHandle
+            ?: throw SubqueryExecutionException.invalidExecutionHandle()
+
+    override val fieldScope: EngineExecutionContext.FieldExecutionScope by lazy { fieldScopeSupplier.get() }
+
+    /**
+     * Implementation of [EngineExecutionContext.FieldExecutionScope] that holds field-scoped
+     * execution state.
+     *
+     * This is an immutable data class that gets replaced as we traverse into child plans during execution.
+     */
+    data class FieldExecutionScopeImpl(
+        override val fragments: Map<String, FragmentDefinition> = emptyMap(),
+        override val variables: Map<String, Any?> = emptyMap(),
+        override val resolutionPolicy: ResolutionPolicy = ResolutionPolicy.STANDARD,
+        override val attribution: ExecutionAttribution = ExecutionAttribution.DEFAULT,
+        override val caller: Caller? = null,
+    ) : EngineExecutionContext.FieldExecutionScope
+
+    override fun createNodeReference(
+        id: String,
+        graphQLObjectType: GraphQLObjectType
+    ) = NodeEngineObjectDataImpl(
+        id,
+        graphQLObjectType,
+        dispatcherRegistry,
+        currentResolver,
+    )
+
+    override fun createRootFieldReference(
+        rootFieldPath: List<String>,
+        type: GraphQLObjectType,
+        args: Map<String, Any?>,
+    ): RootFieldReference = ObjectRootFieldReference(rootFieldPath, type, args, currentResolver)
+
+    override fun hasModernNodeResolver(typeName: String): Boolean {
+        return dispatcherRegistry.getNodeResolverDispatcher(typeName) != null
+    }
+
+    override fun projectOwnedSelections(
+        selectionSet: EngineSelectionSet,
+        resolverType: ResolverType,
+    ): EngineSelectionSet = ownedSelectionProjector.project(selectionSet, resolverType)
+
+    override suspend fun resolveSelectionSet(
+        selectionSet: EngineSelectionSet,
+        options: ResolveSelectionSetOptions,
+    ): EngineObjectData.Sync = resolveSelectionSet(selectionSet, options, instrumentationContext = null)
+
+    /**
+     * Subquery materialization with an optional [ResolverInstrumentationContext].
+     *
+     * When [instrumentationContext] is non-null and [engine] implements
+     * [SubqueryInstrumentationEngine] (always true in production — `engine` is `EngineImpl`),
+     * per-selection fetch instrumentation fires for the resolved fields. Otherwise this falls back
+     * to the plain [Engine.resolveSelectionSet], so non-instrumented callers and test doubles are
+     * unaffected.
+     */
+    internal suspend fun resolveSelectionSet(
+        selectionSet: EngineSelectionSet,
+        options: ResolveSelectionSetOptions,
+        instrumentationContext: ResolverInstrumentationContext?,
+    ): EngineObjectData.Sync {
+        val handle = requireExecutionHandle()
+
+        val effectiveOptions = options.copy(attribution = fieldScope.attribution)
+
+        return executeWithMetrics {
+            val subqueryInstrumentationEngine = engine as? SubqueryInstrumentationEngine
+            if (instrumentationContext == null || subqueryInstrumentationEngine == null) {
+                engine.resolveSelectionSet(handle, selectionSet, effectiveOptions)
+            } else {
+                subqueryInstrumentationEngine.resolveSelectionSet(
+                    handle,
+                    selectionSet,
+                    effectiveOptions,
+                    instrumentationContext,
+                )
+            }
+        }
+    }
+
+    /**
+     * Resolves a root field reference within this context's active execution.
+     *
+     * This bridge preserves the current execution handle and field attribution while delegating
+     * engine-internal planning and field resolution to [Engine].
+     *
+     * @param caller the resolver that created the reference. The engine attributes the root field
+     *   to it, not to the resolver that awaits the reference.
+     */
+    internal suspend fun resolveRootFieldReference(
+        rootFieldPath: List<String>,
+        arguments: Map<String, Any?>,
+        selectionSet: EngineSelectionSet,
+        caller: Caller?,
+    ): EngineObjectData? {
+        val handle = requireExecutionHandle()
+
+        return executeWithMetrics {
+            engine.resolveRootFieldReference(
+                executionHandle = handle,
+                rootFieldPath = rootFieldPath,
+                arguments = arguments,
+                selectionSet = selectionSet,
+                options = ResolveRootFieldReferenceOptions(
+                    attribution = fieldScope.attribution,
+                    caller = caller,
+                ),
+            )
+        }
+    }
+
+    override suspend fun completeSelectionSet(
+        selectionSet: RequiredSelectionSet,
+        arguments: Map<String, Any?>,
+        options: CompleteSelectionSetOptions,
+    ): graphql.ExecutionResult {
+        return completeSelectionSet(selectionSet, null, arguments, options)
+    }
+
+    internal suspend fun completeSelectionSet(
+        selectionSet: RequiredSelectionSet,
+        targetResult: ObjectEngineResult?,
+        arguments: Map<String, Any?> = emptyMap(),
+        options: CompleteSelectionSetOptions = CompleteSelectionSetOptions.DEFAULT,
+    ): graphql.ExecutionResult {
+        val handle = requireExecutionHandle()
+        val completionEngine = engine as? SelectionSetCompletionEngine
+            ?: error("Expected SelectionSetCompletionEngine but got ${engine::class.qualifiedName}")
+        return completionEngine.completeSelectionSet(handle, selectionSet, targetResult, arguments, options)
+    }
+
+    private inline fun <T : EngineObjectData?> executeWithMetrics(block: () -> T): T {
+        return try {
+            block().also { incrementSubqueryExecutionCounter(success = true) }
+        } catch (e: Exception) {
+            incrementSubqueryExecutionCounter(success = false)
+            throw e
+        }
+    }
+
+    private fun incrementSubqueryExecutionCounter(success: Boolean) {
+        meterRegistry?.counter(
+            SUBQUERY_EXECUTION_METER_NAME,
+            "success",
+            success.toString()
+        )?.increment()
+    }
+
+    /**
+     * Gets the [FieldDataLoader] for the given field coordinate if it already exists, otherwise
+     * creates and returns a new one. The loader is request-scoped since it has the same
+     * lifecycle as the [EngineExecutionContext].
+     */
+    internal fun fieldDataLoader(resolver: FieldResolverExecutor): FieldDataLoader =
+        fieldDataLoaders.computeIfAbsent(FieldDataLoaderKey(resolver.resolverId, matBatchDepth)) {
+            FieldDataLoader(resolver)
+        }
+
+    /**
+     * Gets the [NodeDataLoader] for the given Node type if it already exists, otherwise
+     * creates and returns a new one. The loader is request-scoped since it has the same
+     * lifecycle as the [EngineExecutionContext].
+     */
+    internal fun nodeDataLoader(resolver: NodeResolverExecutor): NodeDataLoader =
+        nodeDataLoaders.computeIfAbsent(resolver.typeName) {
+            NodeDataLoader(resolver)
+        }
+
+    /**
+     * Returns true iff field coordinate has a tenant-defined resolver function.
+     */
+    fun hasResolver(
+        typeName: String,
+        fieldName: String
+    ): Boolean {
+        return dispatcherRegistry.getFieldResolverDispatcher(typeName, fieldName) != null
+    }
+
+    /**
+     * Internal copy with full control over all parameters.
+     * This is the single source of truth for copying.
+     *
+     * **Do not call directly** - use [EngineExecutionContextExtensions.copy] extension instead.
+     * This method is internal only because the extension needs access; it should be treated as private.
+     */
+    internal fun copy(
+        activeSchema: EngineSchema = this.activeSchema,
+        fieldScopeSupplier: Supplier<out EngineExecutionContext.FieldExecutionScope> = this.fieldScopeSupplier,
+        dataFetchingEnvironment: DataFetchingEnvironment? = this.dataFetchingEnvironment,
+        fieldRssOriginFilteringKillSwitchEnabled: Boolean = this.fieldRssOriginFilteringKillSwitchEnabled,
+        matResolutionEnabled: Boolean = this.matResolutionEnabled,
+        matBatchDepth: Int? = null,
+        executionHandle: EngineExecutionContext.ExecutionHandle? = this._executionHandle,
+        currentResolver: Caller? = this.currentResolver,
+    ): EngineExecutionContextImpl {
+        return EngineExecutionContextImpl(
+            fullSchema = this.fullSchema,
+            scopedSchema = this.scopedSchema,
+            requestContext = this.requestContext,
+            activeSchema = activeSchema,
+            engineSelectionSetFactory = this.engineSelectionSetFactory,
+            dispatcherRegistry = this.dispatcherRegistry,
+            resolverInstrumentation = this.resolverInstrumentation,
+            fieldDataLoaders = this.fieldDataLoaders,
+            nodeDataLoaders = this.nodeDataLoaders,
+            fieldRssOriginFilteringKillSwitchEnabled = fieldRssOriginFilteringKillSwitchEnabled,
+            matResolutionEnabled = matResolutionEnabled,
+            resolverOutputMissingFieldReporter = this.resolverOutputMissingFieldReporter,
+            resolverOutputMissingFieldErrorsEnabled = this.resolverOutputMissingFieldErrorsEnabled,
+            engine = this.engine,
+            globalIDCodec = this.globalIDCodec,
+            meterRegistry = this.meterRegistry,
+            isResolverSelective = this.isResolverSelective,
+            ownedSelectionProjector = this.ownedSelectionProjector,
+            materializedFieldValueReader = this.materializedFieldValueReader,
+            dataFetchingEnvironment = dataFetchingEnvironment,
+            fieldScopeSupplier = fieldScopeSupplier,
+            executionHandle = executionHandle,
+            matBatchDepth = matBatchDepth ?: this.matBatchDepth,
+            currentResolver = currentResolver,
+            incrementalExecutionEnabled = this.incrementalExecutionEnabled,
+        )
+    }
+
+    /**
+     * Forks mutable engine execution state for one temporary shadow field execution.
+     *
+     * Schemas, request context, registry, and instrumentation are shared. Data-loader maps start
+     * fresh; field scope, DFE, and a shadow-local execution handle are established by the shadow
+     * execution parameters.
+     */
+    internal fun forkForShadowExecution(): EngineExecutionContextImpl =
+        EngineExecutionContextImpl(
+            fullSchema = fullSchema,
+            scopedSchema = scopedSchema,
+            requestContext = requestContext,
+            activeSchema = activeSchema,
+            engineSelectionSetFactory = engineSelectionSetFactory,
+            dispatcherRegistry = dispatcherRegistry,
+            resolverInstrumentation = resolverInstrumentation,
+            fieldDataLoaders = ConcurrentHashMap(),
+            nodeDataLoaders = ConcurrentHashMap(),
+            fieldRssOriginFilteringKillSwitchEnabled = fieldRssOriginFilteringKillSwitchEnabled,
+            matResolutionEnabled = matResolutionEnabled,
+            resolverOutputMissingFieldReporter = resolverOutputMissingFieldReporter,
+            resolverOutputMissingFieldErrorsEnabled = resolverOutputMissingFieldErrorsEnabled,
+            engine = engine,
+            globalIDCodec = globalIDCodec,
+            meterRegistry = meterRegistry,
+            isResolverSelective = isResolverSelective,
+            ownedSelectionProjector = ownedSelectionProjector,
+            materializedFieldValueReader = materializedFieldValueReader,
+            matBatchDepth = 0,
+            incrementalExecutionEnabled = incrementalExecutionEnabled,
+        )
+}
+
+/**
+ * Identifies the field loader for one resolver and Mat depth within a request.
+ *
+ * Including the depth keeps a Mat re-run in a separate batch from the call waiting for it.
+ */
+internal data class FieldDataLoaderKey(
+    val resolverId: String,
+    val matBatchDepth: Int,
+)

@@ -3,30 +3,33 @@ package com.example.starwars.modules.filmography.films.resolvers
 import com.example.starwars.filmography.resolverbases.FilmResolvers
 import com.example.starwars.modules.filmography.characters.models.CharacterBuilder
 import com.example.starwars.modules.filmography.characters.models.CharacterRepository
-import com.example.starwars.modules.filmography.films.models.FilmCharactersRepository
+import com.example.starwars.modules.filmography.films.models.FilmCastData
+import io.micronaut.context.annotation.Prototype
 import jakarta.inject.Inject
-import viaduct.api.Resolver
 import viaduct.api.grts.Character
+import viaduct.api.resolver.Resolver
 
 /**
  * Example of a relationship field resolver in the Film type.
  *
- * This resolver fetches the list of main characters appearing in a film.
- *
- * @resolver("fragment _ on Film { id }"): Fragment syntax for accessing film ID
+ * Uses [FilmCastData] backing data resolved by [FilmCastDataResolver] so that
+ * the `findCharactersByFilmId` call is shared with [FilmCharacterCountSummaryResolver].
+ * When both `characters` and `characterCountSummary` are requested for the same film,
+ * the repository is called once instead of twice.
  */
-@Resolver("id")
+// tag::backing_data_consumer[15]
+@Resolver(objectValueFragment = "fragment _ on Film { castData }")
+@Prototype
 class FilmCharactersResolver
     @Inject
     constructor(
-        private val characterRepository: CharacterRepository,
-        private val filmCharactersRepository: FilmCharactersRepository
+        private val characterRepository: CharacterRepository
     ) : FilmResolvers.Characters() {
         override suspend fun resolve(ctx: Context): List<Character?>? {
-            val filmId = ctx.objectValue.getId().internalID
-
-            return filmCharactersRepository.findCharactersByFilmId(filmId).map {
-                val character = characterRepository.findById(it) ?: throw IllegalArgumentException("Character with ID $it not found")
+            val castData = ctx.getObjectValue().get<FilmCastData>("castData", FilmCastData::class)
+            return castData.characterIds.map { id ->
+                val character = characterRepository.findById(id)
+                    ?: throw IllegalArgumentException("Character with ID $id not found")
                 CharacterBuilder(ctx).build(character)
             }
         }

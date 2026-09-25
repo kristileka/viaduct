@@ -1,0 +1,585 @@
+@file:Suppress("DEPRECATION", "ForbiddenImport") // CoroutineInterop retained for Airbnb
+@file:OptIn(ExperimentalApi::class)
+
+package viaduct.engine.api.mocks
+
+import graphql.execution.AsyncExecutionStrategy
+import graphql.execution.ExecutionStrategy
+import graphql.execution.SimpleDataFetcherExceptionHandler
+import graphql.execution.instrumentation.ChainedInstrumentation
+import graphql.execution.instrumentation.Instrumentation
+import graphql.schema.GraphQLCompositeType
+import graphql.schema.GraphQLList
+import graphql.schema.GraphQLNonNull
+import graphql.schema.GraphQLObjectType
+import graphql.schema.GraphQLOutputType
+import graphql.schema.GraphQLType
+import graphql.schema.idl.RuntimeWiring
+import graphql.schema.idl.SchemaGenerator
+import graphql.schema.idl.SchemaParser
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.TestCoroutineScheduler
+import kotlinx.coroutines.test.TestDispatcher
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import viaduct.apiannotations.ExperimentalApi
+import viaduct.apiannotations.VisibleForTest
+import viaduct.dataloader.mocks.MockNextTickDispatcher
+import viaduct.engine.ViaductSchemaLoadException
+import viaduct.engine.ViaductWiringFactory
+import viaduct.engine.api.CheckerMetadata
+import viaduct.engine.api.CheckerResult
+import viaduct.engine.api.CheckerResultContext
+import viaduct.engine.api.Coordinate
+import viaduct.engine.api.EngineExecutionContext
+import viaduct.engine.api.EngineObjectData
+import viaduct.engine.api.EngineSchema
+import viaduct.engine.api.EngineSelectionSet
+import viaduct.engine.api.ExecutionAttribution
+import viaduct.engine.api.RequiredSelectionSet
+import viaduct.engine.api.ResolvedEngineObjectData
+import viaduct.engine.api.ResolverMetadata
+import viaduct.engine.api.VariablesResolver
+import viaduct.engine.api.select.SelectionsParser
+import viaduct.engine.api.spi.CheckerExecutor
+import viaduct.engine.api.spi.CheckerExecutorFactory
+import viaduct.engine.api.spi.CoroutineInterop
+import viaduct.engine.api.spi.FieldResolverExecutor
+import viaduct.engine.api.spi.NodeResolverExecutor
+import viaduct.engine.api.spi.ProxyResolverFactory
+import viaduct.engine.api.spi.VariableFromArgumentDefinitions
+import viaduct.engine.runtime.DispatcherRegistry
+import viaduct.engine.runtime.QueryPlanExecutionCondition
+import viaduct.engine.runtime.execution.DefaultCoroutineInterop
+import viaduct.engine.runtime.mocks.ContextMocks
+import viaduct.engine.runtime.mocks.createDispatcherRegistry
+import viaduct.engine.runtime.select.EngineSelectionSetFactoryImpl
+import viaduct.engine.runtime.select.EngineSelectionSetImpl
+import viaduct.engine.runtime.tenantloading.ExecutorValidatorContext
+import viaduct.engine.runtime.tenantloading.StandardDispatcherRegistryFactory
+import viaduct.engine.runtime.validation.Validator
+import viaduct.graphql.utils.DefaultSchemaFactory
+import viaduct.graphql.utils.ParsedSelections
+import viaduct.service.api.spi.CodeInjector
+import viaduct.service.api.spi.TenantModuleInjectorFactory
+
+typealias CheckerFn = suspend (arguments: Map<String, Any?>, objectDataMap: Map<String, EngineObjectData.Sync>) -> Unit
+typealias NodeBatchResolverFn = suspend (selectors: List<NodeResolverExecutor.Selector>, context: EngineExecutionContext) -> Map<NodeResolverExecutor.Selector, Result<EngineObjectData>>
+typealias NodeUnbatchedResolverFn = suspend (id: String, selections: EngineSelectionSet?, context: EngineExecutionContext) -> EngineObjectData
+typealias FieldUnbatchedResolverFn = suspend (
+    arguments: Map<String, Any?>,
+    objectValue: EngineObjectData.Sync,
+    queryValue: EngineObjectData.Sync,
+    selections: EngineSelectionSet?,
+    context: EngineExecutionContext
+) -> Any?
+
+typealias FieldBatchResolverFn = suspend (selectors: List<FieldResolverExecutor.Selector>, context: EngineExecutionContext) -> Map<FieldResolverExecutor.Selector, Result<Any?>>
+typealias VariablesResolverFn = suspend (ctx: VariablesResolver.ResolveCtx, context: EngineExecutionContext) -> Map<String, Any?>
+
+fun createCoroutineInterop(): CoroutineInterop = DefaultCoroutineInterop
+
+fun createExecutionStrategy(): ExecutionStrategy = AsyncExecutionStrategy(SimpleDataFetcherExceptionHandler())
+
+fun createInstrumentation(): Instrumentation = ChainedInstrumentation(listOf<Instrumentation>())
+
+fun EngineSelectionSet.variables() = this.variables
+
+fun createEngineSelectionSet(
+    parsedSelections: ParsedSelections,
+    viaductSchema: EngineSchema,
+    variables: Map<String, Any?>
+): EngineSelectionSet =
+    EngineSelectionSetImpl.create(
+        parsedSelections,
+        variables,
+        viaductSchema
+    )
+
+fun createEngineSelectionSetFactory(viaductSchema: EngineSchema) = EngineSelectionSetFactoryImpl(viaductSchema)
+
+fun createRSS(
+    typeName: String,
+    selectionString: String,
+    variableProviders: List<VariablesResolver> = emptyList(),
+    forChecker: Boolean = false,
+    attribution: ExecutionAttribution = ExecutionAttribution.DEFAULT,
+    executionCondition: QueryPlanExecutionCondition = QueryPlanExecutionCondition.ALWAYS_EXECUTE
+) = RequiredSelectionSet(SelectionsParser.parse(typeName, selectionString), variableProviders, forChecker, attribution, executionCondition)
+
+class MockVariablesResolver(
+    vararg names: String,
+    override val requiredSelectionSet: RequiredSelectionSet? = null,
+    val resolveFn: VariablesResolverFn,
+) : VariablesResolver {
+    override val variableNames: Set<String> = names.toSet()
+
+    override suspend fun resolve(
+        ctx: VariablesResolver.ResolveCtx,
+        context: EngineExecutionContext
+    ): Map<String, Any?> = resolveFn(ctx, context)
+}
+
+/**
+ * Create a [EngineSchema] with mock wiring, which allows for schema parsing and validation.
+ * This is useful for testing local changes that are unnecessary for a full engine execution,
+ * e.g., unit tests.
+ *
+ * @param sdl The SDL string to parse and create the schema.
+ */
+fun createSchema(sdl: String): EngineSchema {
+    val tdr = SchemaParser().parse(sdl).apply {
+        DefaultSchemaFactory.addDefaults(this)
+    }
+    return EngineSchema(SchemaGenerator().makeExecutableSchema(tdr, RuntimeWiring.MOCKED_WIRING))
+}
+
+/**
+ * Create a [EngineSchema] with actual wiring, which allows for real execution.
+ * This is useful for testing the actual engine behaviors, e.g., engine feature test.
+ *
+ * @param sdl The SDL string to parse and create the schema.
+ * @param allowExistingDefaultSchemaComponents Whether to allow schemas that already contain
+ *   Viaduct default schema components, such as generated compilation schemas.
+ * @param airbnbModeEnabled Whether to allow Airbnb-specific compatibility in default schema validation.
+ */
+fun createSchemaWithWiring(
+    sdl: String,
+    allowExistingDefaultSchemaComponents: Boolean = false,
+    airbnbModeEnabled: Boolean = false,
+): EngineSchema {
+    val tdr = SchemaParser().parse(sdl)
+    try {
+        DefaultSchemaFactory.addDefaults(
+            registry = tdr,
+            allowExisting = allowExistingDefaultSchemaComponents,
+            airbnbModeEnabled = airbnbModeEnabled,
+        )
+    } catch (e: Exception) {
+        throw ViaductSchemaLoadException(
+            "Failed to add default schema components.",
+            e
+        )
+    }
+    val actualWiringFactory = ViaductWiringFactory(DefaultCoroutineInterop)
+    val wiring = RuntimeWiring.newRuntimeWiring().wiringFactory(actualWiringFactory).apply {
+        DefaultSchemaFactory.defaultScalars().forEach { scalar(it) }
+    }.build()
+
+    // Let SchemaProblem and other GraphQL validation errors pass through
+    return EngineSchema(SchemaGenerator().makeExecutableSchema(tdr, wiring))
+}
+
+object MockSchema {
+    val minimal: EngineSchema = createSchema("extend type Query { empty: Int }")
+
+    fun mk(sdl: String) = createSchema(sdl)
+}
+
+open class MockFieldUnbatchedResolverExecutor(
+    override val objectSelectionSet: RequiredSelectionSet? = null,
+    override val querySelectionSet: RequiredSelectionSet? = null,
+    override val isSelective: Boolean = false,
+    val resolverName: String = "mock-field-unbatched-resolver",
+    override val argumentVariables: VariableFromArgumentDefinitions = VariableFromArgumentDefinitions.EMPTY,
+    override val resolverId: String,
+    open val unbatchedResolveFn: FieldUnbatchedResolverFn = { _, _, _, _, _ -> null }
+) : FieldResolverExecutor {
+    override val isBatching: Boolean = false
+    @OptIn(VisibleForTest::class)
+    override val metadata = ResolverMetadata.forMock(resolverName)
+
+    override suspend fun batchResolve(
+        selectors: List<FieldResolverExecutor.Selector>,
+        context: EngineExecutionContext
+    ): Map<FieldResolverExecutor.Selector, Result<Any?>> {
+        require(selectors.size == 1) { "Unbatched resolver should only receive single selector, got {}".format(selectors.size) }
+        val selector = selectors.first()
+        return mapOf(selector to runCatching { unbatchedResolveFn(selector.arguments, selector.syncObjectValueGetter(), selector.syncQueryValueGetter(), selector.selections, context) })
+    }
+
+    companion object {
+        /** a [FieldResolverExecutor] implementation that always returns `null` */
+        val Null: MockFieldUnbatchedResolverExecutor = MockFieldUnbatchedResolverExecutor(resolverId = "") { _, _, _, _, _ -> null }
+    }
+}
+
+open class MockFieldBatchResolverExecutor(
+    override val objectSelectionSet: RequiredSelectionSet? = null,
+    override val querySelectionSet: RequiredSelectionSet? = null,
+    override val isSelective: Boolean = false,
+    val resolverName: String = "mock-field-batch-resolver",
+    override val argumentVariables: VariableFromArgumentDefinitions = VariableFromArgumentDefinitions.EMPTY,
+    override val resolverId: String,
+    open val batchResolveFn: FieldBatchResolverFn = { _, _ -> throw NotImplementedError() }
+) : FieldResolverExecutor {
+    override val isBatching: Boolean = true
+    @OptIn(VisibleForTest::class)
+    override val metadata = ResolverMetadata.forMock(resolverName)
+
+    override suspend fun batchResolve(
+        selectors: List<FieldResolverExecutor.Selector>,
+        context: EngineExecutionContext
+    ): Map<FieldResolverExecutor.Selector, Result<Any?>> = batchResolveFn(selectors, context)
+}
+
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+private val testScheduler: TestCoroutineScheduler = TestCoroutineScheduler()
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+private val internalDispatcher: TestDispatcher = UnconfinedTestDispatcher(testScheduler)
+
+@OptIn(ExperimentalCoroutinesApi::class)
+fun FieldResolverExecutor.invoke(
+    fullSchema: EngineSchema,
+    coord: Coordinate,
+    arguments: Map<String, Any?> = emptyMap(),
+    objectValue: Map<String, Any?> = emptyMap(),
+    queryValue: Map<String, Any?> = emptyMap(),
+    selections: EngineSelectionSet? = null,
+    context: EngineExecutionContext = ContextMocks(fullSchema).engineExecutionContext,
+) = runBlocking(MockNextTickDispatcher(testScheduler, internalDispatcher)) {
+    val objectData = createEngineObjectData(fullSchema.schema.getObjectType(coord.first), objectValue)
+    val queryData = createEngineObjectData(fullSchema.schema.queryType, queryValue)
+    val selector = FieldResolverExecutor.Selector(
+        arguments = arguments,
+        selections = selections,
+        syncObjectValueGetter = { objectData },
+        syncQueryValueGetter = { queryData },
+    )
+    batchResolve(listOf(selector), context)[selector]?.getOrNull()
+}
+
+@OptIn(ExperimentalCoroutinesApi::class)
+fun CheckerExecutor.invoke(
+    fullSchema: EngineSchema,
+    coord: Coordinate,
+    arguments: Map<String, Any?> = emptyMap(),
+    objectDataMap: Map<String, Map<String, Any?>> = emptyMap(),
+    context: EngineExecutionContext = ContextMocks(fullSchema).engineExecutionContext,
+    checkerType: CheckerExecutor.CheckerType = CheckerExecutor.CheckerType.FIELD
+) = runBlocking(MockNextTickDispatcher(testScheduler, internalDispatcher)) {
+    val objectType = fullSchema.schema.getObjectType(coord.first)!!
+    val objectMap = objectDataMap.mapValues { (_, it) -> createEngineObjectData(objectType, it) }
+    execute(arguments, objectMap, context, checkerType)
+}
+
+class MockCheckerErrorResult(override val error: Exception) : CheckerResult.Error {
+    override fun isErrorForResolver(ctx: CheckerResultContext): Boolean {
+        return true
+    }
+
+    override fun combine(fieldResult: CheckerResult.Error): CheckerResult.Error {
+        return fieldResult
+    }
+}
+
+class MockCheckerExecutor(
+    override val requiredSelectionSets: Map<String, RequiredSelectionSet?> = emptyMap(),
+    override val checkerMetadata: CheckerMetadata? = null,
+    val executeFn: CheckerFn = { _, _ -> },
+) : CheckerExecutor {
+    override suspend fun execute(
+        arguments: Map<String, Any?>,
+        objectDataMap: Map<String, EngineObjectData.Sync>,
+        context: EngineExecutionContext,
+        checkerType: CheckerExecutor.CheckerType
+    ): CheckerResult {
+        try {
+            executeFn(arguments, objectDataMap)
+        } catch (e: Exception) {
+            return MockCheckerErrorResult(e)
+        }
+        return CheckerResult.Success
+    }
+}
+
+class MockNodeUnbatchedResolverExecutor(
+    override val typeName: String = "MockNode",
+    override val isSelective: Boolean = false,
+    val unbatchedResolveFn: NodeUnbatchedResolverFn = { _, _, _ -> throw NotImplementedError() }
+) : NodeResolverExecutor {
+    @OptIn(VisibleForTest::class)
+    override val metadata: ResolverMetadata = ResolverMetadata.forMock("Node:$typeName")
+    override val isBatching: Boolean = false
+
+    override suspend fun resolve(
+        selectors: List<NodeResolverExecutor.Selector>,
+        context: EngineExecutionContext
+    ): Map<NodeResolverExecutor.Selector, Result<EngineObjectData>> {
+        return selectors.associateWith { selector ->
+            try {
+                Result.success(unbatchedResolveFn(selector.id, selector.selections, context))
+            } catch (e: Exception) {
+                Result.failure(e)
+            }
+        }
+    }
+}
+
+class MockNodeBatchResolverExecutor(
+    override val typeName: String,
+    override val isSelective: Boolean = false,
+    val batchResolveFn: NodeBatchResolverFn = { _, _ -> throw NotImplementedError() }
+) : NodeResolverExecutor {
+    @OptIn(VisibleForTest::class)
+    override val metadata: ResolverMetadata = ResolverMetadata.forMock("Node:$typeName")
+    override val isBatching: Boolean = true
+
+    override suspend fun resolve(
+        selectors: List<NodeResolverExecutor.Selector>,
+        context: EngineExecutionContext
+    ): Map<NodeResolverExecutor.Selector, Result<EngineObjectData>> = batchResolveFn(selectors, context)
+}
+
+/** Each module gets its own tenant name so they bootstrap as distinct module configs. */
+fun List<MockTenantModuleBootstrapper>.toDispatcherRegistryFactory(
+    validator: Validator<ExecutorValidatorContext>,
+    checkerExecutorFactory: CheckerExecutorFactory,
+    proxyResolverFactory: ProxyResolverFactory = ProxyResolverFactory.NO_OP,
+): StandardDispatcherRegistryFactory {
+    val registriesByTenant =
+        mapIndexed { i, module ->
+            "test/tenant$i" to
+                MockExecutorRegistry(
+                    module.fieldResolverExecutors,
+                    module.nodeResolverExecutors,
+                )
+        }.toMap()
+    return StandardDispatcherRegistryFactory(
+        moduleConfigSources = registriesByTenant.map { (tenantName, registry) ->
+            mockModuleConfigSource(tenantName, registry)
+        },
+        tenantModuleInjectorFactory = object : TenantModuleInjectorFactory {
+            override suspend fun bootstrap(
+                tenantName: String,
+                tenantBootstrapClass: Class<*>?,
+            ): CodeInjector = MockExecutorCodeInjector(requireNotNull(registriesByTenant[tenantName]))
+        },
+        validator = validator,
+        checkerExecutorFactory = checkerExecutorFactory,
+        proxyResolverFactory = proxyResolverFactory,
+    )
+}
+
+/**
+ * A mock tenant module: a schema plus the resolver and checker executors registered against it.
+ *
+ * Holds the executors directly rather than implementing an engine SPI. Convert it to an
+ * [EngineTestModule] before handing them to the engine.
+ */
+class MockTenantModuleBootstrapper(
+    val fullSchema: EngineSchema,
+    val fieldResolverExecutors: Iterable<Pair<Coordinate, FieldResolverExecutor>> = emptyList(),
+    val nodeResolverExecutors: Iterable<Pair<String, NodeResolverExecutor>> = emptyList(),
+    val checkerExecutors: Map<Coordinate, CheckerExecutor> = emptyMap(),
+    val typeCheckerExecutors: Map<String, CheckerExecutor> = emptyMap(),
+) {
+    fun toEngineTestModule(): EngineTestModule =
+        EngineTestModule(
+            fullSchema = fullSchema,
+            fieldResolverExecutors = fieldResolverExecutors,
+            nodeResolverExecutors = nodeResolverExecutors,
+            checkerExecutors = checkerExecutors,
+            typeCheckerExecutors = typeCheckerExecutors,
+        )
+
+    fun resolverAt(coord: Coordinate) = fieldResolverExecutors.first { it.first == coord }.second
+
+    fun checkerAt(coord: Coordinate) = checkerExecutors[coord]
+
+    companion object {
+        /**
+         * Create a [MockTenantModuleBootstrapper] with the provided schema SDL.
+         * This will parse the SDL and create a [EngineSchema] with actual wiring.
+         */
+        operator fun invoke(
+            schemaSDL: String,
+            block: MockTenantModuleDSL<Unit>.() -> Unit
+        ) = invoke(createSchemaWithWiring(schemaSDL), block)
+
+        /**
+         * Create a [MockTenantModuleBootstrapper] with the provided [EngineSchema].
+         * The provided schema should already be built with actual wiring via `mkSchemaWithWiring`,
+         * not `mkSchema` with mock wiring.
+         */
+        operator fun invoke(
+            schemaWithWiring: EngineSchema,
+            block: MockTenantModuleDSL<Unit>.() -> Unit
+        ) = MockTenantModuleDSL(schemaWithWiring, Unit).apply { block() }.create()
+    }
+
+    fun resolveField(
+        coord: Coordinate,
+        arguments: Map<String, Any?> = emptyMap(),
+        objectValue: Map<String, Any?> = emptyMap(),
+        queryValue: Map<String, Any?> = emptyMap(),
+        selections: EngineSelectionSet? = null,
+        context: EngineExecutionContext = contextMocks.engineExecutionContext,
+    ) = resolverAt(coord).invoke(fullSchema, coord, arguments, objectValue, queryValue, selections, context)
+
+    fun checkField(
+        coord: Coordinate,
+        arguments: Map<String, Any?> = emptyMap(),
+        objectDataMap: Map<String, Map<String, Any?>> = emptyMap(),
+        context: EngineExecutionContext = contextMocks.engineExecutionContext,
+    ) = checkerAt(coord)!!.invoke(fullSchema, coord, arguments, objectDataMap, context)
+
+    fun toDispatcherRegistry(
+        checkerExecutors: Map<Coordinate, CheckerExecutor>? = null,
+        typeCheckerExecutors: Map<String, CheckerExecutor>? = null
+    ): DispatcherRegistry =
+        createDispatcherRegistry(
+            fieldResolverExecutors.toMap(),
+            nodeResolverExecutors.toMap(),
+            checkerExecutors ?: this.checkerExecutors,
+            typeCheckerExecutors ?: this.typeCheckerExecutors,
+        )
+
+    val contextMocks by lazy {
+        ContextMocks(
+            myFullSchema = fullSchema,
+            myDispatcherRegistry = this.toDispatcherRegistry(),
+        )
+    }
+}
+
+fun createEngineObjectData(
+    graphQLObjectType: GraphQLObjectType,
+    data: Map<String, Any?>,
+): ResolvedEngineObjectData {
+    fun cvt(
+        type: GraphQLType,
+        value: Any?
+    ): Any? =
+        @Suppress("UNCHECKED_CAST")
+        when (type) {
+            is GraphQLNonNull -> cvt(type.wrappedType as GraphQLOutputType, value)
+            is GraphQLList -> (value as List<*>?)?.map {
+                cvt(type.wrappedType as GraphQLOutputType, it)
+            }
+
+            is GraphQLObjectType -> when (value) {
+                is EngineObjectData -> value
+                is Map<*, *> -> createEngineObjectData(type, value as Map<String, Any?>)
+                null -> null
+                else -> throw IllegalArgumentException("don't know how to wrap object type $type with value $value (${value::class})")
+            }
+            is GraphQLCompositeType -> if (value is EngineObjectData) value else throw IllegalArgumentException("don't know how to wrap type $type with value $value")
+            else -> value
+        }
+
+    return ResolvedEngineObjectData
+        .Builder(graphQLObjectType)
+        .apply {
+            data.forEach { (fname, value) ->
+                val cvtValue = cvt(graphQLObjectType.getFieldDefinition(fname).type, value)
+                put(fname, cvtValue)
+            }
+        }.build()
+}
+
+class MockCheckerExecutorFactory(
+    val checkerExecutors: Map<Coordinate, CheckerExecutor>? = null,
+    val typeCheckerExecutors: Map<String, CheckerExecutor>? = null
+) : CheckerExecutorFactory {
+    override fun checkerExecutorForField(
+        schema: EngineSchema,
+        typeName: String,
+        fieldName: String
+    ): CheckerExecutor? {
+        return checkerExecutors?.get(Pair(typeName, fieldName))
+    }
+
+    override fun checkerExecutorForType(
+        schema: EngineSchema,
+        typeName: String
+    ): CheckerExecutor? {
+        return typeCheckerExecutors?.get(typeName)
+    }
+}
+
+object Samples {
+    val testSchema = createSchemaWithWiring(
+        """
+        extend type Query {
+            foo: String
+        }
+        type TestType {
+            aField: String
+            bIntField: Int
+            parameterizedField(experiment: Boolean): Boolean
+            cField(f1: String, f2: Int): String
+            dField: String
+            batchField: String
+        }
+        type TestNode implements Node { id: ID! }
+        type TestBatchNode implements Node { id: ID! }
+        """.trimIndent()
+    )
+
+    val mockTenantModule = MockTenantModuleBootstrapper(testSchema) {
+        // Add resolver for aField
+        fieldWithValue("TestType" to "aField", "aField")
+
+        // Add resolver for bIntField
+        fieldWithValue("TestType" to "bIntField", 42)
+
+        // Add resolver for parameterizedField with a required selection set
+        field("TestType" to "parameterizedField") {
+            resolver {
+                objectSelections("fragment _ on TestType { aField @include(if: \$experiment) bIntField }") {
+                    variables("experiment") { ctx, _ ->
+                        mapOf("experiment" to (ctx.arguments["experiment"] ?: false))
+                    }
+                }
+                fn { args, _, _, _, _ -> args["experiment"] as? Boolean ?: false }
+            }
+        }
+
+        // Add resolver for cField
+        fieldWithValue("TestType" to "cField", "cField")
+
+        // Add resolver for dField with variable provider
+        field("TestType" to "dField") {
+            resolver {
+                objectSelections("fragment _ on TestType { aField @include(if: \$experiment) bIntField }") {
+                    variables("experiment") { _, _ ->
+                        mapOf("experiment" to true)
+                    }
+                }
+                fn { _, _, _, _, _ -> "dField" }
+            }
+        }
+
+        // Add batch resolver for batchField
+        field("TestType" to "batchField") {
+            resolver {
+                fn { _, _ -> mapOf() }
+            }
+        }
+
+        // Add node resolver for TestNode
+        type("TestNode") {
+            nodeUnbatchedExecutor { id, _, _ ->
+                createEngineObjectData(
+                    testSchema.schema.getObjectType("TestNode"),
+                    mapOf("id" to id)
+                )
+            }
+        }
+
+        // Add a batch node resolver for TestBatchNode
+        type("TestBatchNode") {
+            nodeBatchedExecutor { selectors, _ ->
+                selectors.associateWith { selector ->
+                    Result.success(
+                        createEngineObjectData(
+                            testSchema.schema.getObjectType("TestBatchNode"),
+                            mapOf("id" to selector.id)
+                        )
+                    )
+                }
+            }
+        }
+    }
+}

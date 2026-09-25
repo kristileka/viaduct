@@ -1,0 +1,27 @@
+plugins {
+    `java-test-fixtures`
+    id("conventions.kotlin")
+    id("conventions.kotlin-static-analysis")
+}
+
+dependencies {
+    api(libs.graphql.java)
+
+    implementation(libs.viaduct.shared.utils)
+    implementation(libs.graphql.java.extension)
+    implementation(libs.slf4j.api)
+    implementation(libs.kotlin.reflect)
+
+    testFixturesApi(libs.graphql.java)
+
+    testFixturesCompileOnly(libs.junit)
+    testFixturesImplementation(libs.viaduct.service.api)
+    testFixturesImplementation(libs.jackson.core)
+    testFixturesImplementation(libs.jackson.databind)
+    testFixturesImplementation(libs.jackson.module)
+    testFixturesImplementation(libs.viaduct.shared.invariants)
+
+    testImplementation(libs.guava)
+    testImplementation(libs.io.mockk.jvm)
+    testImplementation(libs.kotest.assertions.core.jvm)
+}

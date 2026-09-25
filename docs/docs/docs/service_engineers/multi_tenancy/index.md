@@ -1,563 +1,253 @@
 ---
 title: Multi-tenancy
-description: Allowing multiple teams to deploy their own isolated GraphQL subschemas (tenants) within shared Viaduct infrastructure with independent resolvers.
+description: Structuring a Viaduct application so multiple tenant projects contribute schema partitions and resolvers to one composed schema.
 ---
 
-Viaduct's multi-tenant architecture allows multiple teams to independently develop and deploy their own GraphQL schemas (called **tenants**) within a shared Viaduct infrastructure. Each tenant owns its schema definitions and resolvers while contributing to a unified central schema.
+Viaduct multi-tenancy is a source and build structure for letting multiple teams contribute independently owned GraphQL schema partitions and resolver code to one Viaduct application.
 
-This guide explains how to use multiple build modules and configure tenants to serve portions of a central schema.
+A tenant is one Gradle project that applies the Viaduct module plugin. It contributes a schema partition and the resolver implementations for that partition. The settings topology declares the application project, tenant projects, and package layout. The application project applies the Viaduct application plugin and builds the `Viaduct` runtime that serves the composed schema.
 
-## What is a Tenant?
+This page is for service engineers setting up that source and build structure. For resolver authoring patterns, see the [Developers](../../developers/index.md) section. For a worked example, see the [Star Wars tutorial](../../../getting_started/starwars/index.md).
 
-A **tenant** is an isolated GraphQL subschema with its own:
+## The Two Viaduct Gradle Plugins
 
-- GraphQL SDL (schema) files defining types, queries, and mutations
-- Kotlin resolvers implementing the business logic
-- Independent deployment lifecycle
+A multi-tenant Viaduct application uses two Gradle plugins:
 
-Multiple tenants are composed together at build time to form the **central schema** that your Viaduct application exposes.
+- `com.airbnb.viaduct.application-gradle-plugin` marks the project that builds the `Viaduct` runtime. This is usually the host service project: the project with the HTTP server, dependency-injection setup, runtime configuration, observability, and deployment packaging.
+- `com.airbnb.viaduct.module-gradle-plugin` marks a project that contributes tenant code. A tenant project contains GraphQL SDL files and the Kotlin resolvers that implement that SDL.
 
-## Module Architecture
+The application plugin coordinates the application-level build, aggregating the results of module-level builds into the larger application. The module plugin handles the module-local build process.
 
-Viaduct organizes tenants into a hierarchical module structure. Understanding this hierarchy is essential for managing dependencies and schema composition.
+## Recommended Project Shape
 
-### Module Hierarchy Levels
+Use a Gradle multi-project build. One common shape is:
 
-1. **Module Roots**: Top-level organizational units (e.g., `data`, `entity`, `presentation`)
-2. **Sub-modules**: Groupings within a module root (e.g., `entity/listingblock`, `entity/userblock`)
-3. **Tenants**: Individual GraphQL schemas (e.g., `entity/listingblock/stays/listing`)
-
-### Example Structure
-
-```
-modules/
-├── entity/                          # Module root
-│   ├── common/                      # Sub-module (shared types)
-│   │   └── commontypes/             # Tenant
-│   │       ├── schema/
-│   │       └── src/main/kotlin/
-│   ├── listingblock/                # Sub-module
-│   │   └── stays/
-│   │       └── listing/             # Tenant
-│   │           ├── schema/
-│   │           └── src/main/kotlin/
-│   └── userblock/                   # Sub-module
-│       └── user/                    # Tenant
-│           ├── schema/
-│           └── src/main/kotlin/
-├── data/                            # Module root
-│   ├── payments/                    # Tenant
-│   └── orders/                      # Tenant
-└── presentation/                    # Module root
-    └── checkout/                    # Tenant
+```text
+settings.gradle.kts
+build.gradle.kts                         # application project
+common/build.gradle.kts                  # optional shared JVM code, not a Viaduct tenant
+tenants/catalog/build.gradle.kts         # tenant project
+tenants/orders/build.gradle.kts          # tenant project
+tenants/users/build.gradle.kts           # tenant project
 ```
 
-### Module Dependencies
+The exact directory names are your choice; `modules`, `tenants`, or domain-specific names are all fine as long as Gradle includes the projects and the Viaduct topology declares them. The application project applies `viaduct.application`. Tenant projects apply `viaduct.module`. Shared library projects do not apply either Viaduct plugin.
 
-Modules form a dependency graph that determines schema composition order. Common patterns include:
+## Settings Topology
 
-```
-presentation → data → entity → entity/common
-```
+Declare the Viaduct application and tenant modules in `settings.gradle.kts`:
 
-When you build a tenant, Viaduct automatically includes all schemas from ancestor modules. For example:
+```kotlin title="settings.gradle.kts"
+plugins {
+    id("com.airbnb.viaduct.settings-gradle-plugin")
+}
 
-- Building `presentation/checkout` includes schemas from: `presentation`, `data`, `entity`, and `entity/common`
-- Building `entity/listingblock/stays/listing` includes schemas from: `entity/listingblock`, `entity`, and `entity/common`
+includeViaductApplication {
+    project(":")
+    modulePackagePrefix("com.example.myservice")
 
-This dependency resolution ensures that:
-
-- Types defined in lower-level modules are available to higher-level modules
-- Schema composition happens in the correct order
-- Common types are shared across tenants
-
-## Tenant Directory Structure
-
-Each tenant follows a standard layout:
-
-```
-modules/<module>/<tenant>/
-├── build.gradle.kts                # Build configuration
-├── schema/
-│   └── src/main/resources/graphql/
-│       └── <domain>/<entity>/      # GraphQL schema files
-│           ├── Type1.graphqls
-│           ├── Type2.graphqls
-│           └── queries/
-│               └── AllType1Query.graphqls
-└── src/main/kotlin/
-    └── com/yourcompany/viaduct/<tenant>/
-        ├── loaders/                 # Data loading logic
-        └── resolvers/               # Resolver implementations
-```
-
-### Schema Files Location
-
-Schema files must be placed in:
-
-```
-schema/src/main/resources/graphql/<hierarchical-path>/
-```
-
-The hierarchical path typically mirrors your module structure:
-
-```
-schema/src/main/resources/graphql/entity/listingblock/stays/listing/
-├── Listing.graphqls
-├── StayDetails.graphqls
-└── queries/
-    └── AllListingsQuery.graphqls
-```
-
-This naming convention:
-
-- Ensures schema files are properly discovered during build
-- Prevents naming conflicts between modules
-- Organizes schemas by ownership and domain
-
-## Creating Multiple Tenants
-
-When creating new tenants, follow the standard directory structure and conventions outlined above. For detailed guidance on implementing resolvers, schemas, and build configuration, see the [Star Wars Tutorial](../../../getting_started/starwars/index.md), which provides comprehensive examples of:
-
-- Query resolvers, node resolvers, and field resolvers
-- Batch resolution patterns for efficient data loading
-- GraphQL schema design and type extensions
-- Build configuration with Gradle
-
-## Using Multiple Tenants to Serve a Central Schema
-
-### Schema Composition
-
-At build time, Viaduct merges all tenant schemas into a single **central schema**. The composition process:
-
-1. **Discovery**: Scans all tenant schema directories
-2. **Aggregation**: Collects all `.graphqls` files per module
-3. **Merging**: Combines types, respecting GraphQL type system rules
-4. **Validation**: Ensures the composed schema is valid
-5. **Code Generation**: Generates resolver base classes
-
-### Type Extensions Across Tenants
-
-Tenants can extend types defined in other tenants using GraphQL's `extend` keyword:
-
-```graphql title="modules/entity/listingblock/stays/listing/schema/.../Listing.graphqls"
-type Listing @scope(to: ["default"]) {
-  id: ID!
-  title: String!
+    includeModule {
+        project(":tenants:catalog")
+        modulePackageSuffix("catalog")
+    }
+    includeModule {
+        project(":tenants:orders")
+        modulePackageSuffix("orders")
+    }
+    includeModule {
+        project(":tenants:users")
+        modulePackageSuffix("users")
+    }
 }
 ```
 
-```graphql title="modules/entity/listingblock/stays/amenities/schema/.../ListingAmenities.graphqls"
-extend type Listing @scope(to: ["default"]) {
-  amenities: [Amenity!]!
-  hasWifi: Boolean!
+The application plugin uses this topology to wire module schema partitions and runtime dependencies. Module plugins use the same topology to find the owning application and generate code under the declared package layout.
+
+## Application Project
+
+The application project owns the runtime and should apply the application plugin:
+
+```kotlin title="build.gradle.kts"
+plugins {
+    alias(libs.plugins.kotlinJvm)
+    alias(libs.plugins.viaduct.application)
+}
+
+dependencies {
+    implementation(libs.viaduct.api)
+    implementation(libs.viaduct.runtime)
 }
 ```
 
-After composition, the central schema contains:
+The application project is also where service-engineering concerns usually live:
 
-```graphql
-type Listing @scope(to: ["default"]) {
-  id: ID!
-  title: String!
-  amenities: [Amenity!]!
-  hasWifi: Boolean!
+- constructing the `Viaduct` instance with `BasicViaductFactory` or `ViaductBuilder`
+- integrating with the web framework or message consumer
+- configuring dependency injection for resolver classes
+- configuring schema variants, observability, feature flags, and deployment packaging
+
+Tenant projects should normally be listed in the Viaduct settings topology rather than manually added as application project dependencies. The application plugin adds topology modules to the application runtime classpath so Viaduct can discover their generated metadata and resolver classes, while keeping tenant implementation code out of the application project's compilation classpath.
+
+## Tenant Projects
+
+Each tenant project applies the module plugin:
+
+```kotlin title="tenants/catalog/build.gradle.kts"
+plugins {
+    `java-library`
+    alias(libs.plugins.kotlinJvm)
+    alias(libs.plugins.ksp)
+    alias(libs.plugins.viaduct.module)
+}
+
+dependencies {
+    api(libs.viaduct.api)
+    implementation(libs.viaduct.runtime)
 }
 ```
+
+A tenant project usually contains:
+
+```text
+tenants/catalog/
+  build.gradle.kts
+  src/main/viaduct/schema/
+    Product.graphqls
+    Query.graphqls
+  src/main/kotlin/com/example/myservice/catalog/
+    ProductNodeResolver.kt
+    ProductSearchResolver.kt
+```
+
+The `src/main/viaduct/schema` directory is the convention the module plugin uses for tenant SDL. The Kotlin package should align with the settings topology `modulePackagePrefix` plus the tenant project's `modulePackageSuffix`.
 
 !!! warning
-    When extending types across tenants, ensure the extending tenant depends on the module containing the original type definition.
+    Viaduct validates topology package prefixes and suffixes as dotted identifier segments, but it does not reject every reserved word from every resolver implementation language. Service engineers should consider adding application-specific Gradle linting to ensure `modulePackagePrefix` and `modulePackageSuffix` values are valid package names for the languages their resolver teams use.
 
-### Shared Types and Common Modules
+For example, with `modulePackagePrefix("com.example.myservice")` on the application topology and `modulePackageSuffix("catalog")` on a tenant module, resolver implementations for that tenant should live under a package such as:
 
-For types used across multiple tenants, create a common module:
-
-```graphql title="modules/entity/common/commontypes/schema/.../CommonTypes.graphqls"
-type Address @scope(to: ["default"]) {
-  street: String!
-  city: String!
-  country: String!
-}
-
-type Money @scope(to: ["default"]) {
-  amount: BigDecimal!
-  currency: String!
-}
+```text
+com.example.myservice.catalog
 ```
 
-All tenants depending on `entity/common` can reference these types:
+## Central Schema Assembly
 
-```graphql title="modules/entity/userblock/user/schema/.../User.graphqls"
-type User @scope(to: ["default"]) {
+Each tenant contributes SDL files from its own `src/main/viaduct/schema` directory. During the application build, Viaduct assembles those schema partitions into one central schema.
+
+This central schema is the schema served by the application runtime. A type defined in one tenant can be referenced or extended by another tenant because all tenant schema partitions contribute to the same central schema.
+
+For example, one tenant can define a type:
+
+```graphql title="tenants/catalog/src/main/viaduct/schema/Product.graphqls"
+type Product @scope(to: ["default"]) {
   id: ID!
-  billingAddress: Address   # References common type
+  title: String!
 }
 ```
 
-## Using Scopes for Schema Visibility
+Another tenant can extend it:
 
-Scopes control which fields appear in different schemas. This allows serving **multiple schemas** from a single central definition.
-
-### Defining Scopes
-
-Annotate types and fields with `@scope` directives:
-
-```graphql
-type User @scope(to: ["public", "internal"]) {
-  id: ID!
-  name: String!
-}
-
-extend type User @scope(to: ["internal"]) {
-  email: String!
-  ipAddress: String!
-  internalNotes: String!
+```graphql title="tenants/orders/src/main/viaduct/schema/ProductOrderFields.graphqls"
+extend type Product @scope(to: ["default"]) {
+  recentOrders: [Order!]! @resolver
 }
 ```
 
-### Multiple Schema IDs
+This is schema composition, not Gradle dependency resolution. If tenant code needs to call Kotlin classes from another project, model that as a normal Gradle dependency. But GraphQL type visibility comes from central schema assembly, not from tenant-to-tenant Gradle dependencies.
 
-Configure your Viaduct application to expose multiple schemas:
+## Source Layout Choices
 
-```kotlin title="src/main/kotlin/.../ViaductConfiguration.kt"
-@Factory
-class ViaductConfiguration {
-    @Bean
-    fun providesViaduct(): Viaduct {
-        return BasicViaductFactory.create(
-            schemaRegistrationInfo = SchemaRegistrationInfo(
-                scopes = listOf(
-                    SchemaId.Scoped("public", setOf("public")).toSchemaScopeInfo(),
-                    SchemaId.Scoped("internal", setOf("public", "internal")).toSchemaScopeInfo(),
-                )
-            ),
-            tenantRegistrationInfo = TenantRegistrationInfo(
-                tenantPackagePrefix = "com.yourcompany.viaduct"
-            )
-        )
-    }
-}
+The service engineer should choose a layout that makes ownership and build behavior obvious. Good layouts usually have these properties:
+
+- Tenant projects are small enough that one team can own their schema and resolver code.
+- Shared JVM code lives in ordinary library projects, separate from tenant schema partitions.
+- Tenant project names and package suffixes are stable, because they shape generated code and resolver discovery.
+- The Viaduct settings topology lists every tenant served by the application.
+- The application project is the only place that owns runtime integration decisions.
+
+### Organizing Large Schemas by Domain
+
+For large schemas, use ordinary source layout and package naming to group tenants by domain or subdomain. The intermediate directories do not need to be Gradle projects; they can simply create a readable namespace.
+
+```text
+tenants/
+  finance/
+    accountspayable/
+    accountsreceivable/
 ```
 
-### Runtime Schema Selection
-
-Choose which schema to use per request:
+In that layout, the tenant modules might use settings-topology package suffixes such as:
 
 ```kotlin
-suspend fun graphql(
-    @Body request: Map<String, Any>,
-    @Header("X-Schema") schemaHeader: String?
-): HttpResponse<Map<String, Any>> {
+modulePackageSuffix("finance.accountspayable")
+```
 
-    val schemaId = when (schemaHeader) {
-        "internal" -> INTERNAL_SCHEMA_ID
-        else -> PUBLIC_SCHEMA_ID
+and:
+
+```kotlin
+modulePackageSuffix("finance.accountsreceivable")
+```
+
+This keeps generated code and resolver discovery aligned with the ownership structure without implying that every directory is a Gradle project.
+
+## What Belongs in Each Project
+
+Application project:
+
+- web server or message consumer entry point
+- `BasicViaductFactory` or `ViaductBuilder` configuration
+- dependency injection integration
+- schema scoping configuration
+- observability and error handling configuration
+
+Tenant project:
+
+- GraphQL SDL for one owned slice of the central schema
+- resolvers for fields declared by that tenant
+- tenant-local tests
+- tenant-specific data loaders or adapters when they are not shared elsewhere
+
+Shared library project:
+
+- domain models shared by multiple tenants
+- backend clients used by multiple tenants
+- framework-neutral utilities
+- no Viaduct plugin unless the project also contributes SDL and resolvers
+
+## Common Setup Mistakes
+
+### Tenant Project Not on the Runtime Classpath
+
+If a tenant project applies the module plugin but the application does not package its tenant metadata and resolver classes at runtime, first check that the tenant is declared in the settings topology:
+
+```kotlin
+includeViaductApplication {
+    project(":app")
+    modulePackagePrefix("com.example.app")
+
+    includeModule {
+        project(":tenants:catalog")
+        modulePackageSuffix("catalog")
     }
-
-    val executionInput = createExecutionInput(request)
-    val result = viaduct.executeAsync(executionInput, schemaId).await()
-
-    return HttpResponse.ok(result.toSpecification())
 }
 ```
 
-Requests using the "public" schema only see:
+The application plugin wires topology-declared tenant modules onto the runtime classpath. If runtime metadata is still missing, verify that the application and tenant plugins are applied to the projects named in settings, and inspect the application's runtime classpath rather than adding a manual `runtimeOnly(project(...))` edge.
 
-```graphql
-type User {
-  id: ID!
-  name: String!
-}
-```
+### Package Prefix and Suffix Do Not Line Up
 
-Requests using the "internal" schema see all fields:
+If resolvers are not found at runtime, check that the settings topology `modulePackagePrefix` and each tenant project's `modulePackageSuffix` match the Kotlin packages where resolver classes are compiled.
 
-```graphql
-type User {
-  id: ID!
-  name: String!
-  email: String!
-  ipAddress: String!
-  internalNotes: String!
-}
-```
+### Treating Tenant Schema Composition as a Gradle Dependency Graph
 
-### Use Cases for Multiple Schemas
+Tenant projects build independently as Gradle projects. Viaduct assembles their schema partitions into the central schema at the application level. Do not document tenant-to-tenant GraphQL relationships as Gradle dependency resolution.
 
-**External vs Internal APIs**
-
-```graphql
-type Product @scope(to: ["public", "internal"]) {
-  id: ID!
-  name: String!
-  price: Money!
-}
-
-extend type Product @scope(to: ["internal"]) {
-  costBasis: Money!
-  profitMargin: Float!
-  inventoryCount: Int!
-}
-```
-
-**Feature Flags and Gradual Rollout**
-
-```graphql
-type Feature @scope(to: ["default", "beta"]) {
-  id: ID!
-  name: String!
-}
-
-extend type Feature @scope(to: ["beta"]) {
-  experimentalSettings: ExperimentalSettings!
-}
-```
-
-**Multi-Tenant SaaS Applications**
-
-```graphql
-type Dashboard @scope(to: ["enterprise", "pro", "free"]) {
-  basicMetrics: [Metric!]!
-}
-
-extend type Dashboard @scope(to: ["enterprise", "pro"]) {
-  advancedAnalytics: Analytics!
-}
-
-extend type Dashboard @scope(to: ["enterprise"]) {
-  customReports: [Report!]!
-  apiAccess: APICredentials!
-}
-```
-
-## Practical Example: Multi-Tenant E-Commerce
-
-Let's build a multi-tenant schema for an e-commerce platform with separate teams owning different domains.
-
-### Module Structure
-
-```
-modules/
-├── entity/
-│   ├── common/              # Shared types
-│   ├── productblock/        # Product catalog team
-│   ├── userblock/           # User management team
-│   └── orderblock/          # Order processing team
-├── data/                    # Data access layer
-│   ├── payments/            # Payment service integration
-│   └── inventory/           # Inventory service integration
-└── presentation/            # API facade
-    └── storefront/          # Customer-facing API
-```
-
-### Common Types (Entity Layer)
-
-```graphql title="modules/entity/common/commontypes/schema/.../CommonTypes.graphqls"
-type Money @scope(to: ["public", "internal"]) {
-  amount: BigDecimal!
-  currency: String!
-}
-
-type Address @scope(to: ["public", "internal"]) {
-  street: String!
-  city: String!
-  postalCode: String!
-  country: String!
-}
-```
-
-### Product Tenant
-
-```graphql title="modules/entity/productblock/catalog/schema/.../Product.graphqls"
-type Product @scope(to: ["public", "internal"]) {
-  id: ID!
-  name: String!
-  description: String!
-  price: Money!
-  images: [String!]!
-}
-
-extend type Product @scope(to: ["internal"]) {
-  costBasis: Money!
-  supplierInfo: String!
-  profitMargin: Float!
-}
-
-type Query @scope(to: ["public", "internal"]) {
-  product(id: ID!): Product
-  searchProducts(query: String!): [Product!]!
-}
-```
-
-### User Tenant
-
-```graphql title="modules/entity/userblock/user/schema/.../User.graphqls"
-type User @scope(to: ["public", "internal"]) {
-  id: ID!
-  name: String!
-}
-
-extend type User @scope(to: ["internal"]) {
-  email: String!
-  registeredAt: DateTime!
-  lastLogin: DateTime
-}
-```
-
-### Order Tenant
-
-```graphql title="modules/entity/orderblock/order/schema/.../Order.graphqls"
-type Order @scope(to: ["public", "internal"]) {
-  id: ID!
-  orderNumber: String!
-  customer: User!
-  items: [OrderItem!]!
-  total: Money!
-  status: OrderStatus!
-}
-
-type OrderItem @scope(to: ["public", "internal"]) {
-  product: Product!
-  quantity: Int!
-  price: Money!
-}
-
-enum OrderStatus @scope(to: ["public", "internal"]) {
-  PENDING
-  CONFIRMED
-  SHIPPED
-  DELIVERED
-  CANCELLED
-}
-
-extend type User @scope(to: ["public", "internal"]) {
-  orders: [Order!]!
-}
-
-type Query @scope(to: ["public", "internal"]) {
-  order(id: ID!): Order
-}
-
-type Mutation @scope(to: ["public"]) {
-  createOrder(input: CreateOrderInput!): Order!
-  cancelOrder(orderId: ID!): Order!
-}
-```
-
-### Presentation Layer
-
-The presentation layer can aggregate and reshape data from entity and data layers:
-
-```graphql title="modules/presentation/storefront/schema/.../Storefront.graphqls"
-type StorefrontData @scope(to: ["public"]) {
-  featuredProducts: [Product!]!
-  categories: [Category!]!
-  userRecommendations(userId: ID!): [Product!]!
-}
-
-extend type Query @scope(to: ["public"]) {
-  storefront: StorefrontData!
-}
-```
-
-### Composed Central Schema
-
-After composition, the central schema for the "public" scope includes:
-
-- All types from all tenants with `@scope(to: ["public"])`
-- Type extensions merged into base types
-- Fields from the `Order` tenant extending the `User` type
-
-Clients querying the public API can traverse the entire graph:
-
-```graphql
-query CustomerOrders {
-  user(id: "123") {
-    name
-    orders {
-      orderNumber
-      total {
-        amount
-        currency
-      }
-      items {
-        product {
-          name
-          price {
-            amount
-          }
-        }
-        quantity
-      }
-    }
-  }
-}
-```
-
-## Best Practices
-
-### Module Organization
-
-1. **Domain-Driven Design**: Organize tenants by business domain, not technical layers
-2. **Shared Types**: Place common types in `entity/common` or similar base modules
-3. **Minimize Dependencies**: Only depend on modules you actually need
-4. **Clear Ownership**: Each tenant should have a single owning team
-
-### Schema Design
-
-1. **Use Type Extensions**: Extend types across tenant boundaries rather than duplicating
-2. **Scope Consistently**: Apply scopes to all types—there is no default scope
-3. **Hierarchical Naming**: Use paths that reflect module hierarchy in schema file locations
-4. **Avoid Circular Dependencies**: Structure modules as a directed acyclic graph (DAG)
-
-### Resolvers
-
-1. **Package Conventions**: Follow consistent package naming across tenants
-2. **Thin Resolvers**: Delegate business logic to service/loader classes
-3. **Batch Loading**: Use data loaders to avoid N+1 queries
-4. **Error Handling**: Use consistent error patterns across tenants
-
-### Testing
-
-1. **Per-Tenant Tests**: Write unit tests for each tenant's resolvers
-2. **Integration Tests**: Test schema composition and cross-tenant queries
-3. **Scope Validation**: Verify fields appear only in intended schemas
-
-## Troubleshooting
-
-### Schema Composition Errors
-
-**Problem**: Build fails with "Unable to find concrete type for interface"
-
-**Solution**: The interface is defined in module A, but the implementing type is in module B, and B doesn't depend on A. Either move the interface to a common ancestor module or add a dependency from B to A.
-
-**Problem**: Type extensions don't appear in the schema
-
-**Solution**: Ensure the extending tenant's module depends on the module containing the base type.
-
-### Scope Issues
-
-**Problem**: Fields are missing from the schema
-
-**Solution**: Check that types and fields have the correct `@scope` annotations. Remember that fields in type extensions must use scopes that are subsets of the base type's scopes.
-
-**Problem**: "Invalid scope usage within a type" error
-
-**Solution**: Type extensions can only use scopes that were declared on the base type definition. Add the scope to the base type's `@scope` directive.
-
-### Runtime Errors
-
-**Problem**: Resolver not found at runtime
-
-**Solution**: Ensure:
-
-- Resolver class is annotated with `@Resolver`
-- Resolver package is under the configured `tenantPackagePrefix`
-- The tenant's `build.gradle.kts` includes the Viaduct tenant plugin
+Use normal Gradle dependencies only for ordinary Kotlin/JVM code dependencies.
 
 ## See Also
 
-- [Developers: Scopes](../../developers/scopes/index.md) — Detailed scope usage and validation rules
-- [Developers: Resolvers](../../developers/resolvers/index.md) — Writing resolver implementations
-- [Getting Started: Tour](../../../getting_started/tour/index.md) — Understanding Viaduct project structure
-- [Schema Extensions](../schema_extensions/index.md) — Application-wide custom directives and types
+- [Getting Started: Gradle wiring](../../../getting_started/index.md#plugins-intro)
+- [Star Wars Architecture: Tenants](../../../getting_started/starwars/architecture/tenants.md)
+- [Server Integration](../server_integration/index.md)
+- [Developers: Scopes](../../developers/scopes/index.md)
+- [Dependency Injection](../dependency_injection/index.md)

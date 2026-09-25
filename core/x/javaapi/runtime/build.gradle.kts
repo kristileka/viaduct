@@ -1,0 +1,80 @@
+plugins {
+    id("conventions.kotlin")
+    id("conventions.kotlin-static-analysis")
+    id("feature-app-contracts")
+    id("feature-app-contract-tests")
+    `java-test-fixtures`
+}
+
+viaductFeatureAppContracts {
+    java {
+        contractsFrom(":tenant:runtime")
+        contractsFrom(":tenant:tutorials")
+        contractsFrom(":x:javaapi:runtime")
+    }
+}
+
+tasks.named<Sync>("mergeJavaContractSchemas") {
+    // Java contract implementations return complete values when reusing Kotlin fixture schemas.
+    filter { line -> line.replace("isSelective: true", "isSelective: false") }
+}
+
+description = "Java Tenant API runtime implementation - bridges Java API to Kotlin engine"
+
+dependencies {
+    // Java API that this runtime implements
+    api(project(":x:javaapi:api"))
+
+    // Viaduct engine API (Kotlin)
+    api(libs.viaduct.engine.api)
+    implementation(libs.viaduct.shared.bootstrap)
+
+    // Viaduct service API (for CodeInjector)
+    api(libs.viaduct.service.api)
+
+    // Kotlin tenant API (for InputTypeFactory)
+    implementation(libs.viaduct.tenant.api)
+
+    // Kotlin coroutines for async bridging
+    implementation(libs.kotlinx.coroutines.core)
+    implementation(libs.kotlinx.coroutines.jdk8) // For CompletableFuture integration
+
+    // javax.inject for Provider interface
+    implementation(libs.javax.inject)
+
+    // Logging
+    implementation(libs.slf4j.api)
+
+    // GraphQL schema types
+    implementation(libs.graphql.java)
+
+    // Assembled named-fragment configuration
+    implementation(libs.jackson.databind)
+
+    // Shared GraphQL utils (for collectVariableReferences extension)
+    implementation(libs.viaduct.shared.graphql)
+
+    // Shared tenant support (InputValueNormalizerCore)
+    implementation(libs.viaduct.tenant.shared)
+
+    // Testing
+    testImplementation(libs.assertj.core)
+    testImplementation(libs.kotest.assertions.core.jvm)
+    testImplementation(libs.io.mockk.jvm)
+    testImplementation(libs.kotlinx.coroutines.test)
+    testImplementation(libs.viaduct.engine.runtime)
+    testImplementation(libs.viaduct.engine.wiring)
+    testImplementation(testFixtures(libs.viaduct.engine.api))
+    testImplementation(testFixtures(libs.viaduct.shared.graphql))
+    testImplementation(testFixtures(project(":x:javaapi:api")))
+    testImplementation(libs.graphql.java)
+
+    // Dependencies for JavaFeatureAppTestContractBase
+    testImplementation(libs.viaduct.service.runtime)
+    testImplementation(libs.viaduct.service.wiring)
+    testImplementation(testFixtures(libs.viaduct.service.api))
+    testImplementation(testFixtures(libs.viaduct.tenant.runtime))
+    testFixturesImplementation(testFixtures(project(":x:javaapi:api")))
+    testFixturesImplementation(testFixtures(libs.viaduct.tenant.api))
+    testFixturesImplementation(testFixtures(libs.viaduct.tenant.runtime))
+}

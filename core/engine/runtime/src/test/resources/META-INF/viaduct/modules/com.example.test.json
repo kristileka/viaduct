@@ -1,0 +1,8 @@
+{
+  "version" : "1",
+  "tenantName" : "test",
+  "apiName" : "kotlin",
+  "executorFactory" : "viaduct.engine.runtime.tenantloading.TestExecutorFactory",
+  "nodes" : [ ],
+  "fields" : [ ]
+}

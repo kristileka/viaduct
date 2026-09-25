@@ -1,0 +1,362 @@
+package viaduct.engine.runtime.execution
+
+import graphql.execution.MergedField
+import graphql.language.AstPrinter
+import graphql.language.Field as GJField
+import graphql.language.FragmentDefinition as GJFragmentDefinition
+import graphql.language.FragmentSpread as GJFragmentSpread
+import graphql.language.InlineFragment as GJInlineFragment
+import graphql.language.Selection as GJSelection
+import graphql.language.SelectionSet as GJSelectionSet
+import graphql.language.VariableDefinition
+import graphql.schema.GraphQLCompositeType
+import graphql.schema.GraphQLObjectType
+import graphql.schema.GraphQLSchema
+import viaduct.engine.api.Coordinate
+import viaduct.engine.api.EngineSchema
+import viaduct.engine.api.ExecutionAttribution
+import viaduct.engine.api.RequiredSelectionSet
+import viaduct.engine.api.VariablesResolver
+import viaduct.engine.runtime.DispatcherRegistry
+import viaduct.engine.runtime.QueryPlanExecutionCondition
+import viaduct.engine.runtime.QueryPlanExecutionCondition.Companion.ALWAYS_EXECUTE
+import viaduct.engine.runtime.RequiredSelectionSetRegistry
+import viaduct.engine.runtime.execution.constraints.Constraints
+
+/**
+ * QueryPlan is an intermediate representation of a GraphQL selection set.
+ * It includes models of viaduct-specific concepts, including required selection sets
+ * and their variables.
+ *
+ * @property selectionSet The selections for this plan level.
+ * @property fragments Named fragment definitions available during plan execution.
+ * @property variablesResolvers Resolvers that produce variable values at execution time.
+ * @property childPlanIds RequiredSelectionSet plans resolved before any selections in this plan.
+ * @property baseIndex Index over this plan's eager child plans. [index] adds this plan itself.
+ * @property attribution Execution attribution for tracing and instrumentation.
+ * @property executionCondition Condition that controls whether this plan executes at runtime.
+ * @property variableDefinitions Pre-computed variable definitions for this plan.
+ * @property requiredSelectionSetId The id of the RequiredSelectionSet instance that produced this child plan.
+ */
+data class QueryPlan(
+    val selectionSet: SelectionSet,
+    val fragments: Fragments,
+    val variablesResolvers: List<VariablesResolver>,
+    val childPlanIds: List<RequiredSelectionSet.Id>,
+    private val baseIndex: QueryPlanIndex,
+    val attribution: ExecutionAttribution? = ExecutionAttribution.DEFAULT,
+    val executionCondition: QueryPlanExecutionCondition,
+    val variableDefinitions: List<VariableDefinition>,
+    val requiredSelectionSetId: RequiredSelectionSet.Id? = null,
+) {
+    /** The GraphQL type that owns the fields in this plan. */
+    val parentType: GraphQLCompositeType get() = selectionSet.parentType
+
+    /** Index over this plan and its eager child plans. */
+    val index: QueryPlanIndex =
+        if (requiredSelectionSetId == null) {
+            baseIndex
+        } else {
+            Index.Builder<RequiredSelectionSet.Id, QueryPlan>()
+                .add(baseIndex)
+                .add(requiredSelectionSetId, this)
+                .build()
+        }
+
+    /**
+     * Configuration for building a QueryPlan.
+     *
+     * @property query The query text used as part of the cache key. For top-level operations
+     *   this is the client's query string. For [buildFromSelections] and [buildFromParsedSelections],
+     *   this is computed internally from the selection set — callers can omit it.
+     * @property schema GraphQL schema used for type verification and field resolution.
+     * @property registry Registry for looking up RequiredSelectionSets declared by resolvers and checkers.
+     * @property dispatcherRegistry Registry for looking up resolver and checker dispatchers.
+     * @property executionCondition Condition under which QueryPlans built with these parameters
+     *   should execute at runtime. Defaults to always execute.
+     */
+    data class Parameters(
+        val query: String = "",
+        val schema: EngineSchema,
+        val registry: RequiredSelectionSetRegistry,
+        val dispatcherRegistry: DispatcherRegistry = DispatcherRegistry.Empty,
+        val executionCondition: QueryPlanExecutionCondition = ALWAYS_EXECUTE
+    )
+
+    /**
+     * A variable reference found while building the query plan.
+     *
+     * Query planning records where each variable was referenced so runtime code can answer
+     * narrower questions without rewalking the graphql-java AST. For example, [CollectFields]
+     * only cares about variables used by conditional directives, while child-plan construction
+     * also needs variables used in field arguments and other directives.
+     */
+    data class SelectionVariableReference(
+        val name: String,
+        val kind: Kind
+    ) {
+        enum class Kind {
+            FIELD_ARGUMENT,
+            CONDITIONAL_DIRECTIVE,
+            DIRECTIVE
+        }
+    }
+
+    /**
+     * A Selection models any kind of element that may appear in a QueryPlan SelectionSet.
+     *
+     * Selection comes in the same flavors as graphql-java's [graphql.language.Selection].
+     */
+    sealed interface Selection {
+        val constraints: Constraints
+        val variableReferences: List<SelectionVariableReference> get() = emptyList()
+    }
+
+    /**
+     * [Selection] also has representations similar to graphql-java's [graphql.language.Selection] classes.
+     *
+     * These selections have not been collected yet and may be subject to [Constraints]
+     * that determine if/how they get collected.
+     *
+     * @param fieldTypeChildPlans Builds child plans for the resolved concrete field type on demand. Across executions
+     *  of a single operation, polymorphic fields typically resolve to a small subset of possible concrete types.
+     */
+    data class Field(
+        val resultKey: String,
+        override val constraints: Constraints,
+        val field: GJField,
+        val selectionSet: SelectionSet?,
+        val childPlans: List<FieldChildPlan>,
+        val fieldTypeChildPlans: FieldTypeChildPlans,
+        val metadata: FieldMetadata? = FieldMetadata.empty,
+        override val variableReferences: List<SelectionVariableReference> = emptyList(),
+    ) : Selection {
+        override fun toString(): String = AstPrinter.printAst(field)
+    }
+
+    data class FragmentSpread(
+        val name: String,
+        override val constraints: Constraints,
+        override val variableReferences: List<SelectionVariableReference> = emptyList(),
+        val fragmentSpread: GJFragmentSpread? = null,
+    ) : Selection
+
+    data class InlineFragment(
+        val selectionSet: SelectionSet,
+        override val constraints: Constraints,
+        override val variableReferences: List<SelectionVariableReference> = emptyList(),
+        val inlineFragment: GJInlineFragment? = null,
+    ) : Selection
+
+    /**
+     * Planned fragment definition.
+     *
+     * @property index Index over child plans reachable from this fragment definition body.
+     *   Spread-site directive variable plans are not included here because they are specific to
+     *   each fragment spread.
+     */
+    data class FragmentDefinition(
+        val selectionSet: SelectionSet,
+        val gjDef: GJFragmentDefinition,
+        val childPlanIds: List<RequiredSelectionSet.Id>,
+        val variableReferences: List<SelectionVariableReference> = emptyList(),
+        val index: QueryPlanIndex,
+    )
+
+    data class Fragments(
+        val map: Map<String, FragmentDefinition>,
+        /**
+         * Original source fragments for this plan. GJ AST-backed tenant selection sets, such as
+         * EngineSelectionSetImpl, need it because [map] omits fragments pruned during planning and
+         * client and RSS plans may reuse fragment names. It can be removed once all tenant selection
+         * sets use [ExecutionSelectionSet].
+         */
+        val source: Map<String, GJFragmentDefinition> = map.mapValues { it.value.gjDef },
+    ) : Map<String, FragmentDefinition> by map {
+        operator fun plus(other: Fragments): Fragments =
+            copy(
+                map = map + other.map,
+                source = source + other.source,
+            )
+
+        operator fun plus(entry: Pair<String, FragmentDefinition>): Fragments =
+            copy(
+                map = map + entry,
+                source = source + (entry.first to entry.second.gjDef),
+            )
+
+        companion object {
+            val empty: Fragments = Fragments(emptyMap())
+        }
+    }
+
+    /**
+     * A set of query-plan selections at one execution level.
+     *
+     * [parentType] is the type that owns the fields directly contained by this selection set.
+     * Keeping it on the selection set preserves field type conditions when a nested selection set
+     * is detached from its original plan or field.
+     *
+     * [enclosingVariableReferences] are variable references from the selection that owns this
+     * selection set, rather than from one of the child selections. Field collection can be invoked
+     * directly on a nested selection set, such as the body of `user @include(if: $show) { id }`.
+     * Carrying the enclosing references with the child selection set keeps that boundary visible
+     * without forcing collection to know which field or inline fragment led to the selection set.
+     */
+    data class SelectionSet(
+        val parentType: GraphQLCompositeType,
+        val selections: List<Selection>,
+        val enclosingVariableReferences: List<SelectionVariableReference> = emptyList(),
+        val conditionallyExcludedCoordinates: Set<Coordinate> = emptySet(),
+    ) {
+        constructor(
+            parentType: GraphQLCompositeType,
+            vararg selections: Selection,
+        ) : this(parentType, listOf(*selections))
+
+        operator fun plus(selection: Selection): SelectionSet = copy(selections = selections + selection)
+
+        /**
+         * Merges this selection set with [other]. The two selection sets must have the same
+         * parent type, or one parent type must be a possible type of the other per [schema] --
+         * i.e. an interface (or union) merged with one of its implementing (or member) object
+         * types. This allows merging selections that reach the same response key through
+         * different but schema-compatible paths, such as an interface field alongside a
+         * concrete implementation's narrower field.
+         *
+         * The merged selection set keeps the more specific (possible) type, since it is always
+         * a superset of the abstract type's fields.
+         */
+        fun merge(
+            other: SelectionSet,
+            schema: GraphQLSchema,
+        ): SelectionSet {
+            val mergedParentType = mergedParentType(other, schema)
+            return if (other.isEmpty()) {
+                copy(parentType = mergedParentType)
+            } else if (isEmpty()) {
+                other.copy(parentType = mergedParentType)
+            } else {
+                val nextEnclosingVariableReferences =
+                    if (other.enclosingVariableReferences.isEmpty()) {
+                        enclosingVariableReferences
+                    } else if (enclosingVariableReferences.isEmpty()) {
+                        other.enclosingVariableReferences
+                    } else {
+                        enclosingVariableReferences + other.enclosingVariableReferences
+                    }
+                val nextConditionallyExcludedCoordinates =
+                    if (other.conditionallyExcludedCoordinates.isEmpty()) {
+                        conditionallyExcludedCoordinates
+                    } else if (conditionallyExcludedCoordinates.isEmpty()) {
+                        other.conditionallyExcludedCoordinates
+                    } else {
+                        conditionallyExcludedCoordinates + other.conditionallyExcludedCoordinates
+                    }
+                SelectionSet(
+                    mergedParentType,
+                    selections + other.selections,
+                    nextEnclosingVariableReferences,
+                    nextConditionallyExcludedCoordinates
+                )
+            }
+        }
+
+        private fun mergedParentType(
+            other: SelectionSet,
+            schema: GraphQLSchema,
+        ): GraphQLCompositeType {
+            val a = parentType
+            val b = other.parentType
+            if (a == b) return a
+            if (b is GraphQLObjectType && schema.isPossibleType(a, b)) return b
+            if (a is GraphQLObjectType && schema.isPossibleType(b, a)) return a
+            throw IllegalArgumentException(
+                "Cannot merge selection sets on `${a.name}` and `${b.name}`"
+            )
+        }
+
+        private fun isEmpty(): Boolean =
+            selections.isEmpty() &&
+                enclosingVariableReferences.isEmpty() &&
+                conditionallyExcludedCoordinates.isEmpty()
+
+        companion object {
+            fun empty(parentType: GraphQLCompositeType): SelectionSet = SelectionSet(parentType, emptyList())
+        }
+    }
+
+    /**
+     * Metadata of the field.
+     * @property resolvedByCoordinate The field coordinate for the resolver that produced the current object scope.
+     * Set to the field's own coordinate when that field has a resolver, otherwise propagated from the parent
+     * selection. Used by observability to attribute trivial field fetches to the resolver that created the
+     * parent object. Not used to decide whether a field itself is selectively resolved — that is derived at
+     * runtime from [DispatcherRegistry] using the concrete object type, since resolvers are only bound to
+     * concrete-object field coordinates.
+     */
+    data class FieldMetadata(
+        val resolvedByCoordinate: Coordinate?,
+    ) {
+        companion object {
+            val empty: FieldMetadata = FieldMetadata(null)
+        }
+    }
+}
+
+/**
+ * Converts the canonical query-plan representation to graphql-java's execution representation.
+ *
+ * Child selection sets are always rebuilt from the query plan. The selection sets still present
+ * on the embedded graphql-java fields are source syntax, not a second source of truth.
+ */
+internal fun QueryPlan.SelectionSet.toAstSelectionSet(): GJSelectionSet =
+    GJSelectionSet.newSelectionSet()
+        .selections(selections.flatMap { it.toAstSelections() })
+        .build()
+
+private fun QueryPlan.Selection.toAstSelections(): List<GJSelection<*>> =
+    when (this) {
+        is QueryPlan.Field ->
+            listOf(field.withSelectionSet(selectionSet?.toAstSelectionSet()))
+        is QueryPlan.InlineFragment -> listOf(
+            (inlineFragment ?: GJInlineFragment.newInlineFragment().build())
+                .transform { it.selectionSet(selectionSet.toAstSelectionSet()) }
+        )
+        is QueryPlan.FragmentSpread ->
+            listOf(fragmentSpread ?: GJFragmentSpread.newFragmentSpread(name).build())
+    }
+
+internal fun MergedField.withSelectionSet(selectionSet: GJSelectionSet): MergedField =
+    MergedField.newMergedField(fields.map { it.withSelectionSet(selectionSet) })
+        .addDeferredExecutions(deferredExecutions)
+        .build()
+
+private fun GJField.withSelectionSet(selectionSet: GJSelectionSet?): GJField =
+    if (this.selectionSet === selectionSet) {
+        this
+    } else {
+        transform { it.selectionSet(selectionSet) }
+    }
+
+/**
+ * Provides type-checker child plans for the concrete object type a field resolved to.
+ *
+ * This is intentionally a lookup API rather than a map over every possible concrete field type:
+ * broad interface/union fields may have many implementers, but execution only needs the one
+ * concrete type that was actually produced.
+ */
+interface FieldTypeChildPlans {
+    fun plansFor(objectType: GraphQLObjectType): List<QueryPlan>
+
+    companion object {
+        val empty: FieldTypeChildPlans = object : FieldTypeChildPlans {
+            override fun plansFor(objectType: GraphQLObjectType): List<QueryPlan> = emptyList()
+        }
+
+        operator fun invoke(plansFor: (GraphQLObjectType) -> List<QueryPlan>): FieldTypeChildPlans =
+            object : FieldTypeChildPlans {
+                override fun plansFor(objectType: GraphQLObjectType): List<QueryPlan> = plansFor(objectType)
+            }
+    }
+}

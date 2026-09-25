@@ -35,6 +35,7 @@ Use the context in your resolvers via dependency injection:
 
 
 **Benefits:**
+
 - Automatic lifecycle management
 - Type-safe access to context data
 - Prevents data leakage between requests
@@ -56,7 +57,6 @@ When creating your `ExecutionInput`, include the request context:
 {{ codetag("demoapps/starwars/src/main/kotlin/com/example/starwars/service/viaduct/ViaductRestController.kt", "create_execution_input", lang="kotlin") }}
 
 
-
 ```kotlin
  val requestContext = mapOf(
   "securityAccess" to securityAccess,
@@ -75,7 +75,7 @@ Inside your resolvers, access the request context through the resolver context:
 
 ```kotlin
 @Resolver
-class FooQuery : FooResolber.Character() {
+class FooQuery : FooResolver.Character() {
     override suspend fun resolve(ctx: Context): Foo? {
         val requestContext = ctx.requestContext as? Map<*, *>
         ...
@@ -84,12 +84,14 @@ class FooQuery : FooResolber.Character() {
 ```
 
 **Benefits:**
+
 - Simple to set up
 - No additional framework configuration needed
 - Direct access to context data
 - Flexible for passing arbitrary data
 
 **Considerations:**
+
 - Requires manual type casting
 - Less type-safe than framework approach
 - No automatic lifecycle management
@@ -100,4 +102,6 @@ class FooQuery : FooResolber.Character() {
 For production applications with complex authorization needs, authentication, or multi-tenancy, use framework-based request scoping. It provides automatic lifecycle management and type safety.
 
 For simpler installations or prototypes where you need to pass arbitrary context without framework configuration, use `ExecutionInput.requestContext`.
+
+> For the complete `ExecutionInput` API and runtime execution model, see the [Viaduct API developer reference](../../../docs/developers/viaduct_api/index.md).
 

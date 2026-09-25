@@ -4,8 +4,7 @@ description: How schemas are defined, registered, and selected at runtime in the
 ---
 
 
-In Viaduct, a **schema** describes the GraphQL surface that a request can access. In the Star Wars demo, we register
-two schema IDs — one public and one with extra fields — and select between them at runtime based on **scopes**.
+In Viaduct, a **schema** describes the GraphQL surface that a request can access. In the Star Wars demo, we register two schema IDs — one public and one with extra fields — and select between them at runtime based on **scopes**.
 
 ## What a schema is
 
@@ -20,23 +19,19 @@ The Star Wars demo defines two schema IDs:
 
 ## Where schemas are registered
 
-Schemas are registered in configuration, providing **scope bindings** and **SDL discovery** settings (package prefix
-and resource regex). Example (excerpt adapted from `ViaductConfiguration.kt`):
+Schemas are registered when creating a Viaduct instance by passing a list of [SchemaScopeInfo] descriptors. Example (excerpt from `ViaductConfiguration.kt`):
 
 
 {{ codetag("demoapps/starwars/src/main/kotlin/com/example/starwars/service/viaduct/ViaductConfiguration.kt", "schema_registration", lang="kotlin") }}
 
 
-- `grtPackagePrefix`: optional package prefix for GRT schema file discovery (test-only override, production uses defaults).
-- `grtResourcesIncluded`: optional regex pattern for which SDL files to include (test-only override, production uses defaults).
-- `tenantPackagePrefix`: where Viaduct scans for generated resolver classes.
-- `scopes`: which runtime scopes activate each schema ID.
+- `scopedSchemas`: a list of `SchemaScopeInfo` descriptors for schemas that use `@scope`.
+  `SchemaScopeInfo.Scoped` binds a schema name to scope IDs; `SchemaScopeInfo.Base` exposes the
+  unfiltered base view. Schemas without `@scope` need no descriptors.
 
 ## Organizing SDL files
 
-Place your GraphQL SDL files under the configured resources path so they are included by `resourcesIncluded`. Keep
-entities modular (for example, `character.graphqls`, `film.graphqls`, `species.graphqls`) and use **directives** like
-`@scope`, `@idOf`, and `@oneOf` where appropriate.
+Place your GraphQL SDL files under the configured resources path so they are included by `resourcesIncluded`. Keep entities modular (for example, `character.graphqls`, `film.graphqls`, `species.graphqls`) and use **directives** like `@scope`, `@idOf`, and `@oneOf` where appropriate.
 
 ### Example (fragment)
 
@@ -78,6 +73,5 @@ To add a new entity:
 - **Do** register schema IDs with clear scope sets (public vs. public + extras).
 - **Do** keep SDL modular and use directives for visibility and type-safety.
 - **Don’t** rely on a single “mega schema” and conditional logic inside resolvers to hide fields.
-- **Don’t** mix raw IDs with Global IDs; declare `@idOf` where applicable.
 
-
+> For multi-tenant schema management at the service layer, see the [Multi-tenancy service engineer docs](../../../docs/service_engineers/multi_tenancy/index.md). For the full `@scope` directive reference, see the [Scopes developer reference](../../../docs/developers/scopes/index.md).

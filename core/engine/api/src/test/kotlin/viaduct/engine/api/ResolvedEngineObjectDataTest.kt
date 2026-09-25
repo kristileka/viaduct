@@ -1,0 +1,61 @@
+package viaduct.engine.api
+
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertSame
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
+import viaduct.engine.api.mocks.createSchema
+import viaduct.errors.UnsetFieldException
+
+class ResolvedEngineObjectDataTest {
+    private val schema = createSchema(
+        """
+            type Obj { x:Int }
+            extend type Query { x:Int }
+        """.trimIndent()
+    )
+    private val obj = schema.schema.getObjectType("Obj")
+
+    @Test
+    fun properties() {
+        val eod = ResolvedEngineObjectData.Builder(obj)
+            .put("x", 1)
+            .put("y", null)
+            .build()
+
+        assertSame(obj, eod.type)
+        assertEquals(1, eod.get("x"))
+        assertEquals(null, eod.get("y"))
+        assertThrows<UnsetFieldException> {
+            eod.get("unset")
+        }
+        assertEquals(null, eod.getOrNull("unset"))
+        assertEquals(listOf("x", "y"), eod.getSelections().toList())
+    }
+
+    @Test
+    fun `isPresent distinguishes stored null from an unset selection`() {
+        val eod = ResolvedEngineObjectData.Builder(obj)
+            .put("x", 1)
+            .put("y", null)
+            .build()
+
+        assertTrue(eod.isPresent("x"))
+        assertTrue(eod.isPresent("y"))
+        assertFalse(eod.isPresent("unset"))
+    }
+
+    @Test
+    fun `Builder -- objects constructed by Builder are immutable`() {
+        // Ensure that if a Builder is reused, that it does not modify already created objects
+
+        val builder = ResolvedEngineObjectData.Builder(obj).put("x", 1)
+        val eod1 = builder.build()
+        val eod2 = builder.put("x", 2).build()
+
+        assertEquals(1, eod1.get("x"))
+        assertEquals(2, eod2.get("x"))
+    }
+}

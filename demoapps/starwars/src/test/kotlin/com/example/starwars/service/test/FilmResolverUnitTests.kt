@@ -1,23 +1,29 @@
-@file:Suppress("ForbiddenImport", "DEPRECATION")
+@file:Suppress("ForbiddenImport")
 
 package com.example.starwars.service.test
 
+import com.example.starwars.modules.filmography.films.models.FilmCastData
 import com.example.starwars.modules.filmography.films.models.FilmCharactersRepository
-import com.example.starwars.modules.filmography.films.resolvers.FilmCharacterCountSummaryResolver
+import com.example.starwars.modules.filmography.films.resolvers.FilmCastDataResolver
 import com.example.starwars.modules.filmography.films.resolvers.FilmDisplayTitleResolver
 import com.example.starwars.modules.filmography.films.resolvers.FilmProductionDetailsResolver
 import com.example.starwars.modules.filmography.films.resolvers.FilmSummaryResolver
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
-import viaduct.api.globalid.GlobalIDImpl
+import viaduct.api.globalid.GlobalID
 import viaduct.api.grts.Film
-import viaduct.engine.SchemaFactory
-import viaduct.engine.api.ViaductSchema
-import viaduct.engine.runtime.execution.DefaultCoroutineInterop
-import viaduct.tenant.testing.DefaultAbstractResolverTestBase
+import viaduct.api.grts.FilmProductionDetails
+import viaduct.api.select.SelectionSet
+import viaduct.api.testing.ResolverTestBase
+import viaduct.apiannotations.ExperimentalApi
+import viaduct.apiannotations.InternalApi
+import viaduct.errors.UnsetFieldException
 
 /**
  * Integration tests for custom field resolvers on the Film type.
@@ -28,10 +34,8 @@ import viaduct.tenant.testing.DefaultAbstractResolverTestBase
  * Note: Integration tests that cover full query execution and authorization
  * are located in QueryResolverUnitTests.kt.
  */
-@OptIn(ExperimentalCoroutinesApi::class)
-class FilmResolverUnitTests : DefaultAbstractResolverTestBase() {
-    override fun getSchema(): ViaductSchema = SchemaFactory(DefaultCoroutineInterop).fromResources()
-
+@OptIn(ExperimentalCoroutinesApi::class, ExperimentalApi::class, InternalApi::class)
+class FilmResolverUnitTests : ResolverTestBase() {
     private lateinit var filmCharactersRepository: FilmCharactersRepository
 
     @BeforeEach
@@ -44,12 +48,9 @@ class FilmResolverUnitTests : DefaultAbstractResolverTestBase() {
         runBlocking {
             val resolver = FilmDisplayTitleResolver()
 
-            val result = runFieldResolver(
-                resolver = resolver,
-                objectValue = Film.Builder(context)
-                    .title("Star Wars: A New Hope")
-                    .build(),
-            )
+            val result = runFieldResolver(resolver) {
+                objectValue = Film.of(context) { title("Star Wars: A New Hope") }
+            }
 
             assertEquals("Star Wars: A New Hope", result)
         }
@@ -59,74 +60,73 @@ class FilmResolverUnitTests : DefaultAbstractResolverTestBase() {
         runBlocking {
             val resolver = FilmSummaryResolver()
 
-            val result = runFieldResolver(
-                resolver = resolver,
-                objectValue = Film.Builder(context)
-                    .title("The Empire Strikes Back")
-                    .episodeID(5)
-                    .director("Irvin Kershner")
-                    .build(),
-            )
+            val result = runFieldResolver(resolver) {
+                objectValue = Film.of(context) {
+                    title("The Empire Strikes Back")
+                    episodeID(5)
+                    director("Irvin Kershner")
+                }
+            }
 
             assertEquals("Episode 5: The Empire Strikes Back (Directed by Irvin Kershner)", result)
         }
 
     @Test
-    fun `FilmProductionDetailsResolver formats release director and producers`(): Unit =
+    fun `FilmProductionDetailsResolver returns only selected fields`(): Unit =
         runBlocking {
             val resolver = FilmProductionDetailsResolver()
 
-            val result = runFieldResolver(
-                resolver = resolver,
-                objectValue = Film.Builder(context)
-                    .title("Return of the Jedi")
-                    .director("Richard Marquand")
-                    .producers(listOf("Howard Kazanjian", "George Lucas", "Rick McCallum"))
-                    .releaseDate("1983-05-25")
-                    .build(),
-            )
+            val result = runFieldResolver(resolver) {
+                selections = productionDetailsSelections("title director")
+                objectValue = Film.of(context) {
+                    title("Return of the Jedi")
+                    director("Richard Marquand")
+                    producers(listOf("Howard Kazanjian", "George Lucas", "Rick McCallum"))
+                    releaseDate("1983-05-25")
+                }
+            }
 
-            assertEquals(
-                "Return of the Jedi was released on 1983-05-25, directed by Richard Marquand and produced by Howard Kazanjian, George Lucas, Rick McCallum",
-                result
-            )
+            assertNotNull(result)
+            assertEquals("Return of the Jedi", result!!.getTitleOrThrow())
+            assertEquals("Richard Marquand", result.getDirectorOrThrow())
+            assertThrows(UnsetFieldException::class.java) { result.getProducersOrThrow() }
+            assertThrows(UnsetFieldException::class.java) { result.getReleaseDateOrThrow() }
         }
 
     @Test
-    fun `FilmProductionDetailsResolver handles missing producers gracefully`(): Unit =
+    fun `FilmProductionDetailsResolver preserves null selected fields`(): Unit =
         runBlocking {
             val resolver = FilmProductionDetailsResolver()
 
-            val result = runFieldResolver(
-                resolver = resolver,
-                objectValue = Film.Builder(context)
-                    .title("Rogue One")
-                    .director("Gareth Edwards")
-                    .producers(null) // triggers "Unknown producers"
-                    .releaseDate("2016-12-16")
-                    .build(),
-            )
+            val result = runFieldResolver(resolver) {
+                selections = productionDetailsSelections("producers")
+                objectValue = Film.of(context) {
+                    title("Rogue One")
+                    director("Gareth Edwards")
+                    producers(null)
+                    releaseDate("2016-12-16")
+                }
+            }
 
-            assertEquals(
-                "Rogue One was released on 2016-12-16, directed by Gareth Edwards and produced by Unknown producers",
-                result
-            )
+            assertNotNull(result)
+            assertNull(result!!.getProducersOrThrow())
         }
 
+    private fun productionDetailsSelections(fields: String): SelectionSet<FilmProductionDetails> = mkSelectionSetFactory().selectionsOn(FilmProductionDetails.Reflection, fields, emptyMap())
+
     @Test
-    fun `FilmCharacterCountSummaryResolver counts characters`(): Unit =
+    fun `FilmCastDataResolver returns character IDs from repository`(): Unit =
         runBlocking {
-            val resolver = FilmCharacterCountSummaryResolver(filmCharactersRepository)
+            val resolver = FilmCastDataResolver(filmCharactersRepository)
 
-            val result = runFieldResolver(
-                resolver = resolver,
-                objectValue = Film.Builder(context)
-                    .id(GlobalIDImpl(Film.Reflection, "1"))
-                    .title("A New Hope")
-                    .build(),
-            )
+            val result = runFieldResolver(resolver) {
+                objectValue = Film.of(context) {
+                    id(GlobalID(Film.Reflection, "1"))
+                    title("A New Hope")
+                }
+            }
 
-            assertEquals("A New Hope features 5 main characters", result)
+            assertEquals(FilmCastData(listOf("1", "2", "3", "4", "5")), result)
         }
 
     // Note: Node-based tests using runNodeResolver are now in QueryResolverUnitTests.kt

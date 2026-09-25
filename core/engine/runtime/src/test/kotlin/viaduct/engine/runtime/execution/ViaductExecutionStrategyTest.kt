@@ -1,0 +1,2064 @@
+@file:Suppress("ForbiddenImport")
+
+package viaduct.engine.runtime.execution
+
+import graphql.GraphQLError
+import graphql.execution.DataFetcherResult
+import graphql.execution.SimpleDataFetcherExceptionHandler
+import graphql.execution.instrumentation.InstrumentationContext
+import graphql.execution.instrumentation.InstrumentationState
+import graphql.execution.instrumentation.parameters.InstrumentationFieldCompleteParameters
+import graphql.schema.DataFetcher
+import io.kotest.matchers.types.shouldBeInstanceOf
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.ObsoleteCoroutinesApi
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.future.await
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNotSame
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertSame
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Nested
+import org.junit.jupiter.api.RepeatedTest
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
+import viaduct.dataloader.BatchLoaderEnvironment
+import viaduct.dataloader.InternalDataLoader
+import viaduct.dataloader.MappedBatchLoadFn
+import viaduct.dataloader.NextTickDispatcher
+import viaduct.engine.api.CheckerResult
+import viaduct.engine.api.CheckerResultContext
+import viaduct.engine.api.EngineExecutionContext
+import viaduct.engine.api.EngineObjectData
+import viaduct.engine.api.RequiredSelectionSet
+import viaduct.engine.api.instrumentation.ViaductModernGJInstrumentation
+import viaduct.engine.api.mocks.MockRequiredSelectionSetRegistry
+import viaduct.engine.api.mocks.createRSS
+import viaduct.engine.api.spi.CheckerExecutor
+import viaduct.engine.runtime.CheckerDispatcher
+import viaduct.engine.runtime.EngineObjectDataFactory
+import viaduct.engine.runtime.EngineResultLocalContext
+import viaduct.engine.runtime.RequestScopeCancellationException
+import viaduct.engine.runtime.context.getLocalContextForType
+import viaduct.engine.runtime.execution.ExecutionTestHelpers.createExecutionInput
+import viaduct.engine.runtime.execution.ExecutionTestHelpers.createSchema
+import viaduct.engine.runtime.execution.ExecutionTestHelpers.createViaductGraphQL
+import viaduct.engine.runtime.execution.ExecutionTestHelpers.executeQuery
+import viaduct.engine.runtime.execution.ExecutionTestHelpers.executeViaductModernGraphQL
+import viaduct.engine.runtime.execution.ExecutionTestHelpers.runExecutionTest
+import viaduct.service.api.spi.FlagManager
+import viaduct.utils.slf4j.logger
+
+/**
+ * Tests for ViaductExecutionStrategy focusing on core execution functionality.
+ *
+ * This test class covers:
+ * - Field resolution and data fetching behavior
+ * - Field merging with and without arguments
+ * - Error handling and instrumentation
+ * - DataLoader batching capabilities
+ * - Nested lists and DataFetcherResult handling
+ * - Mutation field serial execution
+ * - EngineResultLocalContext configuration
+ *
+ * For tests related to child plan execution and Required Selection Sets (RSS),
+ * see ViaductExecutionStrategyChildPlanTest.
+ *
+ * For tests comparing modern vs classic execution strategies,
+ * see ViaductExecutionStrategyModernTest.
+ */
+@ExperimentalCoroutinesApi
+class ViaductExecutionStrategyTest {
+    companion object {
+        private val log by logger()
+    }
+
+    // Use a single-threaded dispatcher for deterministic testing of DataLoader batching.
+    //
+    // The multi-threaded default dispatcher (Dispatchers.Default) creates a race condition in this test:
+    // some threads complete their work before others even start, causing the NextTickDispatcher's counter
+    // to prematurely hit zero and trigger batching with only partial keys (instead of all 10).
+    //
+    // This is a TEST-ONLY issue due to instant batch operations. In production, DataLoader operations
+    // are I/O-bound (database queries, API calls), giving plenty of time for all loads to register
+    // before any batch completes. The batching logic being tested here is identical regardless of
+    // thread count - we're just eliminating timing variance in the test fixture.
+    @OptIn(ObsoleteCoroutinesApi::class, DelicateCoroutinesApi::class)
+    val nextTickDispatcher = NextTickDispatcher(
+        wrappedDispatcher = kotlinx.coroutines.newSingleThreadContext("test-dispatcher"),
+        flagManager = FlagManager.Disabled
+    )
+
+    @Test
+    fun `fatal error in data fetcher crashes request`() =
+        runExecutionTest {
+            val sdl = "type Query { field: String }"
+            val resolvers = mapOf(
+                "Query" to mapOf(
+                    "field" to DataFetcher<String> {
+                        // Throw Error, not Exception - represents fatal JVM error
+                        throw AssertionError("Fatal invariant violation")
+                    }
+                )
+            )
+
+            val exception = assertThrows<AssertionError> {
+                executeViaductModernGraphQL(sdl, resolvers, "{ field }")
+            }
+
+            assertTrue(
+                exception.message?.contains("Fatal invariant violation") ==
+                    true
+            )
+        }
+
+    @Test
+    fun `instrumentation failure during field completion is contained at field level`() =
+        runExecutionTest {
+            // Define a simple schema with one field that would normally resolve to a valid value.
+            val sdl = // language=GraphQL
+                """
+                type Query {
+                    brokenField: String
+                }
+                """
+            val resolvers = mapOf(
+                "Query" to mapOf(
+                    // This resolver returns a valid value.
+                    "brokenField" to DataFetcher { "Valid Value" }
+                )
+            )
+            val query = // language=GraphQL
+                """
+                query {
+                    brokenField
+                }
+                """
+
+            // Define a custom instrumentation that fails during field completion.
+            class FailingFieldCompletionInstrumentation : ViaductModernGJInstrumentation {
+                override fun beginFieldCompletion(
+                    parameters: InstrumentationFieldCompleteParameters,
+                    state: InstrumentationState?
+                ): InstrumentationContext<Any>? =
+                    object : InstrumentationContext<Any> {
+                        override fun onDispatched() {
+                            // No-op
+                        }
+
+                        override fun onCompleted(
+                            result: Any?,
+                            t: Throwable?
+                        ) {
+                            // Force a failure during field completion.
+                            throw RuntimeException("Forced field completion error")
+                        }
+                    }
+            }
+            // Create a list of instrumentations containing our failing instrumentation.
+            val instrumentations = listOf<ViaductModernGJInstrumentation>(FailingFieldCompletionInstrumentation())
+            val schema = createSchema(sdl, resolvers)
+            // Build the GraphQL engine with our schema, resolvers, and instrumentation.
+            val graphQL = createViaductGraphQL(schema, instrumentations = instrumentations)
+            val executionResult = executeQuery(schema, graphQL, query, emptyMap())
+            // The field should resolve to null because the forced error is caught and converted
+            // into a field-level error rather than aborting the whole query.
+            val data = executionResult.getData<Map<String, Any?>>()
+            assertNull(data?.get("brokenField"), "Expected brokenField to be null due to instrumentation failure")
+            // The error list should contain an error message from our forced failure.
+            val errorMessages = executionResult.errors.map { it.message }
+            assertTrue(
+                errorMessages.any { it.contains("Forced field completion error") },
+                "Expected an error message containing 'Forced field completion error'"
+            )
+        }
+
+    @Test
+    fun `configures EngineResultLocalContext`() {
+        var ctx: EngineResultLocalContext? = null
+        runExecutionTest {
+            withContext(nextTickDispatcher) {
+                val sdl = "type Query { field: Int }"
+                val query = "{ field }"
+                val resolvers = mapOf(
+                    "Query" to mapOf(
+                        "field" to DataFetcher {
+                            ctx = it.getLocalContextForType<EngineResultLocalContext>()
+                            0
+                        }
+                    ),
+                )
+
+                executeViaductModernGraphQL(sdl, resolvers, query)
+                assertEquals("Query", ctx?.rootEngineResult?.type?.name)
+                assertEquals("Query", ctx?.currentObjectEngineResult?.type?.name)
+                assertEquals("Query", ctx?.queryEngineResult?.type?.name)
+                // For Query operations, queryEngineResult should be the same instance as rootEngineResult
+                assertSame(ctx!!.rootEngineResult, ctx!!.queryEngineResult)
+            }
+        }
+    }
+
+    @Test
+    fun `configures EngineResultLocalContext for mutation operations`() {
+        var ctx: EngineResultLocalContext? = null
+        runExecutionTest {
+            withContext(nextTickDispatcher) {
+                val sdl = """
+                    type Query { field: Int }
+                    type Mutation { mutateField: Int }
+                """
+                val query = "mutation { mutateField }"
+                val resolvers = mapOf(
+                    "Query" to mapOf(
+                        "field" to DataFetcher { 0 }
+                    ),
+                    "Mutation" to mapOf(
+                        "mutateField" to DataFetcher {
+                            ctx = it.getLocalContextForType<EngineResultLocalContext>()
+                            0
+                        }
+                    ),
+                )
+
+                executeViaductModernGraphQL(sdl, resolvers, query)
+                assertEquals("Mutation", ctx?.rootEngineResult?.type?.name)
+                assertEquals("Mutation", ctx?.currentObjectEngineResult?.type?.name)
+                assertEquals("Query", ctx?.queryEngineResult?.type?.name)
+                // For Mutation operations, queryEngineResult should be a separate Query-type instance
+                assertNotSame(ctx!!.rootEngineResult, ctx!!.queryEngineResult)
+            }
+        }
+    }
+
+    @RepeatedTest(1000)
+    fun `still allows dataloader batching`() =
+        runExecutionTest {
+            withContext(nextTickDispatcher) {
+                val sdl = // language=GraphQL
+                    """
+                    type Query {
+                        foo: [Foo]
+                    }
+                    type Foo {
+                        bar: String
+                    }
+                    """
+
+                val query = // language=GraphQL
+                    """
+                    query {
+                        foo {
+                            bar
+                        }
+                    }
+                    """
+
+                val loadCalls = mutableListOf<Set<*>>()
+                val loader = InternalDataLoader.newMappedLoader<Int, String, Any>(
+                    object : MappedBatchLoadFn<Int, String> {
+                        override suspend fun load(
+                            keys: Set<Int>,
+                            env: BatchLoaderEnvironment<Int>
+                        ): Map<Int, String> {
+                            loadCalls.add(keys)
+                            return keys.associateWith { "$it" }
+                        }
+                    }
+                )
+
+                data class Bar(
+                    val intValue: Int
+                )
+
+                val resolvers = mapOf(
+                    "Query" to mapOf(
+                        "foo" to DataFetcher { (1..10).map { i -> Bar(i) } }
+                    ),
+                    "Foo" to mapOf(
+                        "bar" to DataFetcher {
+                            scopedFuture {
+                                val source = it.getSource<Bar>()!!
+                                try {
+                                    loader.load(source.intValue)
+                                } catch (e: Exception) {
+                                    println(e)
+                                }
+                            }
+                        }
+                    )
+                )
+
+                executeViaductModernGraphQL(sdl, resolvers, query)
+                assertEquals(1, loadCalls.size)
+                assertEquals(listOf(setOf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)), loadCalls)
+            }
+        }
+
+    @Test
+    fun `test field merging with no arguments`() =
+        runExecutionTest {
+            val sdl = // language=GraphQL
+                """
+                type Query {
+                    foo: Foo
+                }
+                type Foo {
+                    bar: Bar
+                    baz: String
+                }
+                type Bar {
+                    one: String
+                    two: String
+                    nestedBar: Bar
+                }
+                """
+
+            val query = // language=GraphQL
+                """
+                query {
+                    foo {
+                        bar {
+                            one
+                            nestedBar {
+                                two
+                            }
+                        }
+                        bar {
+                            one
+                            two
+                        }
+                        bar {
+                            two
+                            nestedBar {
+                                one
+                                two
+                            }
+                        }
+                        baz
+                    }
+                }
+                """
+
+            val barCount = AtomicInteger(0)
+            val oneCount = AtomicInteger(0)
+            val twoCount = AtomicInteger(0)
+            val resolvers = mapOf(
+                "Query" to mapOf(
+                    "foo" to DataFetcher { mapOf<String, Any?>() }
+                ),
+                "Foo" to mapOf(
+                    "bar" to DataFetcher {
+                        scopedFuture {
+                            barCount.incrementAndGet()
+                            mapOf<String, Any?>()
+                        }
+                    },
+                    "baz" to DataFetcher { scopedFuture { "baz" } }
+                ),
+                "Bar" to mapOf(
+                    "one" to DataFetcher {
+                        scopedFuture {
+                            oneCount.incrementAndGet()
+                            "one"
+                        }
+                    },
+                    "two" to DataFetcher {
+                        scopedFuture {
+                            twoCount.incrementAndGet()
+                            "two"
+                        }
+                    },
+                    "nestedBar" to DataFetcher { mapOf<String, Any?>() }
+                )
+            )
+
+            val modernResult = executeViaductModernGraphQL(sdl, resolvers, query)
+
+            assertEquals(
+                mapOf(
+                    "foo" to mapOf(
+                        "bar" to mapOf(
+                            "one" to "one",
+                            "nestedBar" to mapOf("one" to "one", "two" to "two"),
+                            "two" to "two"
+                        ),
+                        "baz" to "baz"
+                    )
+                ),
+                modernResult.getData<Map<String, Any?>>()
+            )
+            assertEquals(1, barCount.get())
+            // once in bar, once in nestedBar
+            assertEquals(2, oneCount.get())
+            assertEquals(2, twoCount.get())
+        }
+
+    @Test
+    fun `test field merging with simple arguments`() =
+        runExecutionTest {
+            val sdl = // language=GraphQL
+                """
+                type Query {
+                    foo: Foo
+                }
+                type Foo {
+                    bar(arg: Int): Bar
+                    baz: String
+                }
+                type Bar {
+                    value(multiplier: Int): Int
+                    otherValue: String
+                }
+                """
+
+            val query = // language=GraphQL
+                """
+                query {
+                    foo {
+                        bar(arg: 5) {
+                            value(multiplier: 2)
+                            value(multiplier: 2)  # Same arguments, can be merged
+                            otherValue
+                        }
+                        # same arg as above selection, can be merged
+                        bar(arg: 5) {
+                            value2: value(multiplier: 3)  # Different multiplier
+                            otherValue
+                        }
+                        # Different arg value - cannot be merged
+                        bar2: bar(arg: 10) {
+                            value(multiplier: 2)
+                            otherValue
+                        }
+                        baz
+                    }
+                }
+                """
+
+            val barCount = AtomicInteger(0)
+            val valueCount = AtomicInteger(0)
+            val resolvers = mapOf(
+                "Query" to mapOf(
+                    "foo" to DataFetcher { mapOf<String, Any?>() }
+                ),
+                "Foo" to mapOf(
+                    "bar" to DataFetcher { env ->
+                        scopedFuture {
+                            val arg = env.getArgument<Int>("arg")
+                            barCount.incrementAndGet()
+                            mapOf("inputArg" to arg)
+                        }
+                    },
+                    "baz" to DataFetcher { scopedFuture { "baz" } }
+                ),
+                "Bar" to mapOf(
+                    "value" to DataFetcher { env ->
+                        scopedFuture {
+                            valueCount.incrementAndGet()
+                            val inputArg = env.getSource<Map<String, Int>>()?.get("inputArg") ?: 0
+                            val multiplier = env.getArgument<Int>("multiplier")!!
+                            inputArg * multiplier
+                        }
+                    },
+                    "otherValue" to DataFetcher { "constant" }
+                )
+            )
+
+            val modernResult = executeViaductModernGraphQL(sdl, resolvers, query)
+
+            assertEquals(
+                mapOf(
+                    "foo" to mapOf(
+                        "bar" to mapOf(
+                            "value" to 10, // 5 * 2
+                            "value2" to 15, // 5 * 3
+                            "otherValue" to "constant"
+                        ),
+                        "bar2" to mapOf(
+                            "value" to 20, // 10 * 2
+                            "otherValue" to "constant"
+                        ),
+                        "baz" to "baz"
+                    )
+                ),
+                modernResult.getData<Map<String, Any?>>()
+            )
+
+            // bar should be called twice - once for arg:5 (memoized) and once for arg:10
+            assertEquals(2, barCount.get())
+
+            // value should be called 4 times:
+            // - Once for bar1.value1 with multiplier:2 (memoized for value2)
+            // - Once for bar2.value with multiplier:3
+            // - Once for bar3.value with multiplier:2 (different input arg)
+            assertEquals(3, valueCount.get())
+        }
+
+    @Test
+    fun `test field merging with complex argument types`() =
+        runExecutionTest {
+            val sdl = // language=GraphQL
+                """
+            type Query {
+                foo: Foo
+            }
+
+            type Foo {
+                # Test different primitive types
+                stringArg(value: String): String
+                intArg(value: Int): Int
+                floatArg(value: Float): Float
+                booleanArg(value: Boolean): Boolean
+
+                # Test enum type
+                enumArg(value: TestEnum): String
+
+                # Test input object type
+                complexArg(input: ComplexInput): String
+
+                # Test array type
+                arrayArg(values: [Int]): [Int]
+
+                # Test object with multiple args
+                multiArg(str: String, num: Int): String
+            }
+
+            enum TestEnum {
+                ONE
+                TWO
+            }
+
+            input ComplexInput {
+                name: String
+                count: Int
+                tags: [String]
+            }
+            """
+
+            val query = // language=GraphQL
+                """
+            query {
+                foo {
+                    str1:stringArg(value: "hello")
+                    str1:stringArg(value: "hello")        # same arg, can be merged with str1
+                    str2:stringArg(value: "different")    # diff arg, cannot merge and requires diff. response key
+
+                    int1: intArg(value: 42)
+                    int1: intArg(value: 42)               # same arg, can be merged with int1
+                    int2: intArg(value: 43)               # diff arg, cannot merge and requires diff. response key
+
+                    float1: floatArg(value: 3.14)
+                    float1: floatArg(value: 3.14)         # same arg, can be merged with float1
+                    float2: floatArg(value: 3.15)         # diff arg, cannot be merged with float2
+
+                    bool1: booleanArg(value: true)
+                    bool1: booleanArg(value: true)        # same arg, can be merged with bool1
+                    bool2: booleanArg(value: false)       # diff arg, cannot be merged with bool2
+
+                    enum1: enumArg(value: ONE)
+                    enum1: enumArg(value: ONE)            # same arg, can be merged with enum1
+                    enum2: enumArg(value: TWO)            # diff arg, cannot merge and requires diff. response key
+
+                    complex1: complexArg(input: {name: "test", count: 1, tags: ["a", "b"]})
+                    # Same arg - can be merged with complex1
+                    complex1: complexArg(input: {name: "test", count: 1, tags: ["a", "b"]})
+                    # Diff arg, cannot merge
+                    complex2: complexArg(input: {name: "test", count: 2, tags: ["a", "b"]})
+
+                    array1: arrayArg(values: [1, 2, 3])
+                    array1: arrayArg(values: [1, 2, 3])    # same arg, can be merged
+                    array2: arrayArg(values: [1, 2, 4])    # diff arg, cannot merge
+
+                    multi1: multiArg(str: "test", num: 1)
+                    multi1: multiArg(str: "test", num: 1)  # same arg, can be merged
+                    multi2: multiArg(str: "test", num: 2)  # diff arg, cannot merge
+                }
+            }
+            """
+
+            // Counters for each resolver type
+            val counts = mutableMapOf<String, AtomicInteger>()
+
+            val resolvers = mapOf(
+                "Query" to mapOf(
+                    "foo" to DataFetcher { mapOf<String, Any?>() }
+                ),
+                "Foo" to mapOf(
+                    "stringArg" to DataFetcher { env ->
+                        scopedFuture {
+                            counts.getOrPut("string") { AtomicInteger(0) }.incrementAndGet()
+                            env.getArgument<String>("value")
+                        }
+                    },
+                    "intArg" to DataFetcher { env ->
+                        scopedFuture {
+                            counts.getOrPut("int") { AtomicInteger(0) }.incrementAndGet()
+                            env.getArgument<Int>("value")
+                        }
+                    },
+                    "floatArg" to DataFetcher { env ->
+                        scopedFuture {
+                            counts.getOrPut("float") { AtomicInteger(0) }.incrementAndGet()
+                            env.getArgument<Double>("value")
+                        }
+                    },
+                    "booleanArg" to DataFetcher { env ->
+                        scopedFuture {
+                            counts.getOrPut("boolean") { AtomicInteger(0) }.incrementAndGet()
+                            env.getArgument<Boolean>("value")
+                        }
+                    },
+                    "enumArg" to DataFetcher { env ->
+                        scopedFuture {
+                            counts.getOrPut("enum") { AtomicInteger(0) }.incrementAndGet()
+                            env.getArgument<String>("value")
+                        }
+                    },
+                    "complexArg" to DataFetcher { env ->
+                        scopedFuture {
+                            counts.getOrPut("complex") { AtomicInteger(0) }.incrementAndGet()
+                            val input = env.getArgument<Map<String, Any>>("input")!!
+                            "${input["name"]}-${input["count"]}"
+                        }
+                    },
+                    "arrayArg" to DataFetcher { env ->
+                        scopedFuture {
+                            counts.getOrPut("array") { AtomicInteger(0) }.incrementAndGet()
+                            env.getArgument<List<Int>>("values")
+                        }
+                    },
+                    "multiArg" to DataFetcher { env ->
+                        scopedFuture {
+                            counts.getOrPut("multi") { AtomicInteger(0) }.incrementAndGet()
+                            "${env.getArgument<String>("str")}-${env.getArgument<Int>("num")}"
+                        }
+                    }
+                )
+            )
+
+            val modernResult = executeViaductModernGraphQL(sdl, resolvers, query)
+
+            val data = modernResult.getData<Map<String, Any?>>()
+            assertEquals(
+                mapOf(
+                    "foo" to mapOf(
+                        "str1" to "hello",
+                        "str2" to "different",
+                        "int1" to 42,
+                        "int2" to 43,
+                        "float1" to 3.14,
+                        "float2" to 3.15,
+                        "bool1" to true,
+                        "bool2" to false,
+                        "enum1" to "ONE",
+                        "enum2" to "TWO",
+                        "complex1" to "test-1",
+                        "complex2" to "test-2",
+                        "array1" to listOf(1, 2, 3),
+                        "array2" to listOf(1, 2, 4),
+                        "multi1" to "test-1",
+                        "multi2" to "test-2"
+                    )
+                ),
+                data
+            )
+
+            // Verify resolver call counts
+            assertEquals(2, counts["string"]?.get(), "String resolver should be called twice")
+            assertEquals(2, counts["int"]?.get(), "Int resolver should be called twice")
+            assertEquals(2, counts["float"]?.get(), "Float resolver should be called twice")
+            assertEquals(2, counts["boolean"]?.get(), "Boolean resolver should be called twice")
+            assertEquals(2, counts["enum"]?.get(), "Enum resolver should be called twice")
+            assertEquals(2, counts["complex"]?.get(), "Complex resolver should be called twice")
+            assertEquals(2, counts["array"]?.get(), "Array resolver should be called twice")
+            assertEquals(2, counts["multi"]?.get(), "Multi-arg resolver should be called twice")
+        }
+
+    @Test
+    fun `nested lists of DataFetcherResult are handled correctly`() =
+        runExecutionTest {
+            val sdl = // language=GraphQL
+                """
+                type Query {
+                    matrix: [[MatrixItem]]
+                }
+                type MatrixItem {
+                    value: Int
+                    errorProneValue: Int
+                }
+                """
+            val resolvers = mapOf(
+                "Query" to mapOf(
+                    "matrix" to DataFetcher {
+                        listOf(
+                            listOf(
+                                DataFetcherResult
+                                    .newResult<Map<String, Any?>>()
+                                    .data(mapOf("value" to 1))
+                                    .build(),
+                                DataFetcherResult
+                                    .newResult<Map<String, Any?>>()
+                                    .error(
+                                        GraphQLError
+                                            .newError()
+                                            .message("Error at [0][1]")
+                                            .path(listOf("matrix", 0, 1))
+                                            .build()
+                                    ).build()
+                            ),
+                            listOf(
+                                DataFetcherResult
+                                    .newResult<Map<String, Any?>>()
+                                    .data(mapOf("value" to 3))
+                                    .build(),
+                                DataFetcherResult
+                                    .newResult<Map<String, Any?>>()
+                                    .data(mapOf("value" to 4))
+                                    .build()
+                            )
+                        )
+                    }
+                ),
+                "MatrixItem" to mapOf(
+                    "errorProneValue" to DataFetcher { env ->
+                        val value = env.getSource<Map<String, Int>>()?.get("value") ?: 0
+                        if (value % 2 == 0) {
+                            DataFetcherResult
+                                .newResult<Int>()
+                                .error(
+                                    GraphQLError
+                                        .newError()
+                                        .message("Even value error at value: $value")
+                                        .path(env.executionStepInfo.path.toList())
+                                        .build()
+                                ).build()
+                        } else {
+                            DataFetcherResult
+                                .newResult<Int>()
+                                .data(value)
+                                .build()
+                        }
+                    }
+                )
+            )
+            val query = // language=GraphQL
+                """
+                query {
+                    matrix {
+                        value
+                        errorProneValue
+                    }
+                }
+                """
+
+            val modernResult = executeViaductModernGraphQL(sdl, resolvers, query)
+            log.debug("Modern result: {}", modernResult.toSpecification())
+
+            // Expected data
+            val expectedData = mapOf(
+                "matrix" to listOf(
+                    listOf(
+                        mapOf("value" to 1, "errorProneValue" to 1),
+                        null,
+                    ),
+                    listOf(
+                        mapOf("value" to 3, "errorProneValue" to 3),
+                        mapOf("value" to 4, "errorProneValue" to null)
+                    )
+                )
+            )
+
+            // Verify data
+            assertEquals(expectedData, modernResult.getData<Map<String, Any?>>())
+
+            // Verify errors
+            val expectedErrors = listOf(
+                GraphQLError
+                    .newError()
+                    .message("Error at [0][1]")
+                    .path(listOf("matrix", 0, 1))
+                    .build(),
+                GraphQLError
+                    .newError()
+                    .message("Even value error at value: 4")
+                    .path(listOf("matrix", 1, 1, "errorProneValue"))
+                    .build()
+            )
+
+            // Compare errors (comparing messages and paths)
+            val modernErrors = modernResult.errors.map { it.message to it.path }
+            val expectedErrorsData = expectedErrors.map { it.message to it.path }
+
+            assertEquals(expectedErrorsData.size, modernErrors.size)
+            modernErrors.forEach { error ->
+                assertTrue(expectedErrorsData.contains(error))
+            }
+        }
+
+    @Test
+    fun `test instrumentation methods are called and callbacks are verified`() =
+        runExecutionTest {
+            val sdl = // language=GraphQL
+                """
+                type Query {
+                    greeting: String
+                    farewell: String
+                }
+                """
+
+            val resolvers = mapOf(
+                "Query" to mapOf(
+                    "greeting" to DataFetcher { "Hello, World!" },
+                    "farewell" to DataFetcher { "Goodbye, World!" }
+                )
+            )
+
+            val schema = createSchema(sdl, resolvers)
+            val recordingInstrumentation = RecordingInstrumentation()
+            val graphQL = createViaductGraphQL(schema, instrumentations = listOf(recordingInstrumentation))
+
+            val query = // language=GraphQL
+                """
+                query {
+                    greeting
+                    farewell
+                }
+                """
+
+            val executionResult = executeQuery(schema, graphQL, query, emptyMap())
+
+            // Assertions
+            assertTrue(executionResult.errors.isEmpty())
+            assertEquals(
+                mapOf("greeting" to "Hello, World!", "farewell" to "Goodbye, World!"),
+                executionResult.getData<Map<String, Any>>()
+            )
+
+            // Verify that instrumentation methods were called and callbacks were invoked
+
+            // Fetch Object
+            assertEquals(1, recordingInstrumentation.fetchObjectContexts.size)
+            val fetchObjectContext = recordingInstrumentation.fetchObjectContexts.first()
+            assertTrue(fetchObjectContext.onDispatchedCalled.get())
+            assertTrue(fetchObjectContext.onCompletedCalled.get())
+            assertNull(fetchObjectContext.completedException)
+            val fetchObjectData = fetchObjectContext.completedValue
+            assertNotNull(fetchObjectData)
+            // We can further verify the data if needed
+
+            // Field Execution
+            assertEquals(2, recordingInstrumentation.fieldExecutionContexts.size)
+            recordingInstrumentation.fieldExecutionContexts.forEach { context ->
+                assertTrue(context.onDispatchedCalled.get())
+                assertTrue(context.onCompletedCalled.get())
+                assertNull(context.completedException)
+                // Optionally verify completedValue
+            }
+
+            // Field Fetching
+            assertEquals(2, recordingInstrumentation.fieldFetchingContexts.size)
+            recordingInstrumentation.fieldFetchingContexts.forEach { context ->
+                assertTrue(context.onDispatchedCalled.get())
+                assertTrue(context.onCompletedCalled.get())
+                assertNull(context.completedException)
+                // Optionally verify completedValue
+            }
+
+            // Complete Object
+            assertEquals(1, recordingInstrumentation.completeObjectContexts.size)
+            val completeObjectContext = recordingInstrumentation.completeObjectContexts.first()
+            assertTrue(completeObjectContext.onDispatchedCalled.get())
+            assertTrue(completeObjectContext.onCompletedCalled.get())
+            assertNull(completeObjectContext.completedException)
+
+            // Field Completion
+            assertEquals(2, recordingInstrumentation.fieldCompletionContexts.size)
+            recordingInstrumentation.fieldCompletionContexts.forEach { context ->
+                assertTrue(context.onDispatchedCalled.get())
+                assertTrue(context.onCompletedCalled.get())
+                assertNull(context.completedException)
+            }
+        }
+
+    @Test
+    fun `mutation fields are resolved serially`() {
+        // If this test fails it will probably be easier to debug with count decreased to a reasonable value like 10.
+        // But please keep the checked-in value high.
+        // val count = 10_000
+        val count = 1_000
+        val counter = AtomicInteger(0)
+
+        runExecutionTest {
+            // Mutation.x accepts an argument though it isn't used by this test.
+            // The presence of arguments are used to force a new execution of the resolver,
+            // rather than using a cached entry.
+            // This is to work around an issue at the time this test was written, where we will
+            // reuse previous resolver executions.
+            val sdl = """
+                type Query { empty: Int }
+                type Mutation { x(i:Int): Int }
+            """.trimIndent()
+
+            val resolvers = mapOf(
+                "Mutation" to mapOf("x" to DataFetcher { counter.getAndIncrement() })
+            )
+
+            // build up an operation that looks like:
+            // mutation {
+            //   x_0: x(i:0)
+            //   x_1: x(i:1)
+            //   ...
+            // }
+            val query = buildString {
+                append("mutation {")
+                repeat(count) { i ->
+                    append("\nx_$i:x(i:$i)")
+                }
+                append("\n}")
+            }
+
+            // build up map that looks like
+            // mapOf(
+            //   "x_0" to 0,
+            //   "x_1" to 1,
+            //   ...
+            // )
+            val expectedData = mutableMapOf<String, Any?>().let { map ->
+                repeat(count) { i -> map.put("x_$i", i) }
+                map.toMap()
+            }
+
+            val schema = createSchema(sdl, resolvers)
+            val graphQL = createViaductGraphQL(schema)
+            val executionResult = executeQuery(schema, graphQL, query, emptyMap())
+
+            assertEquals(expectedData, executionResult.getData<Map<String, Any?>>())
+            assertTrue(executionResult.errors.isEmpty())
+        }
+    }
+
+    @Test
+    fun `query root and namespaced fields are not forced to execute serially`() =
+        runExecutionTest {
+            val rootField1Future = CompletableFuture<Int>()
+            val namespacedField1Future = CompletableFuture<Int>()
+            val rootField1Started = CompletableDeferred<Unit>()
+            val rootField2Started = CompletableDeferred<Unit>()
+            val namespacedField1Started = CompletableDeferred<Unit>()
+            val namespacedField2Started = CompletableDeferred<Unit>()
+            val parallelObservations = CopyOnWriteArrayList<String>()
+
+            val sdl = """
+                directive @namespaceType on OBJECT
+                type Query {
+                    rootField1: Int
+                    rootField2: Int
+                    namespace: QueryNamespace
+                }
+                type QueryNamespace @namespaceType { namespacedField1: Int namespacedField2: Int }
+            """.trimIndent()
+
+            val resolvers = mapOf(
+                "Query" to mapOf(
+                    "rootField1" to DataFetcher {
+                        rootField1Started.complete(Unit)
+                        rootField1Future
+                    },
+                    "rootField2" to DataFetcher {
+                        if (!rootField1Future.isDone) {
+                            parallelObservations.add("rootField2 started before rootField1 completed")
+                        }
+                        rootField2Started.complete(Unit)
+                        2
+                    },
+                    "namespace" to DataFetcher { emptyMap<String, Any?>() },
+                ),
+                "QueryNamespace" to mapOf(
+                    "namespacedField1" to DataFetcher {
+                        namespacedField1Started.complete(Unit)
+                        namespacedField1Future
+                    },
+                    "namespacedField2" to DataFetcher {
+                        if (!namespacedField1Future.isDone) {
+                            parallelObservations.add("namespacedField2 started before namespacedField1 completed")
+                        }
+                        namespacedField2Started.complete(Unit)
+                        4
+                    },
+                )
+            )
+
+            val schema = createSchema(sdl, resolvers)
+            val graphQL = createViaductGraphQL(schema)
+            val executionFuture =
+                graphQL.executeAsync(createExecutionInput(schema, "{ rootField1 rootField2 namespace { namespacedField1 namespacedField2 } }"))
+
+            withTimeout(1000) { rootField1Started.await() }
+            withTimeout(1000) { rootField2Started.await() }
+            withTimeout(1000) { namespacedField1Started.await() }
+            withTimeout(1000) { namespacedField2Started.await() }
+
+            rootField1Future.complete(1)
+            namespacedField1Future.complete(3)
+            val executionResult = withTimeout(1000) { executionFuture.await() }
+
+            assertEquals(
+                mapOf(
+                    "rootField1" to 1,
+                    "rootField2" to 2,
+                    "namespace" to mapOf("namespacedField1" to 3, "namespacedField2" to 4),
+                ),
+                executionResult.getData<Map<String, Any?>>()
+            )
+            assertTrue(executionResult.errors.isEmpty())
+            assertEquals(2, parallelObservations.size)
+            assertEquals(
+                setOf(
+                    "rootField2 started before rootField1 completed",
+                    "namespacedField2 started before namespacedField1 completed",
+                ),
+                parallelObservations.toSet()
+            )
+        }
+
+    @Test
+    fun `root mutation fields wait for each previous mutation field to finish before dispatching next field`() =
+        runExecutionTest {
+            val probe = OrderedFetcherProbe()
+            val m1Future = CompletableFuture<Int>()
+            val m2Future = CompletableFuture<Int>()
+            val m1Started = CompletableDeferred<Unit>()
+            val m2Started = CompletableDeferred<Unit>()
+            val m3Started = CompletableDeferred<Unit>()
+
+            val sdl = """
+                type Query { empty: Int }
+                type Mutation { m1: Int m2: Int m3: Int }
+            """.trimIndent()
+
+            val resolvers = mapOf(
+                "Mutation" to mapOf(
+                    "m1" to probe.deferredField("m1", m1Future, m1Started),
+                    "m2" to probe.deferredField("m2", m2Future, m2Started),
+                    "m3" to probe.immediateField("m3", 3, m3Started),
+                )
+            )
+
+            val schema = createSchema(sdl, resolvers)
+            val graphQL = createViaductGraphQL(schema)
+            val executionFuture = graphQL.executeAsync(createExecutionInput(schema, "mutation { m1 m2 m3 }"))
+
+            withTimeout(1000) { m1Started.await() }
+            m1Future.complete(1)
+            withTimeout(1000) { m2Started.await() }
+
+            m2Future.complete(2)
+            withTimeout(1000) { m3Started.await() }
+            val executionResult = withTimeout(1000) { executionFuture.await() }
+
+            assertEquals(mapOf("m1" to 1, "m2" to 2, "m3" to 3), executionResult.getData<Map<String, Any?>>())
+            assertTrue(executionResult.errors.isEmpty())
+            probe.assertNoViolations()
+            probe.assertEvents("m1:start", "m1:end", "m2:start", "m2:end", "m3:start", "m3:end")
+        }
+
+    @Test
+    fun `root mutation field does not execute data fetcher when field checker fails`() =
+        runExecutionTest {
+            var dataFetcherInvoked = false
+
+            assertFieldCheckerFailureSkipsDataFetcher(
+                sdl = """
+                    type Query { empty: Int }
+                    type Mutation { m1: Int }
+                """.trimIndent(),
+                resolvers = mapOf(
+                    "Mutation" to mapOf(
+                        "m1" to DataFetcher {
+                            dataFetcherInvoked = true
+                            1
+                        },
+                    )
+                ),
+                query = "mutation { m1 }",
+                fieldCoordinate = "Mutation" to "m1",
+                expectedData = mapOf("m1" to null),
+                dataFetcherInvoked = { dataFetcherInvoked },
+            )
+        }
+
+    @Test
+    fun `root subscription field does not execute data fetcher when field checker fails`() =
+        runExecutionTest {
+            var dataFetcherInvoked = false
+
+            assertFieldCheckerFailureSkipsDataFetcher(
+                sdl = """
+                    type Query { empty: Int }
+                    type Subscription { s1: Int }
+                """.trimIndent(),
+                resolvers = mapOf(
+                    "Subscription" to mapOf(
+                        "s1" to DataFetcher {
+                            dataFetcherInvoked = true
+                            1
+                        },
+                    )
+                ),
+                query = "subscription { s1 }",
+                fieldCoordinate = "Subscription" to "s1",
+                expectedData = mapOf("s1" to null),
+                dataFetcherInvoked = { dataFetcherInvoked },
+            )
+        }
+
+    @Test
+    fun `namespaced mutation field waits for previous namespaced mutation field to finish before dispatching next field`() =
+        runExecutionTest {
+            val probe = OrderedFetcherProbe()
+            val m1Future = CompletableFuture<Int>()
+            val m1Started = CompletableDeferred<Unit>()
+            val m2Started = CompletableDeferred<Unit>()
+
+            val sdl = """
+                directive @namespaceType on OBJECT
+                type Query { empty: Int }
+                type Mutation { namespace: MutationNamespace }
+                type MutationNamespace @namespaceType { m1: Int m2: Int }
+            """.trimIndent()
+
+            val resolvers = mapOf(
+                "Mutation" to mapOf(
+                    "namespace" to namespaceDataFetcher(),
+                ),
+                "MutationNamespace" to mapOf(
+                    "m1" to probe.deferredField("m1", m1Future, m1Started),
+                    "m2" to probe.immediateField("m2", 2, m2Started),
+                )
+            )
+
+            val schema = createSchema(sdl, resolvers)
+            val graphQL = createViaductGraphQL(schema)
+            val executionFuture =
+                graphQL.executeAsync(createExecutionInput(schema, "mutation { namespace { m1 m2 } }"))
+
+            withTimeout(1000) { m1Started.await() }
+            m1Future.complete(1)
+            withTimeout(1000) { m2Started.await() }
+            val executionResult = withTimeout(1000) { executionFuture.await() }
+
+            assertEquals(
+                mapOf("namespace" to mapOf("m1" to 1, "m2" to 2)),
+                executionResult.getData<Map<String, Any?>>()
+            )
+            assertTrue(executionResult.errors.isEmpty())
+            probe.assertNoViolations()
+            probe.assertEvents("m1:start", "m1:end", "m2:start", "m2:end")
+        }
+
+    @Test
+    fun `multiple namespaced and root mutation fields execute serially across all mutation fields`() =
+        runExecutionTest {
+            val probe = OrderedFetcherProbe()
+            val m1Future = CompletableFuture<Int>()
+            val m2Future = CompletableFuture<Int>()
+            val m3Future = CompletableFuture<Int>()
+            val m4Future = CompletableFuture<Int>()
+            val m1Started = CompletableDeferred<Unit>()
+            val m2Started = CompletableDeferred<Unit>()
+            val m3Started = CompletableDeferred<Unit>()
+            val m4Started = CompletableDeferred<Unit>()
+            val m5Started = CompletableDeferred<Unit>()
+            val m1Fetcher = probe.deferredField("m1", m1Future, m1Started)
+            val m2Fetcher = probe.deferredField("m2", m2Future, m2Started)
+            val m3Fetcher = probe.deferredField("m3", m3Future, m3Started)
+            val m4Fetcher = probe.deferredField("m4", m4Future, m4Started)
+            val m5Fetcher = probe.immediateField("m5", 5, m5Started)
+
+            val sdl = """
+                directive @namespaceType on OBJECT
+                type Query { empty: Int }
+                type Mutation {
+                    n1: FirstMutationNamespace
+                    n2: SecondMutationNamespace
+                    m5: Int
+                }
+                type FirstMutationNamespace @namespaceType { m1: Int m2: Int }
+                type SecondMutationNamespace @namespaceType { m3: Int m4: Int }
+            """.trimIndent()
+
+            val resolvers = mapOf(
+                "Mutation" to mapOf(
+                    "n1" to namespaceDataFetcher(),
+                    "n2" to namespaceDataFetcher(),
+                    "m5" to m5Fetcher,
+                ),
+                "FirstMutationNamespace" to mapOf(
+                    "m1" to m1Fetcher,
+                    "m2" to m2Fetcher,
+                ),
+                "SecondMutationNamespace" to mapOf(
+                    "m3" to m3Fetcher,
+                    "m4" to m4Fetcher,
+                ),
+            )
+
+            val schema = createSchema(sdl, resolvers)
+            val graphQL = createViaductGraphQL(schema)
+            val executionFuture =
+                graphQL.executeAsync(createExecutionInput(schema, "mutation { n1 { m1 m2 } n2 { m3 m4 } m5 }"))
+
+            withTimeout(1000) { m1Started.await() }
+            m1Future.complete(1)
+            withTimeout(1000) { m2Started.await() }
+
+            m2Future.complete(2)
+            withTimeout(1000) { m3Started.await() }
+
+            m3Future.complete(3)
+            withTimeout(1000) { m4Started.await() }
+
+            m4Future.complete(4)
+            withTimeout(1000) { m5Started.await() }
+            val executionResult = withTimeout(1000) { executionFuture.await() }
+
+            assertEquals(
+                mapOf(
+                    "n1" to mapOf("m1" to 1, "m2" to 2),
+                    "n2" to mapOf("m3" to 3, "m4" to 4),
+                    "m5" to 5,
+                ),
+                executionResult.getData<Map<String, Any?>>()
+            )
+            assertTrue(executionResult.errors.isEmpty())
+            probe.assertNoViolations()
+            probe.assertEvents(
+                "m1:start",
+                "m1:end",
+                "m2:start",
+                "m2:end",
+                "m3:start",
+                "m3:end",
+                "m4:start",
+                "m4:end",
+                "m5:start",
+                "m5:end",
+            )
+        }
+
+    @Test
+    fun `namespaced mutation field does not execute data fetcher when field checker fails`() =
+        runExecutionTest {
+            var dataFetcherInvoked = false
+
+            assertFieldCheckerFailureSkipsDataFetcher(
+                sdl = """
+                    directive @namespaceType on OBJECT
+                    type Query { empty: Int }
+                    type Mutation { namespace: MutationNamespace }
+                    type MutationNamespace @namespaceType { m1: Int }
+                """.trimIndent(),
+                resolvers = mapOf(
+                    "Mutation" to mapOf(
+                        "namespace" to namespaceDataFetcher(),
+                    ),
+                    "MutationNamespace" to mapOf(
+                        "m1" to DataFetcher {
+                            dataFetcherInvoked = true
+                            1
+                        },
+                    )
+                ),
+                query = "mutation { namespace { m1 } }",
+                fieldCoordinate = "MutationNamespace" to "m1",
+                expectedData = mapOf("namespace" to mapOf("m1" to null)),
+                dataFetcherInvoked = { dataFetcherInvoked },
+            )
+        }
+
+    @Test
+    fun `nested namespaced mutation field waits for previous nested namespaced mutation field to finish before dispatching next field`() =
+        runExecutionTest {
+            val probe = OrderedFetcherProbe()
+            val m1Future = CompletableFuture<Int>()
+            val m1Started = CompletableDeferred<Unit>()
+            val m2Started = CompletableDeferred<Unit>()
+
+            val sdl = """
+                directive @namespaceType on OBJECT
+                type Query { empty: Int }
+                type Mutation { namespace: MutationNamespace }
+                type MutationNamespace @namespaceType { nested: NestedMutationNamespace }
+                type NestedMutationNamespace @namespaceType { m1: Int m2: Int }
+            """.trimIndent()
+
+            val resolvers = mapOf(
+                "Mutation" to mapOf(
+                    "namespace" to namespaceDataFetcher(),
+                ),
+                "MutationNamespace" to mapOf(
+                    "nested" to namespaceDataFetcher(),
+                ),
+                "NestedMutationNamespace" to mapOf(
+                    "m1" to probe.deferredField("m1", m1Future, m1Started),
+                    "m2" to probe.immediateField("m2", 2, m2Started),
+                )
+            )
+
+            val schema = createSchema(sdl, resolvers)
+            val graphQL = createViaductGraphQL(schema)
+            val executionFuture =
+                graphQL.executeAsync(createExecutionInput(schema, "mutation { namespace { nested { m1 m2 } } }"))
+
+            withTimeout(1000) { m1Started.await() }
+            m1Future.complete(1)
+            withTimeout(1000) { m2Started.await() }
+            val executionResult = withTimeout(1000) { executionFuture.await() }
+
+            assertEquals(
+                mapOf("namespace" to mapOf("nested" to mapOf("m1" to 1, "m2" to 2))),
+                executionResult.getData<Map<String, Any?>>()
+            )
+            assertTrue(executionResult.errors.isEmpty())
+            probe.assertNoViolations()
+            probe.assertEvents("m1:start", "m1:end", "m2:start", "m2:end")
+        }
+
+    @Test
+    fun `checker RSS rooted on mutation namespace keeps mutation fields serial`() =
+        runExecutionTest {
+            val probe = OrderedFetcherProbe()
+            val m1Future = CompletableFuture<Int>()
+            val m1Started = CompletableDeferred<Unit>()
+            val m2Started = CompletableDeferred<Unit>()
+
+            val sdl = """
+                directive @namespaceType on OBJECT
+                type Query { empty: Int }
+                type Mutation { namespace: MutationNamespace }
+                type MutationNamespace @namespaceType {
+                    checked: Int
+                    m1: Int
+                    m2: Int
+                }
+            """.trimIndent()
+
+            val resolvers = mapOf(
+                "Mutation" to mapOf(
+                    "namespace" to namespaceDataFetcher(),
+                ),
+                "MutationNamespace" to mapOf(
+                    "checked" to DataFetcher { 3 },
+                    "m1" to probe.deferredField("m1", m1Future, m1Started),
+                    "m2" to probe.immediateField("m2", 2, m2Started),
+                )
+            )
+
+            val resultFuture = async {
+                executeViaductModernGraphQL(
+                    sdl = sdl,
+                    resolvers = resolvers,
+                    query = "mutation { namespace { checked } }",
+                    fieldCheckerDispatchers = mapOf(
+                        ("MutationNamespace" to "checked") to checkerReadingRss(
+                            "namespaceChecker",
+                            createRSS(
+                                typeName = "MutationNamespace",
+                                selectionString = "m1 m2",
+                                forChecker = true,
+                            )
+                        ) { rssData ->
+                            rssData.fetch("m1")
+                            rssData.fetch("m2")
+                        },
+                    ),
+                )
+            }
+
+            withTimeout(1000) { m1Started.await() }
+            m1Future.complete(1)
+            withTimeout(1000) { m2Started.await() }
+            val executionResult = withTimeout(1000) { resultFuture.await() }
+
+            assertEquals(
+                mapOf("namespace" to mapOf("checked" to 3)),
+                executionResult.getData<Map<String, Any?>>()
+            )
+            assertTrue(executionResult.errors.isEmpty())
+            probe.assertNoViolations()
+            probe.assertEvents("m1:start", "m1:end", "m2:start", "m2:end")
+        }
+
+    @Test
+    fun `mutation payload fields are not forced to execute serially`() =
+        runExecutionTest {
+            val field1Future = CompletableFuture<Int>()
+            val field1Started = CompletableDeferred<Unit>()
+            val field2Started = CompletableDeferred<Unit>()
+            val events = CopyOnWriteArrayList<String>()
+
+            val sdl = """
+                type Query { empty: Int }
+                type Mutation { update: MutationPayload }
+                type MutationPayload { field1: Int field2: Int }
+            """.trimIndent()
+
+            val resolvers = mapOf(
+                "Mutation" to mapOf(
+                    "update" to DataFetcher { emptyMap<String, Any?>() },
+                ),
+                "MutationPayload" to mapOf(
+                    "field1" to DataFetcher {
+                        events.add("field1:start")
+                        field1Started.complete(Unit)
+                        field1Future.thenApply {
+                            events.add("field1:end")
+                            it
+                        }
+                    },
+                    "field2" to DataFetcher {
+                        events.add("field2:start")
+                        field2Started.complete(Unit)
+                        events.add("field2:end")
+                        2
+                    },
+                )
+            )
+
+            val schema = createSchema(sdl, resolvers)
+            val graphQL = createViaductGraphQL(schema)
+            val executionFuture =
+                graphQL.executeAsync(createExecutionInput(schema, "mutation { update { field1 field2 } }"))
+
+            withTimeout(1000) { field1Started.await() }
+            withTimeout(1000) { field2Started.await() }
+            assertEquals(
+                listOf("field1:start", "field2:start", "field2:end"),
+                events.toList(),
+                "normal mutation payload fields should still dispatch while a sibling field is unresolved"
+            )
+
+            field1Future.complete(1)
+            val executionResult = executionFuture.await()
+
+            assertEquals(
+                mapOf("update" to mapOf("field1" to 1, "field2" to 2)),
+                executionResult.getData<Map<String, Any?>>()
+            )
+            assertTrue(executionResult.errors.isEmpty())
+        }
+
+    @Test
+    fun `mutation field resolver throws an exception`() {
+        runExecutionTest {
+            val schema = createSchema(
+                """
+                   type Query { empty: Int }
+                   type Mutation { x: Int }
+                """.trimIndent(),
+                mapOf(
+                    "Mutation" to mapOf("x" to DataFetcher { throw RuntimeException("error!") })
+                )
+            )
+            val graphQL = createViaductGraphQL(schema)
+            val executionResult = executeQuery(schema, graphQL, "mutation { x }", emptyMap())
+
+            assertEquals(mapOf("x" to null), executionResult.getData<Map<String, Any?>>())
+            assertEquals(1, executionResult.errors.size)
+            val error = executionResult.errors[0]
+            assertTrue(error.message.contains("Exception while fetching data (/x)"))
+            assertTrue(error.message.contains("error!"))
+        }
+    }
+
+    @Test
+    fun `withRequestSupervisor integration - cleans up lingering child plan jobs after query execution`() =
+        runExecutionTest {
+            withContext(nextTickDispatcher) {
+                val sdl = """
+                    type Query {
+                        mainField: String
+                        hangingField: String
+                    }
+                """
+                // Query only asks for mainField, not hangingField
+                val query = """
+                    query {
+                        mainField
+                    }
+                """
+
+                val hangingJobLaunched = CompletableDeferred<Unit>()
+                val hangingJobCancelled = CompletableDeferred<Throwable?>()
+
+                val resolvers = mapOf(
+                    "Query" to mapOf(
+                        "mainField" to DataFetcher { "main" },
+                        // This field is part of the child plan (RSS) but not directly queried
+                        "hangingField" to DataFetcher {
+                            scopedFuture {
+                                launch {
+                                    hangingJobLaunched.complete(Unit)
+                                    delay(Long.MAX_VALUE)
+                                }.invokeOnCompletion { cause ->
+                                    hangingJobCancelled.complete(cause)
+                                }
+                                // Return immediately - the job runs on parent scope
+                                "hanging"
+                            }
+                        }
+                    )
+                )
+
+                // Configure RSS so that mainField triggers a child plan that includes hangingField
+                val requiredSelectionSetRegistry = MockRequiredSelectionSetRegistry.builder()
+                    .fieldResolverEntry("Query" to "mainField", "fragment Main on Query { hangingField }")
+                    .build()
+
+                val result = executeViaductModernGraphQL(
+                    sdl = sdl,
+                    resolvers = resolvers,
+                    query = query,
+                    requiredSelectionSetRegistry = requiredSelectionSetRegistry
+                )
+
+                // Query should complete successfully (doesn't wait for child plan)
+                assertEquals(
+                    mapOf("mainField" to "main"),
+                    result.getData<Map<String, Any?>>()
+                )
+                assertTrue(result.errors.isEmpty())
+
+                // The hanging child plan job should be cancelled after execution completes
+                val cause = withTimeout(1000) {
+                    hangingJobCancelled.await()
+                }
+                assertNotNull(cause)
+                cause.shouldBeInstanceOf<RequestScopeCancellationException>()
+                Unit
+            }
+        }
+
+    @Test
+    fun `mutation operation throws multiple field exceptions`() {
+        runExecutionTest {
+            val schema = createSchema(
+                """
+                    type Query { empty: Int }
+                    type Mutation { x:Int, y:Int, z:Int }
+                """.trimIndent(),
+                mapOf(
+                    "Mutation" to mapOf(
+                        "x" to DataFetcher { throw RuntimeException("error!") },
+                        "y" to DataFetcher { throw RuntimeException("error!") },
+                        "z" to DataFetcher { throw RuntimeException("error!") },
+                    )
+                )
+            )
+            val graphQL = createViaductGraphQL(schema)
+
+            val executionResult = executeQuery(schema, graphQL, "mutation { x y z }", emptyMap())
+            listOf("x", "y", "z").forEach { key ->
+                val data = executionResult.getData<Map<String, Any?>>()
+                assertTrue(data.containsKey(key))
+                assertNull(data[key])
+                val error = executionResult.errors.find { it.path.last() == key }
+                assertNotNull(error)
+                assertTrue(error!!.message.contains("Exception while fetching data (/$key)"))
+            }
+        }
+    }
+
+    private fun failingChecker(error: Exception): CheckerDispatcher {
+        val dispatcher = object : CheckerDispatcher {
+            override val requiredSelectionSets: Map<String, RequiredSelectionSet?> = emptyMap()
+            override lateinit var executor: CheckerExecutor
+
+            override suspend fun execute(
+                arguments: Map<String, Any?>,
+                objectDataFactories: Map<String, EngineObjectDataFactory>,
+                context: EngineExecutionContext,
+                checkerType: CheckerExecutor.CheckerType,
+            ): CheckerResult =
+                object : CheckerResult.Error {
+                    override val error = error
+
+                    override fun isErrorForResolver(ctx: CheckerResultContext) = true
+
+                    override fun combine(fieldResult: CheckerResult.Error) = this
+                }
+        }
+        dispatcher.executor = object : CheckerExecutor {
+            override suspend fun execute(
+                arguments: Map<String, Any?>,
+                objectDataMap: Map<String, EngineObjectData.Sync>,
+                context: EngineExecutionContext,
+                checkerType: CheckerExecutor.CheckerType,
+            ): CheckerResult = dispatcher.execute(arguments, emptyMap(), context, checkerType)
+
+            override val checkerMetadata = null
+            override val requiredSelectionSets = dispatcher.requiredSelectionSets
+        }
+        return dispatcher
+    }
+
+    private fun checkerReadingRss(
+        rssName: String,
+        rss: RequiredSelectionSet,
+        readRss: suspend (EngineObjectData) -> Unit,
+    ): CheckerDispatcher {
+        val dispatcher = object : CheckerDispatcher {
+            override val requiredSelectionSets: Map<String, RequiredSelectionSet?> = mapOf(rssName to rss)
+            override lateinit var executor: CheckerExecutor
+
+            override suspend fun execute(
+                arguments: Map<String, Any?>,
+                objectDataFactories: Map<String, EngineObjectDataFactory>,
+                context: EngineExecutionContext,
+                checkerType: CheckerExecutor.CheckerType,
+            ): CheckerResult {
+                readRss(checkNotNull(objectDataFactories[rssName]).create(null))
+                return CheckerResult.Success
+            }
+        }
+        dispatcher.executor = object : CheckerExecutor {
+            override suspend fun execute(
+                arguments: Map<String, Any?>,
+                objectDataMap: Map<String, EngineObjectData.Sync>,
+                context: EngineExecutionContext,
+                checkerType: CheckerExecutor.CheckerType,
+            ): CheckerResult {
+                readRss(checkNotNull(objectDataMap[rssName]))
+                return CheckerResult.Success
+            }
+
+            override val checkerMetadata = null
+            override val requiredSelectionSets = dispatcher.requiredSelectionSets
+        }
+        return dispatcher
+    }
+
+    private suspend fun assertFieldCheckerFailureSkipsDataFetcher(
+        sdl: String,
+        resolvers: Map<String, Map<String, DataFetcher<*>>>,
+        query: String,
+        fieldCoordinate: Pair<String, String>,
+        expectedData: Map<String, Any?>,
+        dataFetcherInvoked: () -> Boolean,
+    ) {
+        val checkError = IllegalAccessException("permission denied")
+
+        val result = executeViaductModernGraphQL(
+            sdl = sdl,
+            resolvers = resolvers,
+            query = query,
+            fieldCheckerDispatchers = mapOf(fieldCoordinate to failingChecker(checkError)),
+        )
+
+        assertEquals(expectedData, result.getData<Map<String, Any?>>())
+        assertEquals(1, result.errors.size)
+        assertTrue(result.errors.single().message.contains(checkError.message!!))
+        assertTrue(
+            !dataFetcherInvoked(),
+            "${fieldCoordinate.first}.${fieldCoordinate.second} data fetcher should not execute after its field checker fails"
+        )
+    }
+
+    private fun namespaceDataFetcher(): DataFetcher<Map<String, Any?>> = DataFetcher { emptyMap<String, Any?>() }
+
+    private class OrderedFetcherProbe {
+        private val phase = AtomicInteger(0)
+        private var nextPhase = 0
+        private val orderingViolations = CopyOnWriteArrayList<String>()
+        private val events = CopyOnWriteArrayList<String>()
+
+        fun deferredField(
+            name: String,
+            result: CompletableFuture<Int>,
+            started: CompletableDeferred<Unit>? = null,
+        ): DataFetcher<Any> {
+            val startPhase = nextPhase++
+            val endPhase = nextPhase++
+            return DataFetcher {
+                mark(startPhase, "$name:start", started)
+                result.thenApply {
+                    mark(endPhase, "$name:end")
+                    it
+                }
+            }
+        }
+
+        fun immediateField(
+            name: String,
+            value: Int,
+            started: CompletableDeferred<Unit>? = null,
+        ): DataFetcher<Any> {
+            val startPhase = nextPhase++
+            val endPhase = nextPhase++
+            return DataFetcher {
+                mark(startPhase, "$name:start", started)
+                mark(endPhase, "$name:end")
+                value
+            }
+        }
+
+        fun assertNoViolations() {
+            assertEquals(emptyList<String>(), orderingViolations.toList())
+        }
+
+        fun assertEvents(vararg expectedEvents: String) {
+            assertEquals(expectedEvents.toList(), events.toList())
+        }
+
+        private fun mark(
+            expectedPhase: Int,
+            label: String,
+            started: CompletableDeferred<Unit>? = null,
+        ) {
+            val actual = phase.get()
+            if (!phase.compareAndSet(expectedPhase, expectedPhase + 1)) {
+                orderingViolations.add("$label observed phase $actual, expected $expectedPhase")
+            }
+            events.add(label)
+            started?.complete(Unit)
+        }
+    }
+
+    @Nested
+    inner class WithRequestSupervisorTests {
+        private fun createTestStrategy() =
+            ViaductExecutionStrategy(
+                dataFetcherExceptionHandler = SimpleDataFetcherExceptionHandler(),
+                executionParametersFactory = ExecutionParameters.Factory(
+                    queryPlanFactory = QueryPlanFactory.Default,
+                ),
+                accessCheckRunner = AccessCheckRunner(DefaultCoroutineInterop),
+                isSerial = false
+            )
+
+        @Test
+        fun `cancels child jobs after block completes`() =
+            runExecutionTest {
+                val strategy = createTestStrategy()
+                val childWasCancelled = CompletableDeferred<Unit>()
+
+                val result = strategy.withRequestSupervisor { supervisorScopeFactory ->
+                    // Launch on supervisor (sibling to async, not child)
+                    supervisorScopeFactory(coroutineContext).launch {
+                        delay(Long.MAX_VALUE)
+                    }.invokeOnCompletion { cause ->
+                        if (cause is kotlinx.coroutines.CancellationException) {
+                            childWasCancelled.complete(Unit)
+                        }
+                    }
+                    "success"
+                }
+
+                assertEquals("success", result)
+
+                // Wait for cancellation to propagate
+                withTimeout(1000) {
+                    childWasCancelled.await()
+                }
+            }
+
+        @Test
+        fun `nested request supervisors reuse existing supervisor and defer cleanup to outer scope`() =
+            runExecutionTest {
+                val strategy = createTestStrategy()
+                val childStarted = CompletableDeferred<Unit>()
+                val childCancellationCause = CompletableDeferred<Throwable?>()
+                var outerSupervisorJobId: Int?
+                var innerSupervisorJobId: Int? = null
+
+                strategy.withRequestSupervisor { outerFactory ->
+                    outerSupervisorJobId = outerFactory(coroutineContext).coroutineContext[Job]?.let { System.identityHashCode(it) }
+
+                    strategy.withRequestSupervisor { innerFactory ->
+                        innerSupervisorJobId = innerFactory(coroutineContext).coroutineContext[Job]?.let { System.identityHashCode(it) }
+                        innerFactory(coroutineContext).launch {
+                            childStarted.complete(Unit)
+                            delay(Long.MAX_VALUE)
+                        }.invokeOnCompletion { cause ->
+                            childCancellationCause.complete(cause)
+                        }
+
+                        childStarted.await()
+                    }
+
+                    assertEquals(outerSupervisorJobId, innerSupervisorJobId)
+                    val prematureCancellation = withTimeoutOrNull(100) { childCancellationCause.await() }
+                    assertNull(prematureCancellation)
+                }
+
+                val cause = withTimeout(1000) {
+                    childCancellationCause.await()
+                }
+
+                assertNotNull(cause)
+                cause.shouldBeInstanceOf<RequestScopeCancellationException>()
+                Unit
+            }
+
+        @Test
+        fun `nested request supervisors keep scopedFuture parent active`() =
+            runExecutionTest {
+                val strategy = createTestStrategy()
+
+                val value = strategy.withRequestSupervisor {
+                    strategy.withRequestSupervisor {
+                        scopedFuture { "ok" }.await()
+                    }
+                }
+
+                assertEquals("ok", value)
+            }
+
+        @Test
+        fun `cancels supervisor even when block throws exception`() =
+            runExecutionTest {
+                val strategy = createTestStrategy()
+                val childWasCancelled = CompletableDeferred<Unit>()
+
+                val exception = RuntimeException("test exception")
+
+                val thrown = assertThrows<RuntimeException> {
+                    runBlocking {
+                        withThreadLocalCoroutineContext {
+                            strategy.withRequestSupervisor { supervisorScopeFactory ->
+                                // Launch on supervisor (sibling to async, not child)
+                                supervisorScopeFactory(coroutineContext).launch {
+                                    delay(Long.MAX_VALUE)
+                                }.invokeOnCompletion { cause ->
+                                    if (cause is kotlinx.coroutines.CancellationException) {
+                                        childWasCancelled.complete(Unit)
+                                    }
+                                }
+                                throw exception
+                            }
+                        }
+                    }
+                }
+
+                assertEquals("test exception", thrown.message)
+
+                // Wait for cancellation to propagate
+                withTimeout(1000) {
+                    childWasCancelled.await()
+                }
+            }
+
+        @Test
+        fun `handles self-cancellation of the block`() =
+            runExecutionTest {
+                val strategy = createTestStrategy()
+                val childLaunched = CompletableDeferred<Unit>()
+                val childWasCancelled = CompletableDeferred<Unit>()
+
+                val ex = assertThrows<kotlinx.coroutines.CancellationException> {
+                    runBlocking {
+                        withThreadLocalCoroutineContext {
+                            strategy.withRequestSupervisor { supervisorScopeFactory ->
+                                // Launch on supervisor (sibling to async, not child)
+                                val job = supervisorScopeFactory(coroutineContext).launch {
+                                    childLaunched.complete(Unit)
+                                    delay(Long.MAX_VALUE)
+                                }
+                                job.invokeOnCompletion { cause ->
+                                    if (cause is kotlinx.coroutines.CancellationException) {
+                                        childWasCancelled.complete(Unit)
+                                    }
+                                }
+                                childLaunched.await()
+                                throw kotlinx.coroutines.CancellationException("self-cancel")
+                            }
+                        }
+                    }
+                }
+
+                assertEquals("self-cancel", ex.message)
+
+                // Wait for cancellation to propagate
+                withTimeout(1000) {
+                    childWasCancelled.await()
+                }
+            }
+
+        @Test
+        fun `cancellation propagates through multiple job levels`() =
+            runExecutionTest {
+                val strategy = createTestStrategy()
+                val grandchildWasCancelled = CompletableDeferred<Unit>()
+
+                val result = strategy.withRequestSupervisor { supervisorScopeFactory ->
+                    // Launch child on supervisor (sibling to async, not child)
+                    // This way it doesn't block the async from completing
+                    supervisorScopeFactory(coroutineContext).launch {
+                        // Launch grandchild that would hang without cancellation
+                        launch {
+                            delay(Long.MAX_VALUE)
+                        }.invokeOnCompletion { cause ->
+                            if (cause is kotlinx.coroutines.CancellationException) {
+                                grandchildWasCancelled.complete(Unit)
+                            }
+                        }
+                    }
+                    "done"
+                }
+
+                assertEquals("done", result)
+
+                // Wait for cancellation to propagate through all levels
+                withTimeout(1000) {
+                    grandchildWasCancelled.await()
+                }
+            }
+
+        @Test
+        fun `request supervisor cancellation uses RequestScopeCancellationException`() =
+            runExecutionTest {
+                val strategy = createTestStrategy()
+                val cancellationCause = CompletableDeferred<Throwable?>()
+
+                runBlocking {
+                    withThreadLocalCoroutineContext {
+                        strategy.withRequestSupervisor { supervisorScopeFactory ->
+                            supervisorScopeFactory(coroutineContext).launch {
+                                delay(Long.MAX_VALUE)
+                            }.invokeOnCompletion { cause ->
+                                cancellationCause.complete(cause)
+                            }
+                        }
+                    }
+                }
+
+                val cause = withTimeout(1000) {
+                    cancellationCause.await()
+                }
+
+                assertNotNull(cause)
+                cause.shouldBeInstanceOf<RequestScopeCancellationException>()
+                Unit
+            }
+    }
+
+    @Nested
+    inner class FieldCompletionInstrumentationTest {
+        private val sdl = "type Query { field: String }"
+
+        private fun completionInstrumentation(onCompleted: (Any?, Throwable?) -> Unit): ViaductModernGJInstrumentation =
+            object : ViaductModernGJInstrumentation {
+                override fun beginFieldCompletion(
+                    parameters: InstrumentationFieldCompleteParameters,
+                    state: InstrumentationState?
+                ): InstrumentationContext<Any>? {
+                    if (parameters.executionStepInfo.path.toString() != "/field") return null
+                    return object : InstrumentationContext<Any> {
+                        override fun onDispatched() {}
+
+                        override fun onCompleted(
+                            result: Any?,
+                            t: Throwable?
+                        ) = onCompleted(result, t)
+                    }
+                }
+            }
+
+        @Test
+        fun `beginFieldCompletion onCompleted receives null throwable when field resolves successfully`() =
+            runExecutionTest {
+                var onCompletedCalled = false
+                var capturedThrowable: Throwable? = null
+                executeViaductModernGraphQL(
+                    sdl = sdl,
+                    resolvers = mapOf("Query" to mapOf("field" to DataFetcher { "hello" })),
+                    query = "{ field }",
+                    instrumentations = listOf(
+                        completionInstrumentation { _, t ->
+                            onCompletedCalled = true
+                            capturedThrowable = t
+                        }
+                    )
+                )
+                assertTrue(onCompletedCalled, "beginFieldCompletion.onCompleted should have been called")
+                assertNull(capturedThrowable, "Expected no throwable for a successful field")
+            }
+
+        @Test
+        fun `beginFieldCompletion onCompleted receives throwable when resolver throws`() =
+            runExecutionTest {
+                val resolverException = RuntimeException("resolver blew up")
+                var capturedThrowable: Throwable? = null
+                executeViaductModernGraphQL(
+                    sdl = sdl,
+                    resolvers = mapOf("Query" to mapOf("field" to DataFetcher<String> { throw resolverException })),
+                    query = "{ field }",
+                    instrumentations = listOf(completionInstrumentation { _, t -> capturedThrowable = t })
+                )
+                // FieldFetchingException and concurrency wrappers are stripped — the original exception surfaces directly.
+                assertSame(resolverException, capturedThrowable, "beginFieldCompletion should receive the original resolver exception")
+            }
+
+        @Test
+        fun `beginFieldCompletion onCompleted receives checker throwable when access check fails`() =
+            runExecutionTest {
+                val checkError = IllegalAccessException("permission denied")
+                var capturedThrowable: Throwable? = null
+
+                val failingChecker = object : viaduct.engine.runtime.CheckerDispatcher {
+                    override val requiredSelectionSets: Map<String, viaduct.engine.api.RequiredSelectionSet?> = emptyMap()
+                    override lateinit var executor: viaduct.engine.api.spi.CheckerExecutor
+
+                    override suspend fun execute(
+                        arguments: Map<String, Any?>,
+                        objectDataFactories: Map<String, viaduct.engine.runtime.EngineObjectDataFactory>,
+                        context: viaduct.engine.api.EngineExecutionContext,
+                        checkerType: viaduct.engine.api.spi.CheckerExecutor.CheckerType,
+                    ): viaduct.engine.api.CheckerResult =
+                        object : viaduct.engine.api.CheckerResult.Error {
+                            override val error = checkError
+
+                            override fun isErrorForResolver(ctx: viaduct.engine.api.CheckerResultContext) = true
+
+                            override fun combine(fieldResult: viaduct.engine.api.CheckerResult.Error) = this
+                        }
+                }.also { dispatcher ->
+                    dispatcher.executor = object : viaduct.engine.api.spi.CheckerExecutor {
+                        override suspend fun execute(
+                            arguments: Map<String, Any?>,
+                            objectDataMap: Map<String, viaduct.engine.api.EngineObjectData.Sync>,
+                            context: viaduct.engine.api.EngineExecutionContext,
+                            checkerType: viaduct.engine.api.spi.CheckerExecutor.CheckerType,
+                        ) = dispatcher.execute(arguments, emptyMap(), context, checkerType)
+
+                        override val checkerMetadata = null
+                        override val requiredSelectionSets = emptyMap<String, viaduct.engine.api.RequiredSelectionSet?>()
+                    }
+                }
+
+                executeViaductModernGraphQL(
+                    sdl = sdl,
+                    resolvers = mapOf("Query" to mapOf("field" to DataFetcher { "hello" })),
+                    query = "{ field }",
+                    fieldCheckerDispatchers = mapOf(("Query" to "field") to failingChecker),
+                    instrumentations = listOf(completionInstrumentation { _, t -> capturedThrowable = t })
+                )
+                assertSame(checkError, capturedThrowable, "beginFieldCompletion should receive the original access-check exception")
+            }
+    }
+}

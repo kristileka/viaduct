@@ -4,10 +4,13 @@ import com.example.viadapp.JettyViaductApp
 import com.fasterxml.jackson.databind.ObjectMapper
 import io.kotest.assertions.json.shouldEqualJson
 import io.kotest.matchers.shouldBe
+import io.kotest.matchers.string.shouldContain
 import java.net.ServerSocket
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.LockSupport
+import org.apache.hc.client5.http.classic.methods.HttpGet
 import org.apache.hc.client5.http.classic.methods.HttpPost
+import org.apache.hc.client5.http.classic.methods.HttpPut
 import org.apache.hc.client5.http.impl.classic.HttpClients
 import org.apache.hc.core5.http.ContentType
 import org.apache.hc.core5.http.io.entity.StringEntity
@@ -88,6 +91,82 @@ class HelloWorldTest {
         }
     }
 
+    private fun sendGetRequest(path: String): Pair<Int, String> {
+        val httpClient = HttpClients.createDefault()
+        val request = HttpGet("http://localhost:$port$path")
+
+        return httpClient.execute(request) { response ->
+            val statusCode = response.code
+            val responseBody = response.entity.content.bufferedReader().readText()
+            Pair(statusCode, responseBody)
+        }
+    }
+
+    private fun sendRawPost(
+        body: String,
+        contentType: ContentType = ContentType.APPLICATION_JSON
+    ): Pair<Int, String> {
+        val httpClient = HttpClients.createDefault()
+        val request = HttpPost("http://localhost:$port/graphql")
+        request.entity = StringEntity(body, contentType)
+
+        return httpClient.execute(request) { response ->
+            val statusCode = response.code
+            val responseBody = response.entity.content.bufferedReader().readText()
+            Pair(statusCode, responseBody)
+        }
+    }
+
+    @Test
+    fun `Malformed HTTP Request Unparseable JSON returns 400`() {
+        val (statusCode, _) = sendRawPost("this is not json")
+
+        statusCode shouldBe 400
+    }
+
+    @Test
+    fun `Malformed HTTP Request Missing Query Field returns 400`() {
+        val (statusCode, _) = sendRawPost("""{"operationName": "Hello"}""")
+
+        statusCode shouldBe 400
+    }
+
+    @Test
+    fun `Malformed HTTP Request Wrong HTTP Method returns 405`() {
+        val httpClient = HttpClients.createDefault()
+        val request = HttpPut("http://localhost:$port/graphql")
+        request.entity = StringEntity("""{"query": "{ greeting }"}""", ContentType.APPLICATION_JSON)
+
+        val (statusCode, _) = httpClient.execute(request) { response ->
+            Pair(response.code, response.entity.content.bufferedReader().readText())
+        }
+
+        statusCode shouldBe 405
+    }
+
+    @Test
+    fun `GraphiQL uses Jetty starter default query and storage key`() {
+        val (statusCode, responseBody) = sendGetRequest("/graphiql")
+
+        statusCode shouldBe 200
+        responseBody shouldContain "GraphiQL - Viaduct Jetty Starter"
+        responseBody shouldContain "query HelloWorld"
+        responseBody shouldContain "greeting"
+        responseBody shouldContain "author"
+        responseBody shouldContain "jetty-starter"
+    }
+
+    @Test
+    fun `GraphiQL JavaScript resources are served`() {
+        val (jsxLoaderStatus, jsxLoaderBody) = sendGetRequest("/js/jsx-loader.js")
+        val (globalIdStatus, globalIdBody) = sendGetRequest("/js/global-id-plugin.jsx")
+
+        jsxLoaderStatus shouldBe 200
+        jsxLoaderBody shouldContain "loadJSX"
+        globalIdStatus shouldBe 200
+        globalIdBody shouldContain "createGlobalIdPlugin"
+    }
+
     @Test
     fun `Query Greeting and Author`() {
         val query = """
@@ -136,7 +215,7 @@ class HelloWorldTest {
 
         val (statusCode, responseBody) = sendGraphQLRequest(query)
 
-        statusCode shouldBe 400
+        statusCode shouldBe 200
         responseBody shouldEqualJson """
             {
               "errors": [
@@ -164,7 +243,7 @@ class HelloWorldTest {
 
         val (statusCode, responseBody) = sendGraphQLRequest(query)
 
-        statusCode shouldBe 400
+        statusCode shouldBe 200
         responseBody shouldEqualJson """
             {
               "errors": [
@@ -192,7 +271,7 @@ class HelloWorldTest {
 
         val (statusCode, responseBody) = sendGraphQLRequest(query)
 
-        statusCode shouldBe 400
+        statusCode shouldBe 200
         responseBody shouldEqualJson """
             {
               "errors": [
@@ -224,7 +303,7 @@ class HelloWorldTest {
 
         val (statusCode, responseBody) = sendGraphQLRequest(query)
 
-        statusCode shouldBe 400
+        statusCode shouldBe 200
         responseBody shouldEqualJson """
             {
               "errors": [
@@ -243,12 +322,41 @@ class HelloWorldTest {
                     "fieldName": "throwException",
                     "parentType": "Query",
                     "operationName": "ThrowException",
+                    "fullyQualifiedErrorClass": "java.lang.IllegalStateException",
                     "classification": "DataFetchingException"
                   }
                 }
               ],
               "data": {
                 "throwException": null
+              }
+            }
+        """.trimIndent()
+    }
+
+    @Test
+    fun `Argument field greet returns personalised greeting`() {
+        val (statusCode, responseBody) = sendGraphQLRequest("""{ greet(name: "Viaduct") }""")
+
+        statusCode shouldBe 200
+        responseBody shouldEqualJson """
+            {
+              "data": {
+                "greet": "Hello, Viaduct!"
+              }
+            }
+        """.trimIndent()
+    }
+
+    @Test
+    fun `Echo mutation returns the message`() {
+        val (statusCode, responseBody) = sendGraphQLRequest("""mutation { echo(message: "hello world") }""")
+
+        statusCode shouldBe 200
+        responseBody shouldEqualJson """
+            {
+              "data": {
+                "echo": "hello world"
               }
             }
         """.trimIndent()

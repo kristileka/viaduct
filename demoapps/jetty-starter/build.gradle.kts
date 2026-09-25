@@ -4,10 +4,6 @@ plugins {
     application
 }
 
-viaductApplication {
-    modulePackagePrefix.set("com.example.viadapp")
-}
-
 dependencies {
     implementation(libs.viaduct.api)
     implementation(libs.viaduct.runtime)
@@ -16,7 +12,11 @@ dependencies {
     implementation(libs.jackson.databind)
 
     // Coroutines for async execution
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3")
+    implementation(libs.kotlinx.coroutines.core)
+
+    implementation(libs.kotlinx.coroutines.jdk8)
+    implementation(libs.kotlin.reflect)
+    implementation(libs.reactive.streams)
 
     // Kotest common for runBlocking (used in ViaductServlet)
     implementation(libs.kotest.common)
@@ -25,8 +25,6 @@ dependencies {
     implementation(libs.jetty.server)
     implementation(libs.jetty.servlet)
     implementation(libs.jakarta.servlet.api)
-
-    implementation(project(":resolvers"))
 
     // Test dependencies
     testImplementation(libs.junit.jupiter)

@@ -1,25 +1,30 @@
 package com.example.viadapp.resolvers
 
+import com.example.viadapp.resolvers.resolverbases.MutationResolvers
 import com.example.viadapp.resolvers.resolverbases.QueryResolvers
-import viaduct.api.Resolver
+import viaduct.api.resolver.Resolver
 
 @Resolver
 class GreetingResolver : QueryResolvers.Greeting() {
-    override suspend fun resolve(ctx: Context): String {
-        return "Hello from Jetty + Viaduct!"
-    }
+    override suspend fun resolve(ctx: Context) = "Hello from Jetty + Viaduct!"
 }
 
 @Resolver
 class AuthorResolver : QueryResolvers.Author() {
-    override suspend fun resolve(ctx: Context): String {
-        return "Viaduct GraphQL with Jetty"
-    }
+    override suspend fun resolve(ctx: Context) = "Viaduct GraphQL with Jetty"
 }
 
 @Resolver
 class ThrowExceptionResolver : QueryResolvers.ThrowException() {
-    override suspend fun resolve(ctx: Context): String {
-        throw IllegalStateException("This is a resolver error")
-    }
+    override suspend fun resolve(ctx: Context): Nothing = error("This is a resolver error")
+}
+
+@Resolver
+class GreetResolver : QueryResolvers.Greet() {
+    override suspend fun resolve(ctx: Context) = "Hello, ${ctx.arguments.name}!"
+}
+
+@Resolver
+class EchoMutationResolver : MutationResolvers.Echo() {
+    override suspend fun resolve(ctx: Context) = ctx.arguments.message
 }

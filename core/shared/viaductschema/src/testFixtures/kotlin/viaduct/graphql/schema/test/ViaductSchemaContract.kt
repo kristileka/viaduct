@@ -1,0 +1,888 @@
+package viaduct.graphql.schema.test
+
+import io.kotest.matchers.types.shouldBeInstanceOf
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertSame
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
+import viaduct.graphql.schema.ViaductSchema
+import viaduct.graphql.schema.checkViaductSchemaInvariants
+import viaduct.invariants.FailureCollector
+
+typealias NSE = NoSuchElementException
+
+/**
+ * A contract test suite for [ViaductSchema] implementations.
+ *
+ * This interface provides a comprehensive set of JUnit 5 tests that verify
+ * the behavioral correctness of any [ViaductSchema] implementation. Implementers
+ * need only provide a [makeSchema] factory method, and they receive extensive
+ * test coverage for:
+ *
+ * - Default value handling for fields and arguments
+ * - Field path navigation
+ * - Override detection (`isOverride`)
+ * - Extension lists and applied directives
+ * - Whole-schema structural and referential invariants
+ * - Root type referential integrity
+ * - Type expression properties
+ *
+ * ## Usage
+ *
+ * To use this contract, create a test class that implements this interface:
+ *
+ * ```kotlin
+ * class MySchemaContractTest : ViaductSchemaContract {
+ *     override fun makeSchema(schema: String): ViaductSchema {
+ *         return MySchema.fromSDL(schema)
+ *     }
+ * }
+ * ```
+ *
+ * JUnit will automatically discover and run all the `@Test` methods defined
+ * in this interface.
+ *
+ * @see ViaductSchemaSubtypeContract for complementary tests verifying type structure
+ */
+interface ViaductSchemaContract {
+    companion object {
+        private fun ViaductSchema.withType(
+            type: String,
+            block: (ViaductSchema.TypeDef) -> Unit
+        ) = block(this.types[type] ?: throw IllegalArgumentException("Unknown type $type"))
+
+        private fun ViaductSchema.withExtensions(
+            type: String,
+            block: (Iterable<ViaductSchema.Extension<*, *>>) -> Unit
+        ) = block(
+            this.types[type]?.extensions
+                ?: throw IllegalArgumentException("Unknown type $type")
+        )
+
+        private fun ViaductSchema.withField(
+            type: String,
+            field: String,
+            block: (ViaductSchema.Field) -> Unit
+        ) = block((this.types[type]!! as ViaductSchema.Record).field(field)!!)
+
+        private fun ViaductSchema.withArg(
+            type: String,
+            field: String,
+            arg: String,
+            block: (ViaductSchema.FieldArg) -> Unit
+        ) = block((this.types[type]!! as ViaductSchema.Record).field(field)!!.args.find { it.name == arg }!!)
+
+        private fun ViaductSchema.withEnumValue(
+            enum: String,
+            value: String,
+            block: (ViaductSchema.EnumValue) -> Unit
+        ) = block((this.types[enum]!! as ViaductSchema.Enum).value(value)!!)
+
+        private fun assertToStingContains(
+            msg: String,
+            def: ViaductSchema.Def,
+            vararg expected: String
+        ) {
+            val actual = def.toString()
+            for (e in expected) {
+                assertTrue(actual.contains(e), "$msg: $actual")
+            }
+            assertTrue(actual.contains(def.name), "$msg: $actual")
+        }
+    }
+
+    /**
+     * Creates a checked [ViaductSchema] from SDL.
+     *
+     * The result from [makeSchema] is checked with [checkViaductSchemaInvariants] before it is
+     * returned, so every schema used by this contract must satisfy the whole-schema structural
+     * and referential invariants.
+     *
+     * @param schema A valid GraphQL SDL string
+     * @return A checked [ViaductSchema] parsed from the SDL
+     */
+    fun createSchema(schema: String): ViaductSchema =
+        makeSchema(schema).also {
+            FailureCollector()
+                .also { check -> checkViaductSchemaInvariants(it, check) }
+                .assertEmpty("\n")
+        }
+
+    /**
+     * Factory hook for the [ViaductSchema] implementation under test.
+     *
+     * Implementations should parse the given syntactically valid GraphQL SDL.
+     */
+    fun makeSchema(schema: String): ViaductSchema
+
+    @Test
+    fun `type definitions have exact input and output roles`() {
+        createSchema(
+            """
+                scalar Date
+                enum Status { ACTIVE }
+                input Filter { status: Status }
+                interface Node { id: ID! }
+                type Query implements Node { id: ID! }
+                union Search = Query
+            """.trimIndent()
+        ).apply {
+            fun assertRoles(
+                name: String,
+                input: Boolean,
+                output: Boolean,
+                simple: Boolean,
+                composite: Boolean,
+            ) {
+                val type = types.getValue(name)
+                assertEquals(input, type is ViaductSchema.InputTypeDef, "$name input role")
+                assertEquals(output, type is ViaductSchema.OutputTypeDef, "$name output role")
+                assertEquals(simple, type is ViaductSchema.SimpleTypeDef, "$name simple role")
+                assertEquals(composite, type is ViaductSchema.CompositeTypeDef, "$name composite role")
+            }
+
+            assertRoles("Date", input = true, output = true, simple = true, composite = false)
+            assertRoles("Status", input = true, output = true, simple = true, composite = false)
+            assertRoles("Filter", input = true, output = false, simple = false, composite = false)
+            assertRoles("Node", input = false, output = true, simple = false, composite = true)
+            assertRoles("Query", input = false, output = true, simple = false, composite = true)
+            assertRoles("Search", input = false, output = true, simple = false, composite = true)
+        }
+    }
+
+    @Test
+    fun `object fields preserve concrete object ownership`() {
+        createSchema(
+            """
+                interface Node { id: ID! }
+                type Query implements Node { id: ID! user: User }
+                type User { id: ID! }
+                input Filter { id: ID }
+            """.trimIndent()
+        ).apply {
+            val query = types.getValue("Query") as ViaductSchema.Object
+            val node = types.getValue("Node") as ViaductSchema.Interface
+            val filter = types.getValue("Filter") as ViaductSchema.Input
+
+            query.fields.forEach { field ->
+                assertSame(query, field.containingDef)
+                assertSame(query, field.containingExtension.def)
+            }
+            assertSame(query.fields.first { it.name == "id" }, query.field("id"))
+            assertTrue(node.fields.none { it is ViaductSchema.ObjectField })
+            assertTrue(filter.fields.none { it is ViaductSchema.ObjectField })
+        }
+    }
+
+    @Test
+    fun `Effective default funs should throw on fields of output types`() {
+        this@ViaductSchemaContract.createSchema(
+            """
+                type Query {
+                    foo: String
+                }
+                interface F {
+                    foo: String
+                }
+            """.trimIndent()
+        ).apply {
+            withField("Query", "foo") {
+                assertFalse(it.hasEffectiveDefault, "Query")
+                assertThrows<NSE>("Query") { it.effectiveDefaultValue }
+            }
+            withField("F", "foo") {
+                assertFalse(it.hasEffectiveDefault, "F")
+                assertThrows<NSE>("F") { it.effectiveDefaultValue }
+            }
+        }
+    }
+
+    @Test
+    fun `Effective default funs should throw on has-defaults with no default`() {
+        this@ViaductSchemaContract.createSchema(
+            """
+                type Query {
+                    foo(bar: String!): String
+                }
+                input I {
+                    foo: String!
+                }
+            """.trimIndent()
+        ).apply {
+            withArg("Query", "foo", "bar") {
+                assertFalse(it.hasEffectiveDefault, "Query")
+                assertThrows<NSE>("Query") { it.effectiveDefaultValue }
+            }
+            withField("I", "foo") {
+                assertFalse(it.hasEffectiveDefault, "I")
+                assertThrows<NSE>("I") { it.effectiveDefaultValue }
+            }
+        }
+    }
+
+    @Test
+    fun `Effective default funs shouldn't throw on has-defaults not from output types`() {
+        this@ViaductSchemaContract.createSchema(
+            """
+                type Query {
+                    foo(a: String, b: Int! = 1): String
+                }
+                input I {
+                    a: String
+                    b: Int! = 1
+                }
+            """.trimIndent()
+        ).apply {
+            withArg("Query", "foo", "a") {
+                assertTrue(it.hasEffectiveDefault, "Query.a")
+                it.effectiveDefaultValue.shouldBeInstanceOf<ViaductSchema.NullLiteral>()
+            }
+            withArg("Query", "foo", "b") {
+                assertTrue(it.hasEffectiveDefault, "Query.b")
+                assertNotNull(it.effectiveDefaultValue, "Query.b")
+            }
+            withField("I", "a") {
+                assertTrue(it.hasEffectiveDefault, "I.a")
+                it.effectiveDefaultValue.shouldBeInstanceOf<ViaductSchema.NullLiteral>()
+            }
+            withField("I", "b") {
+                assertTrue(it.hasEffectiveDefault, "I.b")
+                assertNotNull(it.effectiveDefaultValue, "I.b")
+            }
+        }
+    }
+
+    @Test
+    fun `Test the fields getter that takes a path`() {
+        this@ViaductSchemaContract.createSchema(
+            """
+                type Query {
+                    a: A
+                }
+                interface A {
+                    b: B
+                }
+                interface B {
+                    c: C
+                }
+                type C {
+                    d: String
+                }
+            """.trimIndent()
+        ).apply {
+            val query = this.types["Query"]!! as ViaductSchema.Object
+            assertThrows<IllegalArgumentException>("empty") { query.field(listOf()) }
+            assertThrows<IllegalArgumentException>("missing") { query.field(listOf("foo")) }
+            assertThrows<IllegalArgumentException>("scalar") { query.field(listOf("a", "b", "c", "d", "e")) }
+            withField("A", "b") { assertSame(it, query.field(listOf("a", "b"))) }
+            withField("B", "c") { assertSame(it, query.field(listOf("a", "b", "c"))) }
+            withField("C", "d") { assertSame(it, query.field(listOf("a", "b", "c", "d"))) }
+        }
+    }
+
+    @Test
+    fun `isOverride is computed correctly`() {
+        this@ViaductSchemaContract.createSchema(
+            """
+                type Query { foo: String }
+                interface A { a: String }
+                interface B implements A { a: String! b: String }
+                interface C implements A&B { a: String! b: String c: Int }
+            """.trimIndent()
+        ).apply {
+            withField("A", "a") {
+                assertFalse(it.isOverride, "A.a")
+            }
+            withField("B", "a") {
+                assertTrue(it.isOverride, "B.a")
+            }
+            withField("B", "b") {
+                assertFalse(it.isOverride, "B.b")
+            }
+            withField("C", "a") {
+                assertTrue(it.isOverride, "C.a")
+            }
+            withField("C", "b") {
+                assertTrue(it.isOverride, "C.b")
+            }
+            withField("C", "c") {
+                assertFalse(it.isOverride, "C.c")
+            }
+        }
+    }
+
+    @Test
+    fun `Descriptions are descriptive`() {
+        this@ViaductSchemaContract.createSchema(
+            """
+                type Query { foo(a: Int): String }
+                enum E { A }
+                input I { a: Int }
+                interface A { a(b: [String]): Int }
+                scalar S
+                union U = Query
+            """.trimIndent()
+        ).apply {
+            withType("Query") { assertToStingContains("Query", it, "Object") }
+            withField("Query", "foo") { assertToStingContains("Query.foo", it, "Field", "String") }
+            withArg("Query", "foo", "a") { assertToStingContains("Query.foo.a", it, "Arg", "Int") }
+            withType("E") { assertToStingContains("E", it, "Enum") }
+            (this.types["E"]!! as ViaductSchema.Enum).value("A")!!.let { assertToStingContains("E.A", it, "EnumValue") }
+            withType("I") { assertToStingContains("I", it, "Input") }
+            withField("I", "a") { assertToStingContains("I.a", it, "Field", "Int") }
+            withType("A") { assertToStingContains("A", it, "Interface") }
+            withField("A", "a") { assertToStingContains("A.a", it, "Field", "Int") }
+            withArg("A", "a", "b") { assertToStingContains("I.a.b", it, "Arg", "String") }
+            withType("S") { assertToStingContains("S", it, "Scalar") }
+            withType("U") { assertToStingContains("U", it, "Union") }
+        }
+    }
+
+    @Test
+    fun `asTypeExpr works`() {
+        this@ViaductSchemaContract.createSchema(
+            """
+                enum E { A }
+                input I { a: Int }
+                interface A { a(b: [String]): Int }
+                union U = Query
+                type Query {
+                  e0: E
+                  e1: E!
+                  e2: [E]
+                  i0(i:I): String
+                  a0: A
+                  s0: String
+                  s1: String!
+                  s2: [String]
+                  q0: Query
+                  u0: U
+                }
+            """.trimIndent()
+        ).apply {
+            withField("Query", "e0") {
+                assertTrue(it.type.isSimple, "e0")
+                assertFalse(it.type.isList, "[e0]")
+                assertEquals(0, it.type.listDepth, "[e0]d")
+                assertTrue(it.type.isNullable, "e0?")
+            }
+            withField("Query", "e1") {
+                assertTrue(it.type.isSimple, "e1")
+                assertFalse(it.type.isList, "[e1]")
+                assertEquals(0, it.type.listDepth, "[e1]d")
+                assertFalse(it.type.isNullable, "e1?")
+            }
+            withField("Query", "e2") {
+                assertFalse(it.type.isSimple, "e2")
+                assertTrue(it.type.isList, "[e2]")
+                assertEquals(1, it.type.listDepth, "[e2]d")
+                assertTrue(it.type.isNullable, "e2?")
+            }
+            withArg("Query", "i0", "i") {
+                assertFalse(it.type.isSimple, "i0")
+                assertFalse(it.type.isList, "[i0]")
+                assertEquals(0, it.type.listDepth, "[i0]d")
+                assertTrue(it.type.isNullable, "i0?")
+            }
+            withField("Query", "a0") {
+                assertFalse(it.type.isSimple, "a0")
+                assertFalse(it.type.isList, "[a0]")
+                assertEquals(0, it.type.listDepth, "[a0]d")
+                assertTrue(it.type.isNullable, "a0?")
+            }
+            withField("Query", "s0") {
+                assertTrue(it.type.isSimple, "s0")
+                assertFalse(it.type.isList, "[s0]")
+                assertEquals(0, it.type.listDepth, "[s0]d")
+                assertTrue(it.type.isNullable, "s0?")
+            }
+            withField("Query", "s1") {
+                assertTrue(it.type.isSimple, "s1")
+                assertFalse(it.type.isList, "[s1]")
+                assertEquals(0, it.type.listDepth, "[s1]d")
+                assertFalse(it.type.isNullable, "s1?")
+            }
+            withField("Query", "s2") {
+                assertFalse(it.type.isSimple, "s2")
+                assertTrue(it.type.isList, "[s2]")
+                assertEquals(1, it.type.listDepth, "[s2]d")
+                assertTrue(it.type.isNullable, "s2?")
+            }
+            withField("Query", "q0") {
+                assertFalse(it.type.isSimple, "q0")
+                assertFalse(it.type.isList, "[q0]")
+                assertEquals(0, it.type.listDepth, "[q0]d")
+                assertTrue(it.type.isNullable, "q0?")
+            }
+        }
+    }
+
+    @Test
+    fun `oneOf directive application`() {
+        fun mkSchema(sdl: String) =
+            this@ViaductSchemaContract.createSchema(
+                """
+                        schema { query: Query }
+                        type Query { placeholder: Int }
+                        $sdl
+                """.trimIndent()
+            )
+
+        // simple
+        mkSchema("input Input @oneOf { a: Int }")
+            .also {
+                assertTrue(it.types["Input"]!!.hasAppliedDirective("oneOf"))
+            }
+
+        // nested
+        mkSchema(
+            """
+            input Outer @oneOf { a: Inner }
+            input Inner @oneOf { a: Int }
+            """.trimIndent()
+        ).also { schema ->
+            listOf("Outer", "Inner").forEach { typeName ->
+                schema.withType(typeName) {
+                    assertTrue(it.hasAppliedDirective("oneOf"), it.name)
+                }
+            }
+        }
+
+        // recursive
+        mkSchema("input Input @oneOf { a: Input, value: Int }")
+            .also { s ->
+                s.withType("Input") {
+                    assertTrue(it.hasAppliedDirective("oneOf"), "Input")
+                }
+            }
+    }
+
+    @Test
+    fun `test extension lists are properly constructed`() {
+        this@ViaductSchemaContract.createSchema(
+            """
+                directive @d1 on UNION
+                type Query { f1: String }
+                extend type Query { f2: Int }
+                interface A { f1: String }
+                extend interface A { f2: Int }
+                enum E { V1 }
+                extend enum E { V2 }
+                input I { f1: String }
+                extend input I { f2: Int }
+                type T1 { f1: String }
+                type T2 { f2: Int }
+                union U = T1
+                extend union U = T2
+                extend union U @d1
+            """.trimIndent()
+        ).apply {
+            withExtensions("Query") {
+                assertEquals(2, it.count())
+                assertTrue(it.first().isBase)
+                assertFalse(it.last().isBase)
+            }
+            withExtensions("A") {
+                assertEquals(2, it.count())
+                assertTrue(it.first().isBase)
+                assertFalse(it.last().isBase)
+            }
+            withExtensions("E") {
+                assertEquals(2, it.count())
+                assertTrue(it.first().isBase)
+                assertFalse(it.last().isBase)
+            }
+            withExtensions("I") {
+                assertEquals(2, it.count())
+                assertTrue(it.first().isBase)
+                assertFalse(it.last().isBase)
+            }
+            withExtensions("T1") {
+                assertEquals(1, it.count())
+                assertTrue(it.first().isBase)
+            }
+            withExtensions("U") {
+                assertEquals(3, it.count())
+                assertTrue(it.first().isBase)
+                assertFalse(it.elementAt(1).isBase)
+                assertFalse(it.last().isBase)
+            }
+        }
+    }
+
+    @Test
+    fun `test appliedDirectives returns the right list of directive names`() {
+        this@ViaductSchemaContract.createSchema(
+            """
+                directive @d1 on OBJECT | INPUT_OBJECT | ENUM | INTERFACE | UNION
+                directive @d2 on OBJECT | INPUT_OBJECT | ENUM | INTERFACE | UNION
+                directive @d3 on FIELD_DEFINITION | INPUT_FIELD_DEFINITION | ENUM_VALUE
+                directive @d4 on FIELD_DEFINITION | INPUT_FIELD_DEFINITION | ENUM_VALUE
+                directive @d5 on ARGUMENT_DEFINITION
+                directive @d6 on ARGUMENT_DEFINITION
+                directive @d7 on SCALAR
+                directive @d8 on SCALAR
+                scalar CustomScalar @d7
+                extend scalar CustomScalar @d8
+                type Query @d1 {
+                    f1: String @d3
+                    f3(arg1: String @d5): Int
+                }
+                extend type Query @d2 {
+                    f2: Int @d3 @d4
+                    f4(arg2: Int @d5 @d6): String
+                }
+                enum Enum @d1 {
+                    V1 @d3
+                }
+                extend enum Enum @d2 {
+                    V2 @d3 @d4
+                }
+                input Input @d1 {
+                    f1: Boolean @d3
+                }
+                extend input Input @d2 {
+                    f2: Float @d3 @d4
+                }
+                interface Interface @d1 {
+                    f1: Enum @d3
+                    f3(arg3: Boolean @d5): String
+                }
+                extend interface Interface @d2 {
+                    f2: String @d3 @d4
+                }
+                type Object {
+                    f1: String
+                }
+                union Union @d1 = Query
+                extend union Union @d2 = Object
+            """.trimIndent()
+        ).apply {
+            listOf("Query", "Enum", "Input", "Interface", "Union").forEach { typeName ->
+                withType(typeName) {
+                    assertEquals(listOf("d1", "d2"), it.appliedDirectives.map { d -> d.name })
+                }
+            }
+            withField("Query", "f1") {
+                assertEquals(listOf("d3"), it.appliedDirectives.map { d -> d.name })
+            }
+            withField("Query", "f2") {
+                assertEquals(listOf("d3", "d4"), it.appliedDirectives.map { d -> d.name })
+            }
+            withEnumValue("Enum", "V1") {
+                assertEquals(listOf("d3"), it.appliedDirectives.map { d -> d.name })
+            }
+            withEnumValue("Enum", "V2") {
+                assertEquals(listOf("d3", "d4"), it.appliedDirectives.map { d -> d.name })
+            }
+            withField("Input", "f1") {
+                assertEquals(listOf("d3"), it.appliedDirectives.map { d -> d.name })
+            }
+            withField("Input", "f2") {
+                assertEquals(listOf("d3", "d4"), it.appliedDirectives.map { d -> d.name })
+            }
+            withField("Interface", "f1") {
+                assertEquals(listOf("d3"), it.appliedDirectives.map { d -> d.name })
+            }
+            withField("Interface", "f2") {
+                assertEquals(listOf("d3", "d4"), it.appliedDirectives.map { d -> d.name })
+            }
+            withArg("Query", "f3", "arg1") {
+                assertEquals(listOf("d5"), it.appliedDirectives.map { d -> d.name })
+            }
+            withArg("Query", "f4", "arg2") {
+                assertEquals(listOf("d5", "d6"), it.appliedDirectives.map { d -> d.name })
+            }
+            withArg("Interface", "f3", "arg3") {
+                assertEquals(listOf("d5"), it.appliedDirectives.map { d -> d.name })
+            }
+            withType("CustomScalar") {
+                assertEquals(listOf("d7", "d8"), it.appliedDirectives.map { d -> d.name })
+            }
+        }
+    }
+
+    @Test
+    fun `test extensionAppliedDirectives`() {
+        fun assertions(
+            extensionAppliedDirectives: Iterable<ViaductSchema.AppliedDirective<*>>,
+            a1Value: String
+        ) {
+            assertEquals(1, extensionAppliedDirectives.count())
+            val dir = extensionAppliedDirectives.first()
+            assertEquals("d1", dir.name)
+            val argValue = dir.arguments["a1"]
+            argValue.shouldBeInstanceOf<ViaductSchema.StringLiteral>()
+            assertEquals(a1Value, argValue.value)
+        }
+        this@ViaductSchemaContract.createSchema(
+            """
+                directive @d1(a1: String) repeatable on OBJECT | INPUT_OBJECT | ENUM | INTERFACE | UNION
+                type Query @d1(a1: "obj1") {
+                    f1: String
+                }
+                extend type Query @d1(a1: "obj2") {
+                    f2: Int
+                }
+                enum Enum @d1(a1: "enum1") {
+                    V1
+                }
+                extend enum Enum @d1(a1: "enum2") {
+                    V2
+                }
+                input Input @d1(a1: "input1") {
+                    f1: Int
+                }
+                extend input Input @d1(a1: "input2") {
+                    f2: Boolean
+                }
+                interface Interface @d1(a1: "interf1") {
+                    f1: Enum
+                }
+                extend interface Interface @d1(a1: "interf2") {
+                    f2: String
+                }
+            """.trimIndent()
+        ).apply {
+            withEnumValue("Enum", "V1") { assertions(it.containingExtension.appliedDirectives, "enum1") }
+            withEnumValue("Enum", "V2") { assertions(it.containingExtension.appliedDirectives, "enum2") }
+
+            withField("Query", "f1") { assertions(it.containingExtension.appliedDirectives, "obj1") }
+            withField("Query", "f2") { assertions(it.containingExtension.appliedDirectives, "obj2") }
+
+            withField("Input", "f1") { assertions(it.containingExtension.appliedDirectives, "input1") }
+            withField("Input", "f2") { assertions(it.containingExtension.appliedDirectives, "input2") }
+
+            withField("Interface", "f1") { assertions(it.containingExtension.appliedDirectives, "interf1") }
+            withField("Interface", "f2") { assertions(it.containingExtension.appliedDirectives, "interf2") }
+        }
+    }
+
+    @Test
+    fun `test root referential integrity`() {
+        this@ViaductSchemaContract.createSchema(
+            """
+                schema {
+                   query: Foo
+                   mutation: Bar
+                   subscription: Baz
+                }
+                type Foo { blank: String }
+                type Bar { blank: String }
+                type Baz { blank: String }
+            """.trimIndent()
+        ).apply {
+            assertSame(this.types["Foo"], this.queryTypeDef)
+            assertSame(this.types["Bar"], this.mutationTypeDef)
+            assertSame(this.types["Baz"], this.subscriptionTypeDef)
+        }
+    }
+
+    @Test
+    fun `test null roots are null`() {
+        this@ViaductSchemaContract.createSchema(
+            """
+                schema {
+                   query: Query
+                }
+                type Query { blank: String }
+            """.trimIndent()
+        ).apply {
+            assertNull(this.mutationTypeDef)
+            assertNull(this.subscriptionTypeDef)
+        }
+    }
+
+    @Test
+    fun `appliedDirectives on directive args are populated`() {
+        this@ViaductSchemaContract.createSchema(
+            """
+                directive @meta(info: String!) on ARGUMENT_DEFINITION
+                directive @validated(min: Int @meta(info: "test")) on FIELD_DEFINITION
+                type Query { f: String @validated(min: 0) }
+            """.trimIndent()
+        ).apply {
+            val validated = this.directives["validated"]!!
+            val minArg = validated.args.first { it.name == "min" }
+            assertEquals(
+                listOf("meta"),
+                minArg.appliedDirectives.map { it.name },
+                "DirectiveArg.appliedDirectives should include @meta"
+            )
+            // Verify the argument value was decoded correctly
+            val metaApp = minArg.appliedDirectives.first()
+            metaApp.arguments["info"].shouldBeInstanceOf<ViaductSchema.StringLiteral>()
+            assertEquals("test", (metaApp.arguments["info"] as ViaductSchema.StringLiteral).value)
+        }
+    }
+
+    @Test
+    fun `appliedDirectiveDefs returns directive definitions`() {
+        this@ViaductSchemaContract.createSchema(
+            """
+                directive @d1 on OBJECT | FIELD_DEFINITION | ENUM_VALUE
+                directive @d2 on OBJECT | FIELD_DEFINITION | ENUM_VALUE
+                directive @d3 repeatable on OBJECT
+                type Query @d1 @d2 {
+                    f1: String @d1
+                    f2: String @d2
+                }
+                type Tagged @d3 @d3 {
+                    stub: String
+                }
+                enum E {
+                    V1 @d1
+                    V2
+                }
+            """.trimIndent()
+        ).apply {
+            // Type with two different directives
+            val query = this.types["Query"]!!
+            assertEquals(
+                setOf("d1", "d2"),
+                query.appliedDirectiveDefs().map { it.name }.toSet()
+            )
+
+            // Field with one directive
+            val f1 = (query as ViaductSchema.Record).field("f1")!!
+            assertEquals(
+                listOf("d1"),
+                f1.appliedDirectiveDefs().map { it.name }
+            )
+
+            // Repeatable directive: same directive appears once in defs
+            val tagged = this.types["Tagged"]!!
+            assertEquals(
+                listOf("d3", "d3"),
+                tagged.appliedDirectiveDefs().map { it.name }
+            )
+
+            // Enum value with directive
+            val v1 = (this.types["E"]!! as ViaductSchema.Enum).value("V1")!!
+            assertEquals(
+                listOf("d1"),
+                v1.appliedDirectiveDefs().map { it.name }
+            )
+
+            // Enum value with no directive
+            val v2 = (this.types["E"]!! as ViaductSchema.Enum).value("V2")!!
+            assertTrue(v2.appliedDirectiveDefs().isEmpty())
+        }
+    }
+
+    @Test
+    fun `type with description returns description content`() {
+        val schema = createSchema(
+            """
+                ${"\"\"\""}A documented type${"\"\"\""}
+                type Query {
+                    foo: String
+                }
+            """.trimIndent()
+        )
+        assertEquals("A documented type", schema.types["Query"]!!.description)
+    }
+
+    @Test
+    fun `type without description returns null`() {
+        val schema = createSchema(
+            """
+                type Query {
+                    foo: String
+                }
+            """.trimIndent()
+        )
+        assertNull(schema.types["Query"]!!.description)
+    }
+
+    @Test
+    fun `field with description returns description content`() {
+        val schema = createSchema(
+            """
+                type Query {
+                    ${"\"\"\""}A documented field${"\"\"\""}
+                    foo: String
+                }
+            """.trimIndent()
+        )
+        val field = (schema.types["Query"] as ViaductSchema.Record).field("foo")
+        assertEquals("A documented field", field!!.description)
+    }
+
+    @Test
+    fun `field without description returns null`() {
+        val schema = createSchema(
+            """
+                type Query {
+                    foo: String
+                }
+            """.trimIndent()
+        )
+        val field = (schema.types["Query"] as ViaductSchema.Record).field("foo")
+        assertNull(field!!.description)
+    }
+
+    @Test
+    fun `enum value with description returns description content`() {
+        val schema = createSchema(
+            """
+                type Query { foo: Status }
+                enum Status {
+                    ${"\"\"\""}Active status${"\"\"\""}
+                    ACTIVE
+                    INACTIVE
+                }
+            """.trimIndent()
+        )
+        val enumDef = schema.types["Status"] as ViaductSchema.Enum
+        assertEquals("Active status", enumDef.value("ACTIVE")!!.description)
+        assertNull(enumDef.value("INACTIVE")!!.description)
+    }
+
+    @Test
+    fun `multi-line description is preserved`() {
+        val schema = createSchema(
+            "\"\"\"" + """
+First line
+Second line
+            """.trimIndent() + "\"\"\"\n" + """
+                type Query {
+                    foo: String
+                }
+            """.trimIndent()
+        )
+        val desc = schema.types["Query"]!!.description
+        assertNotNull(desc)
+        assertTrue(desc!!.contains("First line"))
+        assertTrue(desc.contains("Second line"))
+    }
+
+    @Test
+    fun `test containingSchema referential integrity`() {
+        this@ViaductSchemaContract.createSchema(
+            """
+                directive @d1 on OBJECT
+                type Query { foo: String }
+                enum E { A }
+                input I { a: Int }
+                interface A { a: String }
+                scalar S
+                type T implements A { a: String }
+                union U = Query | T
+            """.trimIndent()
+        ).apply {
+            // Every TypeDef's containingSchema should be this schema
+            for ((name, typeDef) in this.types) {
+                assertSame(this, typeDef.containingSchema, "TypeDef $name containingSchema")
+            }
+            // Every Directive's containingSchema should be this schema
+            for ((name, directive) in this.directives) {
+                assertSame(this, directive.containingSchema, "Directive $name containingSchema")
+            }
+        }
+    }
+}

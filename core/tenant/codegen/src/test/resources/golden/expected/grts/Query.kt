@@ -1,0 +1,206 @@
+@file:Suppress("warnings")
+
+package viaduct.api.grts
+
+import viaduct.apiannotations.InternalApi
+import viaduct.api.context.ExecutionContext
+import viaduct.api.internal.InternalContext
+import viaduct.api.internal.ObjectBase
+import viaduct.engine.api.EngineObject
+import viaduct.engine.api.EngineObjectData
+
+@OptIn(InternalApi::class)
+class Query(context: InternalContext, engineObject: EngineObject)
+    : ObjectBase(context, engineObject), viaduct.api.types.Object,viaduct.api.types.Query
+{
+     fun getOrderOrThrow(alias: String?): viaduct.api.grts.Order? = TODO()
+     fun getOrderOrThrow(): viaduct.api.grts.Order? = TODO()
+     fun getOrder(alias: String?): viaduct.api.grts.Order? = TODO()
+     fun getOrder(): viaduct.api.grts.Order? = TODO()
+
+     fun getTopUserOrThrow(alias: String?): viaduct.api.grts.User? = TODO()
+     fun getTopUserOrThrow(): viaduct.api.grts.User? = TODO()
+     fun getTopUser(alias: String?): viaduct.api.grts.User? = TODO()
+     fun getTopUser(): viaduct.api.grts.User? = TODO()
+
+     fun getPopularOrdersOrThrow(alias: String?): kotlin.collections.List<viaduct.api.grts.Order> = TODO()
+     fun getPopularOrdersOrThrow(): kotlin.collections.List<viaduct.api.grts.Order> = TODO()
+     fun getPopularOrders(alias: String?): kotlin.collections.List<viaduct.api.grts.Order>? = TODO()
+     fun getPopularOrders(): kotlin.collections.List<viaduct.api.grts.Order>? = TODO()
+
+     fun getTrendingUsersOrThrow(alias: String?): kotlin.collections.List<viaduct.api.grts.User> = TODO()
+     fun getTrendingUsersOrThrow(): kotlin.collections.List<viaduct.api.grts.User> = TODO()
+     fun getTrendingUsers(alias: String?): kotlin.collections.List<viaduct.api.grts.User>? = TODO()
+     fun getTrendingUsers(): kotlin.collections.List<viaduct.api.grts.User>? = TODO()
+
+     fun getOrdersConnectionOrThrow(alias: String?): viaduct.api.grts.OrderConnection? = TODO()
+     fun getOrdersConnectionOrThrow(): viaduct.api.grts.OrderConnection? = TODO()
+     fun getOrdersConnection(alias: String?): viaduct.api.grts.OrderConnection? = TODO()
+     fun getOrdersConnection(): viaduct.api.grts.OrderConnection? = TODO()
+
+     fun getNodeOrThrow(alias: String?): viaduct.api.grts.Node? = TODO()
+     fun getNodeOrThrow(): viaduct.api.grts.Node? = TODO()
+     fun getNode(alias: String?): viaduct.api.grts.Node? = TODO()
+     fun getNode(): viaduct.api.grts.Node? = TODO()
+
+     fun getNodesOrThrow(alias: String?): kotlin.collections.List<viaduct.api.grts.Node?> = TODO()
+     fun getNodesOrThrow(): kotlin.collections.List<viaduct.api.grts.Node?> = TODO()
+     fun getNodes(alias: String?): kotlin.collections.List<viaduct.api.grts.Node?>? = TODO()
+     fun getNodes(): kotlin.collections.List<viaduct.api.grts.Node?>? = TODO()
+
+
+    fun toBuilder(): Builder =
+        Builder(__context, __engineObject.type, toBuilderEOD())
+
+    companion object {
+            fun order(
+                configure: OrderArguments.() -> Unit,
+            ): viaduct.api.context.RootFieldCall<viaduct.api.grts.Order> =
+                OrderRootFieldCall(configure)
+
+            fun topUser(): viaduct.api.context.RootFieldCall<viaduct.api.grts.User> = TopUserRootFieldCall
+
+            fun ordersConnection(
+                configure: OrdersConnectionArguments.() -> Unit,
+            ): viaduct.api.context.RootFieldCall<viaduct.api.grts.OrderConnection> =
+                OrdersConnectionRootFieldCall(configure)
+
+    }
+
+    class OrderArguments internal constructor(
+        private val arguments: viaduct.api.grts.Query_Order_Arguments.Builder
+    ) {
+            fun id(value: kotlin.String): OrderArguments = apply {
+                arguments.id(value)
+            }
+
+    }
+
+
+    class OrdersConnectionArguments internal constructor(
+        private val arguments: viaduct.api.grts.Query_OrdersConnection_Arguments.Builder
+    ) {
+            fun first(value: kotlin.Int): OrdersConnectionArguments = apply {
+                arguments.first(value)
+            }
+
+            fun after(value: kotlin.String?): OrdersConnectionArguments = apply {
+                arguments.after(value)
+            }
+
+    }
+
+
+    internal class OrderRootFieldCall(
+        private val configure: OrderArguments.() -> Unit
+    ) : viaduct.api.context.RootFieldCall<viaduct.api.grts.Order> {
+        override fun field(): viaduct.api.reflect.RootObjectField<*, viaduct.api.grts.Order, viaduct.api.types.Arguments> =
+            Fields.order
+
+        override fun arguments(
+            context: viaduct.api.context.ExecutionContext
+        ): viaduct.api.types.Arguments {
+            val arguments = viaduct.api.grts.Query_Order_Arguments.Builder(context)
+            configure.invoke(OrderArguments(arguments))
+            return arguments.build()
+        }
+    }
+
+
+    internal object TopUserRootFieldCall : viaduct.api.context.RootFieldCall<viaduct.api.grts.User> {
+        override fun field(): viaduct.api.reflect.RootObjectField<*, viaduct.api.grts.User, viaduct.api.types.Arguments> =
+            Fields.topUser
+
+        override fun arguments(
+            context: viaduct.api.context.ExecutionContext
+        ): viaduct.api.types.Arguments {
+            return viaduct.api.types.Arguments.NoArguments
+        }
+    }
+
+
+    internal class OrdersConnectionRootFieldCall(
+        private val configure: OrdersConnectionArguments.() -> Unit
+    ) : viaduct.api.context.RootFieldCall<viaduct.api.grts.OrderConnection> {
+        override fun field(): viaduct.api.reflect.RootObjectField<*, viaduct.api.grts.OrderConnection, viaduct.api.types.Arguments> =
+            Fields.ordersConnection
+
+        override fun arguments(
+            context: viaduct.api.context.ExecutionContext
+        ): viaduct.api.types.Arguments {
+            val arguments = viaduct.api.grts.Query_OrdersConnection_Arguments.Builder(context)
+            configure.invoke(OrdersConnectionArguments(arguments))
+            return arguments.build()
+        }
+    }
+
+    object of {
+        operator fun invoke(context: ExecutionContext, block: Builder.() -> Unit): Query =
+            Builder(context).apply(block).build()
+    }
+
+    class Builder : ObjectBase.Builder<Query> {
+        constructor(context: ExecutionContext)
+            : super(
+                context as InternalContext,
+                TODO() as graphql.schema.GraphQLObjectType,
+                null
+            )
+
+        internal constructor(
+            context: InternalContext,
+            type: graphql.schema.GraphQLObjectType,
+            baseEngineObjectData: EngineObjectData.Sync
+        ) : super(context, type, baseEngineObjectData)
+
+                  fun order(value: viaduct.api.grts.Order?): Builder = TODO()
+
+                  fun topUser(value: viaduct.api.grts.User?): Builder = TODO()
+
+                  fun popularOrders(value: kotlin.collections.List<viaduct.api.grts.Order>): Builder = TODO()
+
+                  fun trendingUsers(value: kotlin.collections.List<viaduct.api.grts.User>): Builder = TODO()
+
+                  fun ordersConnection(value: viaduct.api.grts.OrderConnection?): Builder = TODO()
+
+                  fun node(value: viaduct.api.grts.Node?): Builder = TODO()
+
+                  fun nodes(value: kotlin.collections.List<viaduct.api.grts.Node?>): Builder = TODO()
+
+
+        final override fun build(): Query = TODO()
+    }
+
+    @OptIn(viaduct.apiannotations.InternalApi::class)
+    object Reflection : viaduct.api.reflect.Type<viaduct.api.grts.Query> {
+        override final val name = "Query"
+        override final val kcls = viaduct.api.grts.Query::class
+    }
+    object Fields : viaduct.api.reflect.TypeFields<viaduct.api.grts.Query> {
+            final val __typename: viaduct.api.reflect.Field<viaduct.api.grts.Query> =
+                viaduct.api.internal.FieldImpl("__typename", viaduct.api.grts.Query.Reflection)
+
+            final val order: viaduct.api.reflect.RootObjectField<viaduct.api.grts.Query, viaduct.api.grts.Order, viaduct.api.grts.Query_Order_Arguments> =
+                viaduct.api.internal.RootObjectFieldImpl("order", viaduct.api.grts.Query.Reflection, viaduct.api.grts.Order.Reflection, listOf("order"))
+
+            final val topUser: viaduct.api.reflect.RootObjectField<viaduct.api.grts.Query, viaduct.api.grts.User, viaduct.api.types.Arguments.NoArguments> =
+                viaduct.api.internal.RootObjectFieldImpl("topUser", viaduct.api.grts.Query.Reflection, viaduct.api.grts.User.Reflection, listOf("topUser"))
+
+            final val popularOrders: viaduct.api.reflect.CompositeField<viaduct.api.grts.Query, viaduct.api.grts.Order> =
+                viaduct.api.internal.CompositeFieldImpl("popularOrders", viaduct.api.grts.Query.Reflection, viaduct.api.grts.Order.Reflection)
+
+            final val trendingUsers: viaduct.api.reflect.CompositeField<viaduct.api.grts.Query, viaduct.api.grts.User> =
+                viaduct.api.internal.CompositeFieldImpl("trendingUsers", viaduct.api.grts.Query.Reflection, viaduct.api.grts.User.Reflection)
+
+            final val ordersConnection: viaduct.api.reflect.RootObjectField<viaduct.api.grts.Query, viaduct.api.grts.OrderConnection, viaduct.api.grts.Query_OrdersConnection_Arguments> =
+                viaduct.api.internal.RootObjectFieldImpl("ordersConnection", viaduct.api.grts.Query.Reflection, viaduct.api.grts.OrderConnection.Reflection, listOf("ordersConnection"))
+
+            final val node: viaduct.api.reflect.CompositeField<viaduct.api.grts.Query, viaduct.api.grts.Node> =
+                viaduct.api.internal.CompositeFieldImpl("node", viaduct.api.grts.Query.Reflection, viaduct.api.grts.Node.Reflection)
+
+            final val nodes: viaduct.api.reflect.CompositeField<viaduct.api.grts.Query, viaduct.api.grts.Node> =
+                viaduct.api.internal.CompositeFieldImpl("nodes", viaduct.api.grts.Query.Reflection, viaduct.api.grts.Node.Reflection)
+
+    }
+
+}

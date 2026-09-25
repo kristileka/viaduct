@@ -1,0 +1,420 @@
+@file:Suppress("ForbiddenImport")
+
+package viaduct.engine.runtime
+
+import io.mockk.mockk
+import kotlinx.coroutines.runBlocking
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
+import org.junit.jupiter.api.Assertions.assertSame
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.assertThrows
+import viaduct.engine.api.mocks.createSchema
+import viaduct.errors.UnsetFieldException
+import viaduct.errors.handleFrameworkErrors
+import viaduct.errors.nullOnDataFailure
+
+class SyncProxyEngineObjectDataTest {
+    private val schema = createSchema(
+        """
+            type Obj { x: Int, y: String }
+            extend type Query { x: Int }
+        """.trimIndent()
+    )
+    private val obj = schema.schema.getObjectType("Obj")
+
+    // ============================================================================
+    // Basic functionality tests
+    // ============================================================================
+
+    @Test
+    fun `get -- returns stored values`() {
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to 1, "y" to "hello")
+        )
+
+        assertEquals(1, eod.get("x"))
+        assertEquals("hello", eod.get("y"))
+    }
+
+    @Test
+    fun `get -- returns null for null values`() {
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to null)
+        )
+
+        assertEquals(null, eod.get("x"))
+    }
+
+    @Test
+    fun `get -- throws UnsetFieldException for missing selection`() {
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to 1)
+        )
+
+        assertThrows<UnsetFieldException> {
+            eod.get("missing")
+        }
+    }
+
+    @Test
+    fun `get -- uses custom error message template`() {
+        val customMessage = "add it to @Resolver's objectValueFragment"
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to 1),
+            customMessage
+        )
+
+        val exception = assertThrows<UnsetFieldException> {
+            eod.get("missing")
+        }
+        assert(exception.message?.contains(customMessage) == true) {
+            "Expected message to contain custom error, but was: ${exception.message}"
+        }
+    }
+
+    @Test
+    fun `getOrNull -- returns stored values`() {
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to 1)
+        )
+
+        assertEquals(1, eod.getOrNull("x"))
+    }
+
+    @Test
+    fun `getOrNull -- returns null for missing selection`() {
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to 1)
+        )
+
+        assertEquals(null, eod.getOrNull("missing"))
+    }
+
+    @Test
+    fun `getSelections -- returns all keys`() {
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to 1, "y" to "hello")
+        )
+
+        assertEquals(setOf("x", "y"), eod.getSelections().toSet())
+    }
+
+    @Test
+    fun `isPresent distinguishes stored null from an unset selection`() {
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to 1, "y" to null),
+        )
+
+        assertTrue(eod.isPresent("x"))
+        assertTrue(eod.isPresent("y"))
+        assertFalse(eod.isPresent("missing"))
+    }
+
+    @Test
+    fun `type -- returns the object type`() {
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to 1)
+        )
+
+        assertSame(obj, eod.type)
+    }
+
+    // ============================================================================
+    // Error handling tests - stored exceptions are thrown on access
+    // ============================================================================
+
+    @Test
+    fun `isPresent returns true when reading the selection throws a stored exception`() {
+        val storedException = IllegalStateException("test error")
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to storedException)
+        )
+
+        assertTrue(eod.isPresent("x"))
+        val thrown = assertThrows<IllegalStateException> {
+            eod.get("x")
+        }
+        assertSame(storedException, thrown)
+    }
+
+    @Test
+    fun `get -- throws stored FieldErrorsException`() {
+        val storedException = FieldErrorsException(emptyList())
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to storedException)
+        )
+
+        val thrown = assertThrows<FieldErrorsException> {
+            eod.get("x")
+        }
+        assertSame(storedException, thrown)
+    }
+
+    @Test
+    fun `soft accessor handling returns null for stored field errors`() {
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to FieldErrorsException(emptyList()))
+        )
+
+        val result = nullOnDataFailure {
+            handleFrameworkErrors("Obj.x") { eod.get("x") }
+        }
+
+        assertNull(result)
+    }
+
+    @Test
+    fun `getOrNull -- throws stored exception`() {
+        val storedException = RuntimeException("access denied")
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to storedException)
+        )
+
+        val thrown = assertThrows<RuntimeException> {
+            eod.getOrNull("x")
+        }
+        assertSame(storedException, thrown)
+    }
+
+    @Test
+    fun `get -- stored exception preserves original stack trace`() {
+        // Create exception with a known stack trace
+        val storedException = IllegalAccessException("no access")
+        val originalStackTrace = storedException.stackTrace
+
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to storedException)
+        )
+
+        val thrown = assertThrows<IllegalAccessException> {
+            eod.get("x")
+        }
+
+        // The rethrown exception should have the same stack trace as the original
+        assertEquals(originalStackTrace.toList(), thrown.stackTrace.toList())
+    }
+
+    @Test
+    fun `mixed values and errors -- only errors throw on access`() {
+        val storedException = RuntimeException("error on y")
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf(
+                "x" to 42,
+                "y" to storedException
+            )
+        )
+
+        // x should return normally
+        assertEquals(42, eod.get("x"))
+
+        // y should throw
+        val thrown = assertThrows<RuntimeException> {
+            eod.get("y")
+        }
+        assertSame(storedException, thrown)
+    }
+
+    @Test
+    fun `getSelections -- includes keys with stored exceptions`() {
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf(
+                "x" to 1,
+                "y" to RuntimeException("error")
+            )
+        )
+
+        // Both keys should be in selections, even though y has an error
+        assertEquals(setOf("x", "y"), eod.getSelections().toSet())
+    }
+
+    // ============================================================================
+    // Suspend method tests - verify delegation to sync methods
+    // ============================================================================
+
+    @Test
+    fun `fetch -- delegates to get`() =
+        runBlocking {
+            val eod = SyncProxyEngineObjectData(
+                obj,
+                mapOf("x" to 1, "y" to "hello")
+            )
+
+            assertEquals(1, eod.fetch("x"))
+            assertEquals("hello", eod.fetch("y"))
+        }
+
+    @Test
+    fun `fetch -- throws UnsetFieldException for missing selection`() =
+        runBlocking {
+            val eod = SyncProxyEngineObjectData(
+                obj,
+                mapOf("x" to 1)
+            )
+
+            assertThrows<UnsetFieldException> {
+                eod.fetch("missing")
+            }
+        }
+
+    @Test
+    fun `fetch -- throws stored exception`() =
+        runBlocking {
+            val storedException = RuntimeException("test error")
+            val eod = SyncProxyEngineObjectData(
+                obj,
+                mapOf("x" to storedException)
+            )
+
+            val thrown = assertThrows<RuntimeException> {
+                eod.fetch("x")
+            }
+            assertSame(storedException, thrown)
+        }
+
+    @Test
+    fun `fetchOrNull -- delegates to getOrNull`() =
+        runBlocking {
+            val eod = SyncProxyEngineObjectData(
+                obj,
+                mapOf("x" to 1)
+            )
+
+            assertEquals(1, eod.fetchOrNull("x"))
+            assertNull(eod.fetchOrNull("missing"))
+        }
+
+    @Test
+    fun `fetchOrNull -- throws stored exception`() =
+        runBlocking {
+            val storedException = RuntimeException("test error")
+            val eod = SyncProxyEngineObjectData(
+                obj,
+                mapOf("x" to storedException)
+            )
+
+            val thrown = assertThrows<RuntimeException> {
+                eod.fetchOrNull("x")
+            }
+            assertSame(storedException, thrown)
+        }
+
+    @Test
+    fun `fetchSelections -- delegates to getSelections`() =
+        runBlocking {
+            val eod = SyncProxyEngineObjectData(
+                obj,
+                mapOf("x" to 1, "y" to "hello")
+            )
+
+            assertEquals(setOf("x", "y"), eod.fetchSelections().toSet())
+        }
+
+    // ============================================================================
+    // conditionallyExcludedResultKeys tests
+    // ============================================================================
+
+    @Test
+    fun `get -- returns null for excluded key instead of throwing UnsetFieldException`() {
+        // Excluded keys are never fetched, so they are absent from data entirely.
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to 1),
+            conditionallyExcludedResultKeys = setOf("y")
+        )
+
+        assertNull(eod.get("y"))
+    }
+
+    @Test
+    fun `isPresent returns true for a conditionally excluded selection`() {
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            emptyMap(),
+            conditionallyExcludedResultKeys = setOf("y"),
+        )
+
+        assertTrue(eod.isPresent("y"))
+        assertFalse(eod.isPresent("missing"))
+    }
+
+    @Test
+    fun `get -- throws UnsetFieldException for key absent from both data and excludedKeys`() {
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to 1),
+            conditionallyExcludedResultKeys = setOf("y")
+        )
+
+        assertThrows<UnsetFieldException> {
+            eod.get("missing")
+        }
+    }
+
+    @Test
+    fun `get -- multiple excluded keys all return null`() {
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            emptyMap(),
+            conditionallyExcludedResultKeys = setOf("x", "y")
+        )
+
+        assertNull(eod.get("x"))
+        assertNull(eod.get("y"))
+    }
+
+    @Test
+    fun `fetch -- returns null for excluded key`() =
+        runBlocking {
+            val eod = SyncProxyEngineObjectData(
+                obj,
+                mapOf("x" to 1),
+                conditionallyExcludedResultKeys = setOf("y")
+            )
+
+            assertNull(eod.fetch("y"))
+        }
+
+    @Test
+    fun `checker wrapper preserves presence semantics`() {
+        val delegate = SyncProxyEngineObjectData(obj, mapOf("x" to null))
+        val eod = CheckerSyncEngineObjectData(mockk(), delegate)
+
+        assertTrue(eod.isPresent("x"))
+        assertFalse(eod.isPresent("missing"))
+    }
+
+    // ============================================================================
+    // toString test
+    // ============================================================================
+
+    @Test
+    fun `toString -- includes type name and data`() {
+        val eod = SyncProxyEngineObjectData(
+            obj,
+            mapOf("x" to 1, "y" to "hello")
+        )
+
+        val str = eod.toString()
+        assertTrue(str.contains("Obj")) { "Expected type name 'Obj' in toString: $str" }
+        assertTrue(str.contains("SyncProxyEngineObjectData")) { "Expected class name in toString: $str" }
+    }
+}

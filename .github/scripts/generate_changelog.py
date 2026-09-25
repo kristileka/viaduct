@@ -17,6 +17,8 @@ from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterator
 
+import author_mappings as _author_mappings
+
 from semantic_release.commit_parser.conventional import ConventionalCommitParser
 from semantic_release.commit_parser.token import ParsedMessageResult, ParseResult
 from semantic_release.enums import LevelBump
@@ -95,6 +97,10 @@ def extract_username_from_email(email: str) -> str | None:
     if not email:
         return None
 
+    mapped = _author_mappings.map_email(email)
+    if mapped:
+        return None if mapped in BOT_USERNAMES else f"@{mapped}"
+
     match = re.search(r'^([^@]+)@', email)
     if not match:
         return None
@@ -116,15 +122,11 @@ def extract_username_from_coauthor(author_line: str) -> str | None:
     Returns:
         Username prefixed with @ (e.g., '@email'), or None if invalid/bot
     """
-    match = re.search(r'<([^@]+)@', author_line)
+    match = re.search(r'<([^>]+)>', author_line)
     if not match:
         return None
 
-    username = match.group(1)
-    if username in BOT_USERNAMES:
-        return None
-
-    return f"@{username}"
+    return extract_username_from_email(match.group(1))
 
 
 def clean_commit_message(message: str) -> str:
@@ -141,6 +143,89 @@ def clean_commit_message(message: str) -> str:
     for pattern in METADATA_PATTERNS:
         cleaned = re.sub(pattern, '', cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
+
+
+def strip_conventional_prefix(message: str) -> str:
+    """Strip 'type(scope)!: ' prefix from a conventional commit subject."""
+    match = re.match(r'^[a-z]+(\([^)]+\))?!?:\s*', message)
+    return message[match.end():] if match else message
+
+
+def capitalize_first(text: str) -> str:
+    """Uppercase the first character of text, preserving the rest as-is."""
+    if not text:
+        return text
+    return text[0].upper() + text[1:]
+
+
+# Trailing reference markers added by the OSS workflow:
+#   - (sha)  — short git SHA, substituted from the (AIRBNB) marker on internal commits
+#   - (#NNN) — PR number, appended by GitHub on squash-merges
+# After OSS sync, the same change can appear with both forms in the git log.
+_SHA_REF_RE = re.compile(r'\(([0-9a-f]{4,40})\)\s*$', re.IGNORECASE)
+_PR_REF_RE = re.compile(r'\(#\d+\)\s*$')
+_TRAILING_REF_RE = re.compile(r'\s*\((?:#\d+|[0-9a-f]{4,40})\)\s*$', re.IGNORECASE)
+
+
+def _normalize_for_dedup(description: str) -> str:
+    """Strip a trailing (sha) or (#NNN) reference token for duplicate matching."""
+    return _TRAILING_REF_RE.sub('', description).strip()
+
+
+def _has_sha_ref(description: str) -> bool:
+    return bool(_SHA_REF_RE.search(description))
+
+
+def _has_pr_ref(description: str) -> bool:
+    return bool(_PR_REF_RE.search(description))
+
+
+def _get_base_commit_keys(tag1: str, tag2: str) -> set[tuple[str, tuple[str, ...]]]:
+    """
+    Collect (normalized_description, authors) keys for commits unique to tag1
+    (reachable from tag1 but not tag2). These represent cherry-picks and
+    release-specific commits on the previous release branch.
+    """
+    keys: set[tuple[str, tuple[str, ...]]] = set()
+    for commit in get_commits_between_tags(tag2, tag1):
+        if not should_include_commit(commit.message):
+            continue
+        cleaned = clean_commit_message(commit.message)
+        cleaned = replace_airbnb_marker(cleaned, commit.sha)
+        description = strip_conventional_prefix(cleaned)
+        normalized = _normalize_for_dedup(description)
+        authors = tuple(sorted(extract_authors(commit)))
+        if normalized:
+            keys.add((normalized, authors))
+    return keys
+
+
+def dedupe_entries(entries: list[ChangelogEntry]) -> list[ChangelogEntry]:
+    """
+    Drop PR-merge entries that duplicate a SHA-tagged entry.
+
+    OSS sync can leave the git log with both an original internal commit
+    (`(AIRBNB)` → `(sha)`) and the PR-merge commit synced back from GitHub
+    (`(#NNN)`) for the same change. When both forms exist with the same
+    normalized description and authors, keep the SHA-tagged entry.
+    """
+    groups: dict[tuple[str, tuple[str, ...]], list[ChangelogEntry]] = defaultdict(list)
+    for entry in entries:
+        key = (_normalize_for_dedup(entry.description), tuple(sorted(entry.authors)))
+        groups[key].append(entry)
+
+    drop_ids: set[int] = set()
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        has_sha = any(_has_sha_ref(e.description) for e in group)
+        if not has_sha:
+            continue
+        for e in group:
+            if _has_pr_ref(e.description) and not _has_sha_ref(e.description):
+                drop_ids.add(id(e))
+
+    return [e for e in entries if id(e) not in drop_ids]
 
 
 def replace_airbnb_marker(message: str, sha: str) -> str:
@@ -243,11 +328,13 @@ def extract_authors(commit: CommitInfo) -> list[str]:
     Returns:
         List of @usernames for all non-bot authors
     """
+    seen: set[str] = set()
     authors = []
 
     # Add primary author
     primary = extract_username_from_email(commit.author_email)
-    if primary:
+    if primary and primary not in seen:
+        seen.add(primary)
         authors.append(primary)
 
     # Add co-authors
@@ -256,7 +343,8 @@ def extract_authors(commit: CommitInfo) -> list[str]:
             coauthor = coauthor.strip()
             if coauthor:
                 username = extract_username_from_coauthor(coauthor)
-                if username:
+                if username and username not in seen:
+                    seen.add(username)
                     authors.append(username)
 
     return authors
@@ -296,7 +384,7 @@ def parse_commit(commit: CommitInfo, parser: ConventionalCommitParser) -> Change
             authors=authors,
             change_type=parsed.type,
             scope=parsed.scope,
-            description=parsed.descriptions[0] if parsed.descriptions else cleaned_message,
+            description=strip_conventional_prefix(cleaned_message),
             is_breaking=bool(parsed.breaking_descriptions) or parsed.bump == LevelBump.MAJOR,
             breaking_description=parsed.breaking_descriptions[0] if parsed.breaking_descriptions else None,
             bump=parsed.bump,
@@ -355,7 +443,7 @@ def render_section(change_type: str, entries: list[ChangelogEntry]) -> str:
 
     lines = [f"## {title}", ""]
     for entry in entries:
-        lines.append(f"- {entry.formatted_entry}")
+        lines.append(f"- {capitalize_first(entry.formatted_entry)}")
     lines.append("")
 
     return '\n'.join(lines)
@@ -373,7 +461,7 @@ def render_breaking_changes(entries: list[ChangelogEntry]) -> str:
     """
     lines = ["## Breaking Changes", ""]
     for entry in entries:
-        desc = entry.breaking_description or entry.description
+        desc = capitalize_first(entry.description)
         lines.append(f"- {desc} by {entry.formatted_authors}")
     lines.append("")
 
@@ -400,8 +488,17 @@ def generate_changelog(tag1: str, tag2: str) -> str:
         if entry:
             entries.append(entry)
 
+    # Drop commits already delivered via cherry-pick on the previous release branch
+    base_keys = _get_base_commit_keys(tag1, tag2)
+    entries = [
+        e for e in entries
+        if (_normalize_for_dedup(e.description), tuple(sorted(e.authors))) not in base_keys
+    ]
+
+    # Drop PR-merge duplicates of SHA-tagged entries (see dedupe_entries)
+    entries = dedupe_entries(entries)
     if not entries:
-        return f"# Version {tag2}\n\nNo changes.\n"
+        return "No changes.\n"
 
     # Separate breaking changes
     breaking_entries = [e for e in entries if e.is_breaking]
@@ -417,7 +514,7 @@ def generate_changelog(tag1: str, tag2: str) -> str:
     )
 
     # Build changelog
-    sections = [f"# Version {tag2}", ""]
+    sections: list[str] = []
 
     # Add breaking changes first if any
     if breaking_entries:

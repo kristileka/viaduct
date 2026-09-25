@@ -4,9 +4,10 @@ import com.example.starwars.filmography.resolverbases.FilmResolvers
 import com.example.starwars.modules.filmography.characters.models.CharacterBuilder
 import com.example.starwars.modules.filmography.characters.models.CharacterRepository
 import com.example.starwars.modules.filmography.films.models.FilmCharactersRepository
+import io.micronaut.context.annotation.Prototype
 import jakarta.inject.Inject
 import viaduct.api.FieldValue
-import viaduct.api.Resolver
+import viaduct.api.resolver.Resolver
 
 /**
  * Demonstrates **Reverse Relationship Batching** for one-to-many relationships.
@@ -23,6 +24,7 @@ import viaduct.api.Resolver
  * This prevents rebuilding the same character objects for multiple films.
  */
 @Resolver(objectValueFragment = "fragment _ on Film { id }")
+@Prototype
 class FilmMainCharactersResolver
     @Inject
     constructor(
@@ -30,7 +32,7 @@ class FilmMainCharactersResolver
         private val filmCharactersRepository: FilmCharactersRepository
     ) : FilmResolvers.MainCharacters() {
         override suspend fun batchResolve(contexts: List<Context>): List<FieldValue<List<viaduct.api.grts.Character>>> {
-            val filmIds = contexts.map { it.objectValue.getId().internalID }
+            val filmIds = contexts.map { it.getObjectValue().getIdOrThrow().internalID }
 
             // Batch lookup film-character relationships
             val filmCharacterMap = filmIds.associateWith { filmCharactersRepository.findCharactersByFilmId(it) }
@@ -41,9 +43,8 @@ class FilmMainCharactersResolver
             }
 
             // Returns the list of characters for each film context in the given order
-            return contexts.map { ctx ->
-                // Get character IDs for this film
-                val filmId = ctx.objectValue.getId().internalID
+            return filmIds.mapIndexed { i, filmId ->
+                val ctx = contexts[i]
                 val characterIds = filmCharacterMap[filmId] ?: emptyList()
 
                 // Map character IDs to pre-built Character objects, preserving order

@@ -1,0 +1,607 @@
+@file:Suppress("ForbiddenImport", "DEPRECATION")
+
+package viaduct.service.runtime
+
+import com.google.inject.Guice
+import com.google.inject.Injector
+import com.google.inject.ProvisionException
+import graphql.ExecutionResult as GJExecutionResult
+import graphql.ExecutionResultImpl as GJExecutionResultImpl
+import graphql.GraphQL
+import graphql.GraphQLError as GJGraphQLError
+import graphql.GraphqlErrorBuilder
+import graphql.execution.DataFetcherExceptionHandler
+import graphql.execution.instrumentation.Instrumentation
+import io.micrometer.core.instrument.MeterRegistry
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executor
+import javax.inject.Inject
+import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.future.await
+import viaduct.apiannotations.VisibleForTest
+import viaduct.engine.EngineConfiguration
+import viaduct.engine.EngineImpl
+import viaduct.engine.api.EngineExecutionContext
+import viaduct.engine.api.EngineSchema
+import viaduct.engine.api.GraphQLBuildError
+import viaduct.engine.api.bootstrap.executionregistry.ModuleConfigSource
+import viaduct.engine.api.instrumentation.resolver.ViaductResolverInstrumentation
+import viaduct.engine.api.spi.CheckerExecutorFactory
+import viaduct.engine.api.spi.CoroutineInterop
+import viaduct.engine.api.spi.FieldSelectivityProvider
+import viaduct.engine.api.spi.MaterializedFieldValueReader
+import viaduct.engine.api.spi.ProxyResolverFactory
+import viaduct.engine.runtime.execution.DefaultCoroutineInterop
+import viaduct.engine.runtime.execution.TenantNameResolver
+import viaduct.engine.runtime.execution.ViaductDataFetcherExceptionHandler
+import viaduct.engine.runtime.tenantloading.AbstractDispatcherRegistryFactory
+import viaduct.engine.runtime.tenantloading.ExecutionRegistryConfigSourceCollector
+import viaduct.engine.runtime.tenantloading.MissingResolversException
+import viaduct.engine.runtime.tenantloading.RequiredSelectionsAreInvalid
+import viaduct.service.api.ExecutionInput
+import viaduct.service.api.ExecutionResult
+import viaduct.service.api.SchemaId
+import viaduct.service.api.Viaduct
+import viaduct.service.api.spi.ErrorReporter
+import viaduct.service.api.spi.FlagManager
+import viaduct.service.api.spi.GlobalIDCodec
+import viaduct.service.api.spi.NaiveTenantModuleInjectorFactory
+import viaduct.service.api.spi.ResolverErrorBuilder
+import viaduct.service.api.spi.TenantModuleInjectorFactory
+import viaduct.service.api.spi.globalid.GlobalIDCodecDefault
+
+/**
+ * An immutable implementation of Viaduct interface, it configures and executes queries against the Viaduct runtime
+ *
+ * Registers two different types of schema:
+ * 1. The base schema, which includes all non-tenant-local fields.
+ * 2. The internal full schema, which includes tenant-local fields and is used for planning and resolver validation.
+ * 3. Scoped schemas, which have both introspectable and non-introspectable versions. Scoped schemas that are
+ *   not already registered when requested will be lazily computed.
+ */
+class StandardViaduct
+    @Inject
+    internal constructor(
+        val engineRegistry: EngineRegistry,
+        private val coroutineInterop: CoroutineInterop = DefaultCoroutineInterop,
+        private val standardViaductFactory: Factory
+    ) : Viaduct {
+        /**
+         * Factory for creating StandardViaduct instances with different schema configurations.
+         * Uses child injectors to provide proper schema isolation - each StandardViaduct
+         * gets its own child injector with schema-specific components.
+         */
+        class Factory
+            @Inject
+            constructor(
+                private val injector: Injector, // Parent injector
+            ) {
+                /**
+                 * Creates a new StandardViaduct with the specified schema configuration.
+                 * Each StandardViaduct gets its own child injector, providing proper schema isolation.
+                 * Schema-specific components (registries, dispatchers, etc.) are created per child injector.
+                 * Configuration (TenantBootstrapper, CheckerExecutorFactory creator) comes from parent injector.
+                 */
+                fun createForSchema(schemaConfig: SchemaConfiguration): StandardViaduct {
+                    val schemaModule = SchemaScopedModule(schemaConfig)
+                    val childInjector = injector.createChildInjector(schemaModule)
+                    return childInjector.getInstance(StandardViaduct::class.java)
+                }
+
+                /**
+                 * Creates a new StandardViaduct that reuses schemas from an existing EngineRegistry.
+                 * This avoids expensive schema rebuilding when only code changes need to be picked up.
+                 * Preserves lazy schema initialization state - lazy schemas remain lazy.
+                 *
+                 * @param schemaConfig the schema configuration (needed for Guice bindings)
+                 * @param existingEngineRegistry the existing EngineRegistry to reuse schemas from
+                 */
+                fun createWithReusedSchemas(
+                    schemaConfig: SchemaConfiguration,
+                    existingEngineRegistry: EngineRegistry,
+                ): StandardViaduct {
+                    val schemaModule = SchemaScopedModule(
+                        schemaConfig = schemaConfig,
+                        existingRegistry = existingEngineRegistry,
+                    )
+                    val childInjector = injector.createChildInjector(schemaModule)
+                    return childInjector.getInstance(StandardViaduct::class.java)
+                }
+            }
+
+        class Builder {
+            private var airbnbModeEnabled: Boolean = false
+            private var instrumentation: Instrumentation? = null
+            private var flagManager: FlagManager? = null
+            private var checkerExecutorFactory: CheckerExecutorFactory? = null
+            private var checkerExecutorFactoryCreator: ((EngineSchema) -> CheckerExecutorFactory)? = null
+            private var dataFetcherExceptionHandler: DataFetcherExceptionHandler? = null
+            private var resolverErrorReporter: ErrorReporter? = null
+            private var resolverErrorBuilder: ResolverErrorBuilder? = null
+            private var coroutineInterop: CoroutineInterop? = null
+            private var schemaConfiguration: SchemaConfiguration = SchemaConfiguration.DEFAULT
+            private var documentProviderFactory: DocumentProviderFactory? = null
+            private var tenantNameResolver: TenantNameResolver = TenantNameResolver()
+            private var tenantModuleInjectorFactory: TenantModuleInjectorFactory? = null
+            private var executorRegistryConfigSources: List<ModuleConfigSource>? = null
+            private var executorRegistryGrtPackagePrefix: String? = null
+            private var chainInstrumentationWithDefaults: Boolean = false
+            private var defaultQueryNodeResolversEnabled: Boolean = true
+            private var meterRegistry: MeterRegistry? = null
+            private var resolverInstrumentation: ViaductResolverInstrumentation? = null
+            private var fieldSelectivityProvider: FieldSelectivityProvider? = null
+            private var materializedFieldValueReader: MaterializedFieldValueReader? = null
+            private var allowSubscriptions: Boolean = false
+            private var globalIDCodec: GlobalIDCodec? = null
+            private var proxyResolverFactory: ProxyResolverFactory? = null
+            private var lenientResolverValidation: Boolean = false
+
+            fun enableAirbnbBypassDoNotUse(tenantNameResolver: TenantNameResolver,): Builder =
+                apply {
+                    this.tenantNameResolver = tenantNameResolver
+                    this.airbnbModeEnabled = true
+                }
+
+            /**
+             * Configures the [TenantModuleInjectorFactory] used to provide per-tenant code injectors.
+             * Called once per tenant during startup with the tenant name and the
+             * `@TenantBootstrapper`-annotated class from the tenant's config file (or `null` if absent).
+             */
+            fun withTenantModuleInjectorFactory(tenantModuleInjectorFactory: TenantModuleInjectorFactory): Builder =
+                apply {
+                    this.tenantModuleInjectorFactory = tenantModuleInjectorFactory
+                }
+
+            @VisibleForTest
+            fun withExecutorRegistryConfigSources(
+                executorRegistryConfigSources: List<ModuleConfigSource>,
+                grtPackagePrefix: String? = null,
+            ): Builder =
+                apply {
+                    this.executorRegistryConfigSources = executorRegistryConfigSources
+                    this.executorRegistryGrtPackagePrefix = grtPackagePrefix
+                }
+
+            /**
+             * By default, Viaduct instances implement `Query.node` and `Query.nodes`
+             * resolvers automatically.  Calling this function turns off that default behavior.
+             * (If your schema does not have the `Query.node/s` field(s), you do
+             * _not_ have to explicitly turn off the default behavior.)
+             */
+            fun withoutDefaultQueryNodeResolvers(enabled: Boolean = false): Builder =
+                apply {
+                    this.defaultQueryNodeResolversEnabled = enabled
+                }
+
+            fun withCheckerExecutorFactory(checkerExecutorFactory: CheckerExecutorFactory): Builder =
+                apply {
+                    this.checkerExecutorFactory = checkerExecutorFactory
+                }
+
+            fun withCheckerExecutorFactoryCreator(factoryCreator: (EngineSchema) -> CheckerExecutorFactory): Builder =
+                apply {
+                    this.checkerExecutorFactoryCreator = factoryCreator
+                }
+
+            @Deprecated("For Airbnb use only", level = DeprecationLevel.WARNING)
+            fun withSchemaConfiguration(schemaConfiguration: SchemaConfiguration): Builder =
+                apply {
+                    this.schemaConfiguration = schemaConfiguration
+                }
+
+            fun withDocumentProviderFactory(documentProviderFactory: DocumentProviderFactory): Builder =
+                apply {
+                    this.documentProviderFactory = documentProviderFactory
+                }
+
+            fun withFlagManager(flagManager: FlagManager): Builder =
+                apply {
+                    this.flagManager = flagManager
+                }
+
+            fun withDataFetcherExceptionHandler(dataFetcherExceptionHandler: DataFetcherExceptionHandler): Builder =
+                apply {
+                    this.dataFetcherExceptionHandler = dataFetcherExceptionHandler
+                }
+
+            fun withResolverErrorReporter(resolverErrorReporter: ErrorReporter): Builder =
+                apply {
+                    this.resolverErrorReporter = resolverErrorReporter
+                }
+
+            fun withDataFetcherErrorBuilder(resolverErrorBuilder: ResolverErrorBuilder): Builder =
+                apply {
+                    this.resolverErrorBuilder = resolverErrorBuilder
+                }
+
+            @Deprecated("For advance uses, Airbnb-use only", level = DeprecationLevel.WARNING)
+            fun withInstrumentation(
+                instrumentation: Instrumentation?,
+                chainInstrumentationWithDefaults: Boolean = false
+            ): Builder =
+                apply {
+                    this.instrumentation = instrumentation
+                    this.chainInstrumentationWithDefaults = chainInstrumentationWithDefaults
+                }
+
+            fun withCoroutineInterop(coroutineInterop: CoroutineInterop) =
+                apply {
+                    this.coroutineInterop = coroutineInterop
+                }
+
+            @Deprecated("For advance uses, Airbnb-use only.", level = DeprecationLevel.WARNING)
+            fun getSchemaConfiguration(): SchemaConfiguration = schemaConfiguration
+
+            fun withMeterRegistry(meterRegistry: MeterRegistry) =
+                apply {
+                    this.meterRegistry = meterRegistry
+                }
+
+            fun withResolverInstrumentation(resolverInstrumentation: ViaductResolverInstrumentation): Builder =
+                apply {
+                    this.resolverInstrumentation = resolverInstrumentation
+                }
+
+            /**
+             * Supplies selectivity configuration for field coordinates that do not have dispatcher metadata.
+             */
+            fun withFieldSelectivityProvider(fieldSelectivityProvider: FieldSelectivityProvider): Builder =
+                apply {
+                    this.fieldSelectivityProvider = fieldSelectivityProvider
+                }
+
+            fun withMaterializedFieldValueReader(materializedFieldValueReader: MaterializedFieldValueReader): Builder =
+                apply {
+                    this.materializedFieldValueReader = materializedFieldValueReader
+                }
+
+            /**
+             * Configures the GlobalIDCodec for serializing and deserializing GlobalIDs.
+             * All tenant-API implementations within this Viaduct instance will share this codec
+             * to ensure interoperability.
+             *
+             * @param globalIDCodec The GlobalIDCodec instance to use
+             * @return This Builder instance for method chaining
+             */
+            fun withGlobalIDCodec(globalIDCodec: GlobalIDCodec): Builder =
+                apply {
+                    this.globalIDCodec = globalIDCodec
+                }
+
+            @Deprecated("For testing only, subscriptions are not currently supported in Viaduct.", level = DeprecationLevel.WARNING)
+            fun allowSubscriptions(allow: Boolean) =
+                apply {
+                    allowSubscriptions = allow
+                }
+
+            /**
+             * Wraps tenant resolvers at bootstrap time using [proxyResolverFactory].
+             *
+             * The factory is called for every field and node executor. A non-null return value
+             * replaces the original executor. Use cases include remote execution, instrumentation,
+             * and caching.
+             */
+            fun withProxyResolverFactory(proxyResolverFactory: ProxyResolverFactory): Builder =
+                apply {
+                    this.proxyResolverFactory = proxyResolverFactory
+                }
+
+            /**
+             * When set to true, suppresses the startup error that occurs when a
+             * @resolver-annotated field or type has no registered resolver.
+             * Default is false (strict: missing resolver = startup error).
+             */
+            fun withLenientResolverValidation(lenient: Boolean = true): Builder =
+                apply {
+                    this.lenientResolverValidation = lenient
+                }
+
+            /**
+             * Builds the Guice Module within Viaduct and gets Viaduct from the injector.
+             * Uses the factory pattern for proper dependency injection.
+             *
+             * @return a Viaduct Instance ready to execute
+             */
+            fun build(): StandardViaduct = buildWithOptionalReusedSchemas(existingViaduct = null)
+
+            /**
+             * Builds a Viaduct instance with this builder's runtime bindings while reusing
+             * schemas from [existingViaduct].
+             */
+            fun buildWithReusedSchemas(existingViaduct: StandardViaduct): StandardViaduct = buildWithOptionalReusedSchemas(existingViaduct)
+
+            private fun buildWithOptionalReusedSchemas(existingViaduct: StandardViaduct?): StandardViaduct {
+                val finalGlobalIDCodec = globalIDCodec ?: GlobalIDCodecDefault
+
+                // engine configuration has a lot of defaults, so we copy over any non-null values from the StandardViaduct.Builder
+                val engineConfiguration = with(EngineConfiguration.default) {
+                    val builder = this@Builder
+                    val finalResolverErrorReporter = builder.resolverErrorReporter ?: resolverErrorReporter
+                    val finalResolverErrorBuilder = builder.resolverErrorBuilder ?: resolverErrorBuilder
+                    copy(
+                        coroutineInterop = builder.coroutineInterop ?: coroutineInterop,
+                        flagManager = builder.flagManager ?: flagManager,
+                        airbnbBypassPolicyCheckDuringCompletion = builder.airbnbModeEnabled,
+                        resolverErrorReporter = finalResolverErrorReporter,
+                        resolverErrorBuilder = finalResolverErrorBuilder,
+                        dataFetcherExceptionHandler = builder.dataFetcherExceptionHandler
+                            ?: ViaductDataFetcherExceptionHandler(finalResolverErrorReporter, finalResolverErrorBuilder),
+                        meterRegistry = builder.meterRegistry ?: meterRegistry,
+                        additionalInstrumentation = builder.instrumentation ?: additionalInstrumentation,
+                        chainInstrumentationWithDefaults = builder.chainInstrumentationWithDefaults,
+                        resolverInstrumentation = builder.resolverInstrumentation ?: resolverInstrumentation,
+                        fieldSelectivityProvider = builder.fieldSelectivityProvider ?: fieldSelectivityProvider,
+                        materializedFieldValueReader =
+                            builder.materializedFieldValueReader ?: materializedFieldValueReader,
+                        globalIDCodec = finalGlobalIDCodec,
+                    )
+                }
+
+                // Primary path: resource-backed module configs are bootstrapped in-engine using the
+                // service-supplied injector factory. Generated built-ins (Query.node/nodes,
+                // @namespaceType) are appended later in schema scope. When no injector factory is
+                // configured, no config sources are bootstrapped through this path.
+                val moduleBootstrapConfiguration = ModuleBootstrapConfiguration(
+                    moduleConfigSources = if (tenantModuleInjectorFactory != null) {
+                        executorRegistryConfigSources
+                            ?: ExecutionRegistryConfigSourceCollector.fromResources()
+                    } else {
+                        emptyList()
+                    },
+                    tenantModuleInjectorFactory = tenantModuleInjectorFactory ?: NaiveTenantModuleInjectorFactory,
+                    grtPackagePrefix = executorRegistryGrtPackagePrefix,
+                    defaultQueryNodeResolversEnabled = defaultQueryNodeResolversEnabled,
+                )
+
+                val parentModule = StandardViaductModule(
+                    moduleBootstrapConfiguration = moduleBootstrapConfiguration,
+                    engineConfiguration = engineConfiguration,
+                    tenantNameResolver = tenantNameResolver,
+                    checkerExecutorFactory = checkerExecutorFactory,
+                    checkerExecutorFactoryCreator = checkerExecutorFactoryCreator,
+                    documentProviderFactory = documentProviderFactory,
+                    proxyResolverFactory = proxyResolverFactory,
+                    lenientResolverValidation = lenientResolverValidation,
+                )
+
+                try {
+                    val parentInjector = Guice.createInjector(parentModule)
+
+                    // Get factory from parent injector
+                    val factory = parentInjector.getInstance(Factory::class.java)
+
+                    // Factory creates child injector with schema modules and returns StandardViaduct
+                    return if (existingViaduct == null) {
+                        factory.createForSchema(schemaConfiguration)
+                    } else {
+                        factory.createWithReusedSchemas(schemaConfiguration, existingViaduct.engineRegistry)
+                    }
+                        .also { viaduct ->
+                            if (!airbnbModeEnabled && !allowSubscriptions && hasSubscriptions(viaduct.engineRegistry.getBaseSchemaView())) {
+                                throw GraphQLBuildError("Viaduct does not currently support subscriptions.")
+                            }
+                        }
+                } catch (e: ProvisionException) {
+                    // Match the class that declares create() as well as its synthetic nested frames
+                    // (e.g. the `runBlocking { ... }` lambda in create() compiles to
+                    // AbstractDispatcherRegistryFactory$create$..., which is where schema-derived
+                    // config generation throws).
+                    val factoryClassName = AbstractDispatcherRegistryFactory::class.java.name
+                    val isCausedByDispatcherRegistryFactory = e.cause?.stackTrace?.any {
+                        it.className == factoryClassName || it.className.startsWith("$factoryClassName\$")
+                    } ?: false
+
+                    if (isCausedByDispatcherRegistryFactory) {
+                        throw throwDispatcherRegistryError(e)
+                    }
+                    throw e
+                }
+            }
+
+            /**
+             * Checks if the given schema contains Subscription operation type.
+             *
+             * @param schema the schema to check
+             * @return true if schema has subscriptions defined, false otherwise
+             */
+            private fun hasSubscriptions(schema: EngineSchema): Boolean {
+                return schema.schema.subscriptionType != null
+            }
+
+            /**
+             * If attempting to create a [StandardViaduct] results in a Guice exception,
+             * call this method to potentially unwrap it.  We don't unwrap _all_ Guice
+             * exceptions, but where we have high confidence that cause of the Guice
+             * exception would be more informative to the Service Engineer configuring
+             * Viaduct -- for example, if we detect an invalid required selection set --
+             * then we will unwrap the exception to give the Service Engineer a better
+             * experience in trying to diagnose the problem.
+             *
+             * @param exception The exception thrown by Guice
+             *
+             * @return GraphQLBuildError with proper details
+             */
+            private fun throwDispatcherRegistryError(exception: ProvisionException): GraphQLBuildError {
+                return when (exception.cause) {
+                    is MissingResolversException -> {
+                        val cause = exception.cause as MissingResolversException
+                        GraphQLBuildError(cause.message ?: "Missing resolver implementations", cause)
+                    }
+
+                    is RequiredSelectionsAreInvalid -> GraphQLBuildError(
+                        "Found GraphQL validation errors: %s".format(
+                            (exception.cause as RequiredSelectionsAreInvalid).errors,
+                        ),
+                        exception.cause
+                    )
+
+                    is IllegalArgumentException -> GraphQLBuildError(
+                        "Illegal Argument found : %s".format(
+                            exception.cause?.message,
+                        ),
+                        exception.cause
+                    )
+
+                    else -> GraphQLBuildError(
+                        "Invalid DispatcherRegistryFactory configuration. " + "This is likely invalid schema or fragment configuration.",
+                        exception
+                    )
+                }
+            }
+        }
+
+        private fun schemaNotFoundResult(schemaId: SchemaId): ExecutionResult {
+            val error: GJGraphQLError = GraphqlErrorBuilder.newError()
+                .message("Schema not found for schemaId=$schemaId")
+                .build()
+            return GJExecutionResultImpl.newExecutionResult()
+                .addError(error)
+                .build()
+                .toExecutionResult()
+        }
+
+        /**
+         * Looks up the engine for [schemaId] and executes [executionInput] against it, returning the
+         * sorted [ExecutionResult].
+         *
+         * Must be invoked within a coroutine context established by
+         * [CoroutineInterop.enterThreadLocalCoroutineContext], which installs the [NextTickDispatcher]
+         * (driving dataloader batching) and the thread-local coroutine context the engine relies on.
+         */
+        private suspend fun executeOnEngine(
+            executionInput: ExecutionInput,
+            schemaId: SchemaId
+        ): ExecutionResult {
+            val engine = try {
+                engineRegistry.getEngine(schemaId)
+            } catch (_: EngineRegistry.SchemaNotFoundException) {
+                return schemaNotFoundResult(schemaId)
+            }
+            val executionResult = engine.execute(executionInput.toEngineExecutionInput())
+            return sortExecutionResult(executionResult).toExecutionResult()
+        }
+
+        /**
+         * Suspends until the operation (found in ExecutionInput) completes, returning the sorted
+         * ExecutionResult. This is the idiomatic entry point for Kotlin callers; execution inherits
+         * the caller's coroutine context.
+         *
+         * @param executionInput the [ExecutionInput] to execute
+         * @param schemaId the id of the schema for which we want to execute the operation. Defaults to the base schema.
+         * @return sorted [ExecutionResult]
+         */
+        override suspend fun execute(
+            executionInput: ExecutionInput,
+            schemaId: SchemaId
+        ): ExecutionResult =
+            coroutineInterop.enterThreadLocalCoroutineContext(coroutineContext) {
+                executeOnEngine(executionInput, schemaId)
+            }.await()
+
+        /**
+         * Asynchronously executes an operation (found in ExecutionInput) on the given [executor],
+         * returning a completable future that will contain the sorted ExecutionResult. This is the
+         * idiomatic entry point for Java callers.
+         *
+         * @param executionInput the [ExecutionInput] to execute
+         * @param schemaId the id of the schema for which we want to execute the operation.
+         * @param executor the executor on which to run the operation.
+         * @return [CompletableFuture] of sorted [ExecutionResult]
+         */
+        override fun executeAsync(
+            executionInput: ExecutionInput,
+            schemaId: SchemaId,
+            executor: Executor
+        ): CompletableFuture<ExecutionResult> =
+            coroutineInterop.enterThreadLocalCoroutineContext(executor) {
+                executeOnEngine(executionInput, schemaId)
+            }
+
+        /**
+         * This function is used to get the applied scopes for a given schemaId
+         *
+         * @param schemaId the id of the schema for which we want a [GraphQLSchema]
+         *
+         * @return Set of scopes that are applied to the schema
+         */
+        override fun getAppliedScopes(schemaId: SchemaId): Set<String> {
+            return getSchema(schemaId).scopes()
+        }
+
+        /**
+         * Creates ExecutionResult from Execution Result and sorts the errors based on a path
+         *
+         * @param executionResult the ExecutionResult
+         *
+         * @return the ExecutionResult with the data off the executionResult
+         *
+         * Internal for Testing
+         */
+        internal fun sortExecutionResult(executionResult: GJExecutionResult): GJExecutionResult {
+            val sortedErrors: List<GJGraphQLError> =
+                executionResult.errors.sortedWith(
+                    compareBy({ it.path?.joinToString(separator = ".") ?: "" }, { it.message })
+                )
+
+            return GJExecutionResultImpl(
+                executionResult.getData(),
+                sortedErrors,
+                executionResult.extensions
+            )
+        }
+
+        /**
+         * This function is used to get the GraphQLSchema from the registered scopes.
+         *
+         * @param schemaId the id of the schema for which we want a [GraphQLSchema]
+         *
+         * @return GraphQLSchema instance of the registered scope
+         */
+        fun getSchema(schemaId: SchemaId): EngineSchema = engineRegistry.getSchema(schemaId)
+
+        /**
+         * Creates a new StandardViaduct instance that reuses this instance's schemas.
+         * This avoids expensive schema rebuilding when only code changes need to be picked up.
+         *
+         * @param schemaConfig the schema configuration to use for the new instance
+         * @return a new StandardViaduct instance that reuses schemas but has fresh code-dependent components
+         */
+        fun createWithReusedSchemas(schemaConfig: SchemaConfiguration): StandardViaduct {
+            return standardViaductFactory.createWithReusedSchemas(schemaConfig, engineRegistry)
+        }
+
+        /**
+         * Airbnb only
+         *
+         * This function is used to get the engine from the GraphQLSchemaRegistry
+         * @param schemaId the id of the schema for which we want a [GraphQL] engine
+         *
+         * @return GraphQL instance of the engine
+         */
+        @Deprecated(
+            message = "Airbnb use only. For temporary use during migration to Engine API from graphql-java GraphQL.",
+            level = DeprecationLevel.WARNING
+        )
+        @Suppress("DEPRECATION")
+        fun getEngine(schemaId: SchemaId): GraphQL =
+            (
+                engineRegistry.getEngine(schemaId) as? viaduct.engine.EngineGraphQLJavaCompat
+                    ?: throw IllegalStateException("Engine is not GraphQL compatible")
+            ).getGraphQL()
+
+        /**
+         * Creates an instance of EngineExecutionContext. This should be called exactly once
+         * per request and set in the graphql-java execution input's local context.
+         */
+        @Deprecated(
+            message = "Airbnb use only. Internal API for direct engine access.",
+            level = DeprecationLevel.WARNING
+        )
+        fun createEngineExecutionContext(
+            schemaId: SchemaId,
+            requestContext: Any?
+        ): EngineExecutionContext {
+            val engine = engineRegistry.getEngine(schemaId) as? EngineImpl ?: throw IllegalStateException("Engine is not EngineImpl")
+            return engine.createEngineExecutionContext(requestContext)
+        }
+    }

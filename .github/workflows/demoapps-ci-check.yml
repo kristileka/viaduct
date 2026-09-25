@@ -1,0 +1,251 @@
+name: Demoapp CI Check
+
+on:
+  workflow_dispatch:
+    inputs:
+      java_versions:
+        description: "Java versions array. Defaults to [\"17\",\"21\"]."
+        required: false
+        type: string
+      os:
+        description: "OS array. Defaults to [\"ubuntu-latest\",\"macos-latest\"]."
+        required: false
+        type: string
+  workflow_call:
+    outputs:
+      run_id:
+        description: "GitHub Actions run ID"
+        value: ${{ jobs.validate-inputs.outputs.run_id }}
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  # A called workflow's `github` context is the invoking run's, so `github.workflow` is the top-level
+  # workflow name — keying on it stops distinct entry points sharing one group and cancelling each other.
+  group: demoapps-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  validate-inputs:
+    runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ steps.emit.outputs.run_id }}
+    steps:
+      - name: Emit run ID
+        id: emit
+        run: echo "run_id=${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+        shell: bash
+      - uses: actions/checkout@v6
+      - name: Validate inputs
+        env:
+          OS_INPUT: ${{ inputs.os }}
+          JAVA_INPUT: ${{ inputs.java_versions }}
+        run: python3 .github/scripts/validate_inputs.py
+
+  publish-to-maven-local:
+    needs: validate-inputs
+    runs-on: ubuntu-latest
+    name: Publish to Maven Local
+    env:
+      GRADLE_OPTS: "-Dorg.gradle.parallel=false -Dorg.gradle.caching=true"
+      BUILDSCAN_PUBLISH: "true"
+      BUILDSCAN_AUTOACCEPTTERMS: "true"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-build
+        with:
+          java-version: '17'
+          cache-demoapp-distributions: 'true'
+
+      # The only job here that writes the Gradle cache, and every test job waits on it.
+      # Resolving each demo app's distribution here is what makes it available to those
+      # jobs, which read the cache read-only. Output is kept so the log shows whether a
+      # distribution was fetched or served from cache.
+      - name: Warm demo app Gradle distributions
+        run: |
+          for dir in demoapps/*/; do
+            (cd "$dir" && ./gradlew --version)
+          done
+        shell: bash
+
+      - name: Publish to Maven Local
+        run: ./gradlew publishToMavenLocal -PpublishMinimal --no-daemon
+        shell: bash
+
+      - name: Upload Maven Local repository
+        uses: actions/upload-artifact@v6
+        with:
+          name: maven-local-repo
+          path: ~/.m2/repository
+          compression-level: 0
+          retention-days: 1
+
+  test-starters:
+    needs: publish-to-maven-local
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        demoapp: [cli-starter, jetty-starter, ktor-starter, micronaut-starter, spring-starter]
+        java: ['17', '21']
+    name: Test ${{ matrix.demoapp }} (Java ${{ matrix.java }})
+    env:
+      GRADLE_OPTS: "-Dorg.gradle.parallel=true -Dorg.gradle.caching=true"
+      BUILDSCAN_PUBLISH: "true"
+      BUILDSCAN_AUTOACCEPTTERMS: "true"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-build
+        with:
+          java-version: ${{ matrix.java }}
+          cache-read-only: 'true'
+          cache-demoapp-distributions: 'true'
+
+      - name: Download Maven Local repository
+        uses: actions/download-artifact@v7
+        with:
+          name: maven-local-repo
+          path: ~/.m2/repository
+
+      - name: Test ${{ matrix.demoapp }}
+        run: cd demoapps/${{ matrix.demoapp }} && USE_MAVEN_LOCAL=true ./gradlew test --no-daemon
+        shell: bash
+
+  test-starwars:
+    needs: publish-to-maven-local
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        demoapp: [starwars, starwars-java]
+        os: ${{ fromJSON(inputs.os || '["ubuntu-latest","macos-latest"]') }}
+        java: ${{ fromJSON(inputs.java_versions || '["17","21"]') }}
+    name: Test ${{ matrix.demoapp }} (Java ${{ matrix.java }}) ${{ matrix.os }}
+    env:
+      GRADLE_OPTS: "-Dorg.gradle.parallel=true -Dorg.gradle.caching=true"
+      BUILDSCAN_PUBLISH: "true"
+      BUILDSCAN_AUTOACCEPTTERMS: "true"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-build
+        with:
+          java-version: ${{ matrix.java }}
+          cache-read-only: 'true'
+          cache-demoapp-distributions: 'true'
+
+      - name: Download Maven Local repository
+        uses: actions/download-artifact@v7
+        with:
+          name: maven-local-repo
+          path: ~/.m2/repository
+
+      - name: Test ${{ matrix.demoapp }}
+        run: cd demoapps/${{ matrix.demoapp }} && USE_MAVEN_LOCAL=true ./gradlew test --no-daemon
+        shell: bash
+
+  # ---------------------------------------------------------------------------
+  # Kotlin version matrix — re-run ktor-starter against prior Kotlin releases.
+  # ktor-starter's toml pins the *latest* supported version; this job covers
+  # older (kotlin, ksp) pairs so that a codegen regression in any supported
+  # Kotlin minor is caught without needing a separate full demoapp per version.
+  # Add a new entry here whenever a new Kotlin minor is released.
+  # ---------------------------------------------------------------------------
+  test-kotlin-matrix:
+    needs: publish-to-maven-local
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # KSP2 on Kotlin 2.1 — covers the overlap point where both KSP1 and KSP2
+          # were available.  ktor-starter's toml is pinned to the latest (2.2.x);
+          # this entry keeps prior-minor coverage without a separate app.
+          # Note: no stable KSP2 release exists for Kotlin 2.0.x, so the first
+          # valid KSP2 entry is 2.1.20.  Kotlin 2.0.x KSP1 is covered by jetty-starter.
+          - kotlin_version: "2.1.20"
+            ksp_version: "2.1.20-2.0.1"
+    name: Test ktor-starter (Kotlin ${{ matrix.kotlin_version }})
+    env:
+      GRADLE_OPTS: "-Dorg.gradle.parallel=true -Dorg.gradle.caching=true"
+      BUILDSCAN_PUBLISH: "true"
+      BUILDSCAN_AUTOACCEPTTERMS: "true"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-build
+        with:
+          java-version: '17'
+          cache-read-only: 'true'
+          cache-demoapp-distributions: 'true'
+
+      - name: Download Maven Local repository
+        uses: actions/download-artifact@v7
+        with:
+          name: maven-local-repo
+          path: ~/.m2/repository
+
+      - name: Test ktor-starter (Kotlin ${{ matrix.kotlin_version }})
+        run: cd demoapps/ktor-starter && USE_MAVEN_LOCAL=true ./gradlew test --no-daemon
+        shell: bash
+        env:
+          KOTLIN_VERSION: ${{ matrix.kotlin_version }}
+          KSP_VERSION: ${{ matrix.ksp_version }}
+
+  # ---------------------------------------------------------------------------
+  # Gradle version matrix — re-run micronaut-starter against Gradle 9 as well
+  # as its native Gradle 8 wrapper, ensuring Viaduct's plugin works across
+  # both major Gradle generations without maintaining two full demoapp copies.
+  # ---------------------------------------------------------------------------
+  test-gradle-matrix:
+    needs: publish-to-maven-local
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - gradle_version: "8.11"
+            gradle_sha: "57dafb5c2622c6cc08b993c85b7c06956a2f53536432a30ead46166dbca0f1e9"
+          - gradle_version: "9.1.0"
+            gradle_sha: "a17ddd85a26b6a7f5ddb71ff8b05fc5104c0202c6e64782429790c933686c806"
+    name: Test micronaut-starter (Gradle ${{ matrix.gradle_version }})
+    env:
+      GRADLE_OPTS: "-Dorg.gradle.parallel=true -Dorg.gradle.caching=true"
+      BUILDSCAN_PUBLISH: "true"
+      BUILDSCAN_AUTOACCEPTTERMS: "true"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-build
+        with:
+          java-version: '17'
+          cache-read-only: 'true'
+          cache-demoapp-distributions: 'true'
+
+      - name: Download Maven Local repository
+        uses: actions/download-artifact@v7
+        with:
+          name: maven-local-repo
+          path: ~/.m2/repository
+
+      - name: Override Gradle wrapper to ${{ matrix.gradle_version }}
+        # Edit gradle-wrapper.properties directly instead of running
+        # `./gradlew wrapper`, which would evaluate build.gradle.kts and try to
+        # resolve the Viaduct SNAPSHOT plugin before USE_MAVEN_LOCAL is in scope.
+        # Both the URL and the SHA256 checksum must be updated together. A version that
+        # no demo app commits is fetched at run time, because the distribution cache is
+        # keyed on the committed wrapper properties rather than on this matrix.
+        run: |
+          sed -i \
+            -e 's|distributionUrl=.*|distributionUrl=https\\://services.gradle.org/distributions/gradle-${{ matrix.gradle_version }}-bin.zip|' \
+            -e 's|distributionSha256Sum=.*|distributionSha256Sum=${{ matrix.gradle_sha }}|' \
+            demoapps/micronaut-starter/gradle/wrapper/gradle-wrapper.properties
+        shell: bash
+
+      - name: Test micronaut-starter (Gradle ${{ matrix.gradle_version }})
+        run: cd demoapps/micronaut-starter && USE_MAVEN_LOCAL=true ./gradlew test --no-daemon
+        shell: bash

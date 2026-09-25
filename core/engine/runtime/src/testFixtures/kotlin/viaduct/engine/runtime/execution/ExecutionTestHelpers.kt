@@ -1,0 +1,423 @@
+@file:Suppress("ForbiddenImport", "DEPRECATION")
+
+package viaduct.engine.runtime.execution
+
+import com.github.benmanes.caffeine.cache.Caffeine
+import graphql.ExecutionInput
+import graphql.ExecutionResult
+import graphql.GraphQL
+import graphql.GraphQLContext
+import graphql.execution.AsyncExecutionStrategy
+import graphql.execution.AsyncSerialExecutionStrategy
+import graphql.execution.DataFetcherExceptionHandler
+import graphql.execution.DataFetcherExceptionHandlerParameters
+import graphql.execution.DataFetcherExceptionHandlerResult
+import graphql.execution.SimpleDataFetcherExceptionHandler
+import graphql.execution.instrumentation.ChainedInstrumentation
+import graphql.execution.instrumentation.Instrumentation
+import graphql.execution.instrumentation.SimplePerformantInstrumentation
+import graphql.execution.preparsed.PreparsedDocumentEntry
+import graphql.execution.preparsed.PreparsedDocumentProvider
+import graphql.parser.ParserOptions
+import graphql.scalars.ExtendedScalars
+import graphql.schema.DataFetcher
+import graphql.schema.TypeResolver
+import graphql.schema.idl.RuntimeWiring
+import graphql.schema.idl.SchemaGenerator
+import graphql.schema.idl.SchemaParser
+import graphql.validation.QueryComplexityLimits
+import io.kotest.property.Arb
+import io.kotest.property.arbitrary.map
+import java.util.concurrent.CompletableFuture
+import java.util.function.Function
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.DelicateCoroutinesApi
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.future.await
+import kotlinx.coroutines.runBlocking
+import viaduct.arbitrary.common.Config
+import viaduct.arbitrary.graphql.graphQLExecutionInput
+import viaduct.engine.api.CheckerResult
+import viaduct.engine.api.Coordinate
+import viaduct.engine.api.EngineExecutionContext
+import viaduct.engine.api.EngineObjectData
+import viaduct.engine.api.EngineSchema
+import viaduct.engine.api.EngineSelectionSet
+import viaduct.engine.api.RequiredSelectionSet
+import viaduct.engine.api.ResolveSelectionSetOptions
+import viaduct.engine.api.instrumentation.ChainedModernGJInstrumentation
+import viaduct.engine.api.instrumentation.ViaductModernGJInstrumentation
+import viaduct.engine.api.spi.CheckerExecutor
+import viaduct.engine.api.spi.CoroutineInterop
+import viaduct.engine.runtime.CheckerDispatcher
+import viaduct.engine.runtime.DispatcherRegistry
+import viaduct.engine.runtime.EngineObjectDataFactory
+import viaduct.engine.runtime.RequiredSelectionSetRegistry
+import viaduct.engine.runtime.context.CompositeLocalContext
+import viaduct.engine.runtime.mocks.ContextMocks
+import viaduct.service.api.spi.FlagManager
+
+@OptIn(ExperimentalCoroutinesApi::class)
+object ExecutionTestHelpers {
+    suspend fun executeViaductModernGraphQL(
+        sdl: String,
+        resolvers: Map<String, Map<String, DataFetcher<*>>>,
+        query: String,
+        variables: Map<String, Any?> = emptyMap(),
+        typeResolvers: Map<String, TypeResolver> = emptyMap(),
+        fieldCheckerDispatchers: Map<Coordinate, CheckerDispatcher> = emptyMap(),
+        typeCheckerDispatchers: Map<String, CheckerDispatcher> = emptyMap(),
+        instrumentations: List<Instrumentation> = emptyList(),
+        queryPlanFactory: QueryPlanFactory = QueryPlanFactory.Default,
+        dispatcherRegistry: DispatcherRegistry? = null,
+        requiredSelectionSetRegistry: RequiredSelectionSetRegistry = RequiredSelectionSetRegistry.Empty,
+        airbnbBypassPolicyCheckDuringCompletion: Boolean = false
+    ): ExecutionResult {
+        val schema = createSchema(sdl, resolvers, typeResolvers)
+        val baseDispatcherRegistry = dispatcherRegistry ?: DispatcherRegistry.Impl(
+            fieldResolverDispatchers = emptyMap(),
+            nodeResolverDispatchers = emptyMap(),
+            fieldCheckerDispatchers = fieldCheckerDispatchers,
+            typeCheckerDispatchers = typeCheckerDispatchers
+        )
+        // Wrap the dispatcher registry to delegate RSS calls to the provided registry
+        val effectiveDispatcherRegistry = if (requiredSelectionSetRegistry != RequiredSelectionSetRegistry.Empty) {
+            TestDispatcherRegistryWithRSS(baseDispatcherRegistry, requiredSelectionSetRegistry)
+        } else {
+            baseDispatcherRegistry
+        }
+        val modernGraphQL = createViaductGraphQL(
+            schema,
+            instrumentations = instrumentations,
+            queryPlanFactory = queryPlanFactory,
+            airbnbBypassPolicyCheckDuringCompletion = airbnbBypassPolicyCheckDuringCompletion
+        )
+        return executeQuery(schema, modernGraphQL, query, variables, effectiveDispatcherRegistry)
+    }
+
+    /**
+     * A test helper class that implements [DispatcherRegistry] by delegating dispatcher lookups
+     * to a base registry while allowing [RequiredSelectionSetRegistry] calls to be overridden.
+     * This allows tests to use MockRequiredSelectionSetRegistry without requiring inheritance.
+     */
+    private class TestDispatcherRegistryWithRSS(
+        private val delegate: DispatcherRegistry,
+        private val rssDelegate: RequiredSelectionSetRegistry
+    ) : DispatcherRegistry by delegate {
+        override fun getFieldResolverRequiredSelectionSets(
+            typeName: String,
+            fieldName: String
+        ): List<RequiredSelectionSet> {
+            val delegateResult = rssDelegate.getFieldResolverRequiredSelectionSets(typeName, fieldName)
+            return delegateResult.ifEmpty { delegate.getFieldResolverRequiredSelectionSets(typeName, fieldName) }
+        }
+
+        override fun getFieldCheckerRequiredSelectionSets(
+            typeName: String,
+            fieldName: String
+        ): List<RequiredSelectionSet> {
+            val delegateResult =
+                rssDelegate.getFieldCheckerRequiredSelectionSets(typeName, fieldName)
+            return delegateResult.ifEmpty {
+                delegate.getFieldCheckerRequiredSelectionSets(typeName, fieldName)
+            }
+        }
+
+        override fun getTypeCheckerRequiredSelectionSets(typeName: String): List<RequiredSelectionSet> {
+            val delegateResult =
+                rssDelegate.getTypeCheckerRequiredSelectionSets(typeName)
+            return delegateResult.ifEmpty {
+                delegate.getTypeCheckerRequiredSelectionSets(typeName)
+            }
+        }
+    }
+
+    fun createSchema(
+        sdl: String,
+        resolvers: Map<String, Map<String, DataFetcher<*>>>,
+        typeResolvers: Map<String, TypeResolver> = emptyMap()
+    ): EngineSchema = createSchema(sdl, createRuntimeWiring(resolvers, typeResolvers))
+
+    fun createSchema(
+        sdl: String,
+        runtimeWiring: RuntimeWiring
+    ): EngineSchema {
+        val typeDefinitionRegistry = SchemaParser().parse(sdl)
+        return EngineSchema(SchemaGenerator().makeExecutableSchema(typeDefinitionRegistry, runtimeWiring))
+    }
+
+    val supportedScalars = listOf(
+        ExtendedScalars.Date,
+        ExtendedScalars.Time,
+        ExtendedScalars.Json,
+        ExtendedScalars.GraphQLShort,
+        ExtendedScalars.GraphQLByte
+    )
+
+    fun createRuntimeWiring(
+        resolvers: Map<String, Map<String, DataFetcher<*>>>,
+        typeResolvers: Map<String, TypeResolver>
+    ): RuntimeWiring {
+        return RuntimeWiring.newRuntimeWiring().apply {
+            resolvers.forEach { (typeName, fieldResolvers) ->
+                type(typeName) { builder ->
+                    fieldResolvers.forEach { (fieldName, dataFetcher) ->
+                        builder.dataFetcher(fieldName, dataFetcher)
+                    }
+                    builder
+                }
+            }
+            typeResolvers.forEach { (typeName, typeResolver) ->
+                type(typeName) { builder ->
+                    builder.typeResolver(typeResolver)
+                }
+            }
+            supportedScalars.forEach(::scalar)
+        }.build()
+    }
+
+    fun createViaductGraphQL(
+        schema: EngineSchema,
+        preparsedDocumentProvider: PreparsedDocumentProvider = DocumentCache(),
+        instrumentations: List<Instrumentation> = emptyList(),
+        coroutineInterop: CoroutineInterop = DefaultCoroutineInterop,
+        queryPlanFactory: QueryPlanFactory = QueryPlanFactory.Default,
+        airbnbBypassPolicyCheckDuringCompletion: Boolean = false,
+    ): GraphQL {
+        val execParamFactory = ExecutionParameters.Factory(
+            queryPlanFactory,
+        )
+        val accessCheckRunner = AccessCheckRunner(coroutineInterop)
+
+        @Suppress("DEPRECATION")
+        val executionStrategyFactory = ViaductExecutionStrategy.Factory.Impl(
+            dataFetcherExceptionHandler = ExceptionHandlerWithFuture(),
+            executionParametersFactory = execParamFactory,
+            accessCheckRunner = accessCheckRunner,
+            coroutineInterop = coroutineInterop,
+            airbnbBypassPolicyCheckDuringCompletion = airbnbBypassPolicyCheckDuringCompletion
+        )
+        return GraphQL.newGraphQL(schema.schema)
+            .preparsedDocumentProvider(preparsedDocumentProvider)
+            .queryExecutionStrategy(
+                executionStrategyFactory.create(isSerial = false)
+            )
+            .mutationExecutionStrategy(
+                executionStrategyFactory.create(isSerial = true)
+            )
+            .subscriptionExecutionStrategy(
+                executionStrategyFactory.create(isSerial = false)
+            )
+            .instrumentation(mkInstrumentation(instrumentations))
+            .build()
+    }
+
+    private fun mkInstrumentation(instrumentations: List<Instrumentation>): Instrumentation =
+        if (instrumentations.isNotEmpty()) {
+            ChainedModernGJInstrumentation(
+                instrumentations.map {
+                    it as? ViaductModernGJInstrumentation
+                        ?: ViaductModernGJInstrumentation.fromStandardInstrumentation(it)
+                }
+            )
+        } else {
+            SimplePerformantInstrumentation.INSTANCE
+        }
+
+    fun createGJGraphQL(
+        schema: EngineSchema,
+        preparsedDocumentProvider: PreparsedDocumentProvider = DocumentCache(),
+        instrumentations: List<Instrumentation> = emptyList()
+    ): GraphQL {
+        return GraphQL.newGraphQL(schema.schema)
+            .preparsedDocumentProvider(preparsedDocumentProvider)
+            .instrumentation(ChainedInstrumentation(instrumentations))
+            .queryExecutionStrategy(AsyncExecutionStrategy(ExceptionHandlerWithFuture()))
+            .mutationExecutionStrategy(AsyncSerialExecutionStrategy(ExceptionHandlerWithFuture()))
+            .subscriptionExecutionStrategy(AsyncSerialExecutionStrategy(ExceptionHandlerWithFuture()))
+            .build()
+    }
+
+    suspend fun executeQuery(
+        schema: EngineSchema,
+        graphQL: GraphQL,
+        query: String,
+        variables: Map<String, Any?>,
+        dispatcherRegistry: DispatcherRegistry = DispatcherRegistry.Empty
+    ): ExecutionResult {
+        val executionInput = createExecutionInput(schema, query, variables, dispatcherRegistry = dispatcherRegistry)
+        return graphQL.executeAsync(executionInput).await()
+    }
+
+    fun createExecutionInput(
+        schema: EngineSchema,
+        query: String,
+        variables: Map<String, Any?> = emptyMap(),
+        operationName: String? = null,
+        context: GraphQLContext = GraphQLContext.getDefault(),
+        dispatcherRegistry: DispatcherRegistry = DispatcherRegistry.Empty,
+        flagManager: FlagManager = FlagManager.Default,
+    ): ExecutionInput =
+        ExecutionInput.newExecutionInput()
+            .query(query)
+            .apply { operationName?.let { operationName(it) } }
+            .variables(variables)
+            .localContext(createLocalContext(schema, dispatcherRegistry, flagManager))
+            .graphQLContext { b ->
+                // executing large queries can trigger GJ's ddos prevention
+                // Configure ParserOptions to use the sdl configuration, which has
+                // no size limits on what it will parse
+                // Add this first so that it can be overridden by the context argument
+                b.put(ParserOptions::class.java, ParserOptions.getDefaultSdlParserOptions())
+                b.put(QueryComplexityLimits.KEY, QueryComplexityLimits.NONE)
+
+                context.stream().forEach { (k, v) -> b.put(k, v) }
+            }
+            .build()
+
+    fun createLocalContext(
+        schema: EngineSchema,
+        dispatcherRegistry: DispatcherRegistry = DispatcherRegistry.Empty,
+        flagManager: FlagManager = FlagManager.Default,
+    ): CompositeLocalContext =
+        ContextMocks(
+            myFullSchema = schema,
+            myFlagManager = flagManager,
+            myDispatcherRegistry = dispatcherRegistry
+        ).localContext
+
+    fun <T> runExecutionTest(block: suspend CoroutineScope.() -> T): T =
+        runBlocking {
+            withThreadLocalCoroutineContext {
+                block()
+            }
+        }
+
+    private class ExceptionHandlerWithFuture : DataFetcherExceptionHandler {
+        @OptIn(DelicateCoroutinesApi::class)
+        override fun handleException(handlerParameters: DataFetcherExceptionHandlerParameters?): CompletableFuture<DataFetcherExceptionHandlerResult?> {
+            return scopedFuture {
+                SimpleDataFetcherExceptionHandler().handleException(handlerParameters).await()
+            }
+        }
+    }
+}
+
+/** methods for generating a [TypeResolver] */
+object TypeResolvers {
+    /** create a [TypeResolver] that always resolves to the provided type */
+    fun const(name: String): TypeResolver = TypeResolver { it.schema.getObjectType(name) }
+
+    /** a [TypeResolver] that will use a `__typename` entry in the current object data to resolve a type */
+    val typename: TypeResolver = TypeResolver { env ->
+        val data = env.getObject() as Map<String, Any?>
+        val typename = data["__typename"]!! as String
+        env.schema.getObjectType(typename)
+    }
+}
+
+object DataFetchers {
+    /** a DataFetcher that always returns an empty Map of `String` to `Any?` */
+    val emptyMap: DataFetcher<Any?> = DataFetcher { emptyMap<String, Any?>() }
+}
+
+/** generate an [Arb] of [ExecutionInput] that is configured for running on viaduct */
+fun Arb.Companion.viaductExecutionInput(
+    schema: EngineSchema,
+    cfg: Config = Config.default,
+): Arb<ExecutionInput> = Arb.graphQLExecutionInput(schema, cfg).asViaductExecutionInput(schema)
+
+fun Arb<ExecutionInput>.asViaductExecutionInput(schema: EngineSchema): Arb<ExecutionInput> =
+    map { input ->
+        input.transform {
+            it.localContext(ExecutionTestHelpers.createLocalContext(schema))
+            it.graphQLContext(
+                mapOf(
+                    // to enable testing very large queries, use the "sdl" parser options, which
+                    // supports parsing large inputs
+                    ParserOptions::class.java to ParserOptions.getDefaultSdlParserOptions(),
+                    QueryComplexityLimits.KEY to QueryComplexityLimits.NONE,
+                )
+            )
+        }
+    }
+
+fun ExecutionInput.dump(): String =
+    """
+       |OperationName: $operationName
+       |Variables: $variables
+       |Document:
+       |$query
+    """.trimMargin()
+
+// Sharing a document cache reduces arbitrary conformance test time by about 20%
+class DocumentCache : PreparsedDocumentProvider {
+    private val cache = Caffeine
+        .newBuilder()
+        .maximumSize(10)
+        .build<String, PreparsedDocumentEntry>()
+
+    override fun getDocumentAsync(
+        executionInput: ExecutionInput,
+        parseAndValidateFunction: Function<ExecutionInput, PreparsedDocumentEntry>
+    ): CompletableFuture<PreparsedDocumentEntry?>? =
+        CompletableFuture.completedFuture(
+            cache.get(executionInput.query) {
+                parseAndValidateFunction.apply(executionInput)
+            }
+        )
+}
+
+object CheckerDispatchers {
+    fun success(requiredSelectionSets: Map<String, RequiredSelectionSet?> = emptyMap()): CheckerDispatcher {
+        val dispatcher = object : CheckerDispatcher {
+            override val requiredSelectionSets = requiredSelectionSets
+            override lateinit var executor: CheckerExecutor
+
+            override suspend fun execute(
+                arguments: Map<String, Any?>,
+                objectDataFactories: Map<String, EngineObjectDataFactory>,
+                context: EngineExecutionContext,
+                checkerType: viaduct.engine.api.spi.CheckerExecutor.CheckerType
+            ): CheckerResult = CheckerResult.Success
+        }
+        dispatcher.executor = object : CheckerExecutor {
+            override suspend fun execute(
+                arguments: Map<String, Any?>,
+                objectDataMap: Map<String, EngineObjectData.Sync>,
+                context: EngineExecutionContext,
+                checkerType: CheckerExecutor.CheckerType
+            ): CheckerResult = CheckerResult.Success
+
+            override val checkerMetadata = null
+            override val requiredSelectionSets = dispatcher.requiredSelectionSets
+        }
+        return dispatcher
+    }
+}
+
+/**
+ * Test-only extension to execute a Query selection set.
+ *
+ * This is a convenience wrapper for tests that previously used the deprecated
+ * `EngineExecutionContext.query()` method. For production code, use
+ * [EngineExecutionContext.resolveSelectionSet] directly.
+ */
+suspend fun EngineExecutionContext.query(selectionSet: EngineSelectionSet): EngineObjectData.Sync =
+    resolveSelectionSet(
+        selectionSet,
+        ResolveSelectionSetOptions.DEFAULT
+    )
+
+/**
+ * Test-only extension to execute a Mutation selection set.
+ *
+ * This is a convenience wrapper for tests that previously used the deprecated
+ * `EngineExecutionContext.mutation()` method. For production code, use
+ * [EngineExecutionContext.resolveSelectionSet] directly.
+ */
+suspend fun EngineExecutionContext.mutation(selectionSet: EngineSelectionSet): EngineObjectData.Sync =
+    resolveSelectionSet(
+        selectionSet,
+        ResolveSelectionSetOptions.MUTATION
+    )

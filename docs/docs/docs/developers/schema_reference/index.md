@@ -8,13 +8,18 @@ Viaduct automatically provides a rich set of built-in schema components that are
 
 ## Built-in Directives
 
-Viaduct includes four core directives that are fundamental to the framework's functionality. These directives are automatically available and cannot be overridden.
+Viaduct includes core directives that are fundamental to the framework's functionality. These directives are automatically available and cannot be overridden.
 
 ### @resolver
 
 Marks fields or types that require custom resolution logic. This is the primary mechanism for implementing data fetching in Viaduct.
 
 **Locations:** `FIELD_DEFINITION`, `OBJECT`
+
+**Arguments:**
+
+- `isSelective: Boolean! = false` — enables selective resolution
+- `isBatching: Boolean! = false` — when `true`, codegen generates a `batchResolve` method instead of `resolve`, enabling batch resolution for the field or type
 
 **Example:**
 
@@ -27,42 +32,124 @@ type User @resolver {
   id: ID!
   name: String
   email: String
+  friends: [User] @resolver(isBatching: true)
 }
 ```
 
 **Use cases:**
+
 - Fields that fetch data from external services or databases
 - Fields that require custom business logic beyond simple property access
 - Object types that need node resolution for Global ID support
+- Fields or types that benefit from batch loading (`isBatching: true`)
 
-When you apply `@resolver` to a field, Viaduct generates an abstract resolver class that you must implement. See [Resolvers](../resolvers/index.md) for details.
+When you apply `@resolver` to a field, Viaduct generates an abstract resolver class that you must implement. The generated class contains either a `resolve` method (default) or a `batchResolve` method (when `isBatching: true`) — never both. At startup, Viaduct validates that the `isBatching` flag in the schema matches the method your resolver implements. See [Resolvers](../resolvers/index.md) and [Batch Resolution](../resolvers/batch_resolution.md) for details.
 
 ### @backingData
 
-Specifies the backing data class for a field, enabling type-safe data access in resolvers.
+Specifies the backing data class for a field, enabling type-safe data access in resolvers. A backing-data field is an implementation detail: Viaduct keeps it available for use in required selection sets only in the module that defines the field. The field is not available in other modules or in any externally published schemas.
 
 **Locations:** `FIELD_DEFINITION`
 
 **Arguments:**
+
 - `class: String!` — fully qualified name of the backing data class
 
 **Example:**
 
 ```graphql
 type User {
-  profile: UserProfile @backingData(class: "com.example.data.UserProfileData")
-}
-
-type UserProfile {
-  bio: String
-  avatarUrl: String
+  profileData: BackingData
+    @backingData(class: "com.example.data.UserProfileData")
+    @resolver
 }
 ```
 
-**Use cases:**
-- Mapping GraphQL types to internal data models
-- Providing type information for fields derived from backing data
-- Enabling Viaduct to automatically resolve fields from backing data without custom resolvers
+The field's base type must be `BackingData`, and a field whose base type is `BackingData` must carry `@backingData`. Backing-data fields can only be declared directly on object types; they cannot be declared on interfaces, inherited from interfaces, or used as input fields.
+
+See the [`@backingData` guide](../../../getting_started/starwars/directives/backing_data.md) for a complete resolver example.
+
+### @tenantLocal
+
+Marks an internal field that is available to code in the field's owning tenant but is not part of a client-executable schema. This directive is only applicable to fields whose base type is a scalar (for example, `Int`) or `BackingData`. `BackingData` fields and `@parent` fields are also tenant-local automatically; they do not need this directive.
+
+**Locations:** `FIELD_DEFINITION`
+
+**Example:**
+
+```graphql
+type User {
+  profileCacheKey: String! @tenantLocal
+}
+```
+
+Viaduct keeps tenant-local fields in the internal full schema so generated code, resolver required selection sets, and execution internals can use them. It removes them from Base and Scoped executable schemas, so clients cannot query them.
+
+An explicit `@tenantLocal` field:
+
+- Must return a scalar or `BackingData` type. Lists and non-null wrappers are allowed.
+- Must be declared directly on an object type.
+- Cannot be declared on an interface or implement a field inherited from an interface.
+
+Fields with the `@parent` directive and fields whose base type is `BackingData` have the same schema-visibility behavior automatically. Do not add `@tenantLocal` merely to make those fields private.
+
+### @parent
+
+Marks a field that resolves to the object from which the current object was reached during execution. The engine resolves the field from execution ancestry; it does not invoke a field resolver for it.
+
+**Locations:** `FIELD_DEFINITION`
+
+**Example:**
+
+```graphql
+type Company {
+  name: String!
+  user: User @resolver
+}
+
+type User {
+  parent: Company @parent
+  companyDisplayName: String @resolver
+}
+```
+
+A resolver or checker for a field on `User` can include `parent { name }` in its required selection set. See [Parent fields in required selection sets](../resolvers/field_resolvers.md#parent-fields-in-required-selection-sets).
+
+Parent fields:
+
+- Are tenant-local automatically and are removed from Base and Scoped executable schemas.
+- Must be declared directly on an object type, not on an interface or an inherited interface field.
+- May be nullable or non-null and return an object, interface, or union type, but cannot return a list.
+- Cannot take arguments or carry `@resolver`; the engine resolves the field from execution ancestry.
+- Require exactly one non-`@parent` field in the schema whose unwrapped return type is the child type. That producer field's containing type must be compatible with the declared parent return type.
+- Cannot target a type with a selective type resolver or a parent value whose nearest upstream field resolver is selective.
+
+The `@resolver` restriction applies to the `@parent` field, not to the field that produces the child. A producer field may carry `@resolver` and may return the child directly, in a list, or in a nested list. A non-selective resolver that produces the parent value is also allowed; it prevents a selective resolver farther upstream from affecting this validation.
+
+### @namespaceType
+
+Groups related fields under a dedicated type that acts as an organizational namespace on the root query type. The engine auto-resolves fields that return a namespace type — no resolver is needed for the namespace field itself.
+
+**Locations:** `OBJECT`
+
+**Example:**
+
+```graphql
+type Query {
+  listings: Listings
+}
+
+type Listings @namespaceType {
+  availableRoomTypes: [RoomType] @resolver
+  pricing: ListingsPricing
+}
+
+type ListingsPricing @namespaceType {
+  currencyOptions: [Currency] @resolver
+}
+```
+
+See [Namespace Types](../namespace_types/index.md) for detailed documentation.
 
 ### @scope
 
@@ -71,6 +158,7 @@ Controls field and type visibility across different schema scopes. This is a rep
 **Locations:** `OBJECT`, `INTERFACE`, `UNION`, `ENUM`, `INPUT_OBJECT`, `FIELD_DEFINITION`, `ENUM_VALUE`
 
 **Arguments:**
+
 - `to: [String!]!` — list of scope names where this element is visible
 
 **Example:**
@@ -89,21 +177,16 @@ type InternalMetrics @scope(to: ["internal"]) {
 }
 ```
 
-**Use cases:**
-- Creating public vs. internal API variants from the same codebase
-- Feature flagging schema elements
-- Multi-tenant schema visibility
-- Gradual rollout of new features
-
 See [Scopes](../scopes/index.md) for detailed documentation on using scopes.
 
 ### @idOf
 
-Declares that a field represents a Global ID for a specific GraphQL type. This enables type-safe ID handling.
+Declares that an `ID` field or argument represents a Global ID for a specific GraphQL type. When a field or argument has `@idOf`, Viaduct generates code using `GlobalID<T>` instead of `String` in the resolver signature. This enables type-safe ID handling.
 
 **Locations:** `FIELD_DEFINITION`, `INPUT_FIELD_DEFINITION`, `ARGUMENT_DEFINITION`
 
 **Arguments:**
+
 - `type: String!` — name of the GraphQL type this ID references (must implement `Node`)
 
 **Example:**
@@ -120,12 +203,7 @@ input UpdateUserInput {
 }
 ```
 
-**Use cases:**
-- Type-safe Global ID handling in resolvers
-- Node interface implementations
-- Cross-type references with compile-time validation
-
-When a field has `@idOf`, Viaduct generates code using `GlobalID<T>` instead of `String` in the resolver signature. See [Global IDs](../globalids/index.md) for more information.
+See [Global IDs](../globalids/index.md) for more information.
 
 ## Built-in Types
 
@@ -142,6 +220,7 @@ interface Node @scope(to: ["*"]) {
 ```
 
 **When it's included:**
+
 - Your schema implements types that extend `Node`
 - You use the `@idOf` directive anywhere in your schema
 
@@ -219,15 +298,53 @@ Arbitrary precision integer.
 
 ### JSON
 
-Generic JSON object type. Can represent any JSON structure.
+Represents any JSON value, including objects, arrays, and scalar values.
 
 **Example value:** `{"key": "value", "nested": {"count": 42}}`
 
-**Kotlin type mapping:** `com.fasterxml.jackson.databind.JsonNode`
+**Generated type mappings:**
+
+- Kotlin: `Any?` for `JSON`, or `Any` for `JSON!`
+- Java: `Object`; nullability follows the GraphQL field or argument declaration
+
+These language-specific types expose the same recursive runtime JSON value model.
+
+#### Resolver inputs
+
+For a `JSON` argument or input field, resolvers receive a recursively decoded JSON value:
+
+- JSON objects become `Map<String, Any?>` in Kotlin or `Map<String, Object>` in Java.
+- JSON arrays become `List<Any?>` in Kotlin or `List<Object>` in Java.
+- JSON strings, booleans, and null become `String`, `Boolean`, and `null`.
+- JSON numbers become a subtype of `java.lang.Number`.
+
+Do not depend on a particular numeric subtype. The concrete type can differ based on whether
+the value came from a literal or variable and on conversions performed while passing the value
+to the resolver.
+
+Values nested inside `JSON` do not use Viaduct's other scalar coercions. For example, dates and
+timestamps are strings, not `LocalDate` or `Instant`.
+
+#### Resolver outputs
+
+Resolvers should produce a recursively JSON-compatible value:
+
+- `Map<String, Any?>` in Kotlin or `Map<String, Object>` in Java for objects, with string keys
+- `List<Any?>` in Kotlin or `List<Object>` in Java for arrays
+- `String`, `Boolean`, `Number`, or `null` for scalar values
+
+Standard JVM numeric types, including `Integer`, `Long`, `Float`, `Double`, `BigInteger`, and
+`BigDecimal`, represent JSON numbers; `BigDecimal` is not required. This includes Kotlin `Int`
+and Java `int`, which are boxed as `java.lang.Integer` when used as an `Any` or `Object` value.
+
+Viaduct does not call `toString()` on other object types to turn them into JSON strings. The
+embedding application's JSON serializer may serialize such values as objects or reject them, so
+resolvers should explicitly convert arbitrary objects, dates, and timestamps to the
+JSON-compatible representation they intend to expose.
 
 ### BackingData
 
-Special internal type used by the `@backingData` directive. Not typically used directly in schemas.
+Internal marker type used by fields carrying the `@backingData` directive. A backing-data field's base type must be `BackingData`; Viaduct maps its value to the class named by the directive.
 
 ## Root Types
 
@@ -261,8 +378,11 @@ extend type Mutation {
 
 | Directive | Locations | Purpose | Generated Code Impact |
 |-----------|-----------|---------|----------------------|
-| `@resolver` | FIELD_DEFINITION, OBJECT | Marks fields/types requiring custom resolution | Generates abstract resolver classes |
-| `@backingData(class: String!)` | FIELD_DEFINITION | Specifies backing data class | Enables automatic field resolution |
+| `@resolver(isSelective: Boolean! = false, isBatching: Boolean! = false)` | FIELD_DEFINITION, OBJECT | Marks fields/types requiring custom resolution | Generates `resolve` (default) or `batchResolve` (`isBatching: true`) |
+| `@backingData(class: String!)` | FIELD_DEFINITION | Binds a tenant-local `BackingData` field to a JVM class | Generates typed access to the backing data |
+| `@tenantLocal` | FIELD_DEFINITION | Hides an internal scalar field from executable schemas | Keeps the field available to tenant code |
+| `@parent` | FIELD_DEFINITION | Resolves the current object's execution parent | Generates typed access to selected parent fields |
+| `@namespaceType` | OBJECT | Groups related fields under an organizational namespace | Engine auto-resolves the parent field |
 | `@scope(to: [String!]!)` | OBJECT, INTERFACE, UNION, ENUM, INPUT_OBJECT, FIELD_DEFINITION, ENUM_VALUE | Controls visibility by scope (repeatable) | Affects schema filtering |
 | `@idOf(type: String!)` | FIELD_DEFINITION, INPUT_FIELD_DEFINITION, ARGUMENT_DEFINITION | Declares Global ID type | Uses `GlobalID<T>` instead of `String` |
 
@@ -275,7 +395,7 @@ extend type Mutation {
 | Long | 64-bit integer | `Long` | `9223372036854775807` |
 | BigDecimal | Arbitrary precision decimal | `java.math.BigDecimal` | `"123.456789"` |
 | BigInteger | Arbitrary precision integer | `java.math.BigInteger` | `"12345678901234567890"` |
-| Object | JSON object | `JsonNode` | `{"key": "value"}` |
+| JSON | Generic JSON value | `Any?` | `{"key": "value"}` |
 | Upload | File upload | Implementation-specific | (binary) |
 | BackingData | Internal backing data ref | Internal | (internal) |
 
@@ -292,16 +412,16 @@ extend type Mutation {
 
 ### Don't
 
-- **Don't override core directives** — `@resolver`, `@backingData`, `@scope`, and `@idOf` are framework-provided
+- **Don't override core directives** — Framework directives such as `@resolver`, `@backingData`, `@tenantLocal`, `@parent`, `@scope`, and `@idOf` are provided automatically
 - **Don't redefine standard scalars** — They're automatically available
 - **Don't manually add the Node interface** — It's added automatically when used
 - **Don't forget to extend root types** — Always use `extend type Query`, not `type Query`
-- **Don't use `@scope` as the only authorization mechanism** — Complement with application-level checks
 
 ## See Also
 
 - [Resolvers](../resolvers/index.md) — Implementing resolvers for fields marked with `@resolver`
 - [Global IDs](../globalids/index.md) — Working with `@idOf` and the Node interface
+- [Namespace Types](../namespace_types/index.md) — Organizing root fields with `@namespaceType`
 - [Scopes](../scopes/index.md) — Advanced scope configuration with `@scope`
 - [Service Engineers: Schema Extensions](../../service_engineers/schema_extensions/index.md) — Defining application-wide custom directives and types
-- [Getting Started: Custom Directives](../../../getting_started/starwars/directives/index.md) — Examples from the Star Wars demo
+- [Star Wars: Custom Directives](../../../getting_started/starwars/directives/index.md) — Examples from the Star Wars demo

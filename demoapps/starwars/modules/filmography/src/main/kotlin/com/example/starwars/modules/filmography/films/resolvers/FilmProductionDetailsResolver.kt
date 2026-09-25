@@ -1,15 +1,12 @@
 package com.example.starwars.modules.filmography.films.resolvers
 
 import com.example.starwars.filmography.resolverbases.FilmResolvers
-import jakarta.inject.Inject
-import viaduct.api.Resolver
+import io.micronaut.context.annotation.Prototype
+import viaduct.api.grts.FilmProductionDetails
+import viaduct.api.resolver.Resolver
 
 /**
- * Example of a computed field resolver in the Film type.
- *
- * This resolver computes a summary string that includes the film title, director, producers, and release date.
- *
- * @resolver("fragment _ on Film { title director producers releaseDate }"): Fragment syntax for accessing multiple fields
+ * Selective field resolver that only materializes requested production details.
  */
 @Resolver(
     """
@@ -21,13 +18,17 @@ import viaduct.api.Resolver
     }
     """
 )
-class FilmProductionDetailsResolver
-    @Inject
-    constructor() : FilmResolvers.ProductionDetails() {
-        override suspend fun resolve(ctx: Context): String? {
-            // Access the source Film from the context
-            val film = ctx.objectValue
-            val producerList = film.getProducers()?.filterNotNull()?.joinToString(", ") ?: "Unknown producers"
-            return "${film.getTitle()} was released on ${film.getReleaseDate()}, directed by ${film.getDirector()} and produced by $producerList"
+@Prototype
+class FilmProductionDetailsResolver : FilmResolvers.ProductionDetails() {
+    override suspend fun resolve(ctx: Context): FilmProductionDetails? {
+        val film = ctx.getObjectValue()
+        val selections = ctx.selections()
+
+        return FilmProductionDetails.of(ctx) {
+            if (selections.contains(FilmProductionDetails.Fields.title)) title(film.getTitleOrThrow())
+            if (selections.contains(FilmProductionDetails.Fields.director)) director(film.getDirectorOrThrow())
+            if (selections.contains(FilmProductionDetails.Fields.producers)) producers(film.getProducersOrThrow())
+            if (selections.contains(FilmProductionDetails.Fields.releaseDate)) releaseDate(film.getReleaseDateOrThrow())
         }
     }
+}

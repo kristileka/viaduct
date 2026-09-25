@@ -17,16 +17,6 @@ import viaduct.apiannotations.StableApi
 @StableApi
 interface SelectionSet<T : CompositeOutput> {
     /**
-     * Renders this selection set as a GraphQL fragment.
-     *
-     * The fragment preserves aliases, arguments, directives, and request variables. A synthetic
-     * `__typename` is used when this selection set is empty so the document remains valid GraphQL.
-     *
-     * @throws UnsupportedOperationException if this selection set cannot be rendered.
-     */
-    fun toFragment(): OutputSelectionFragment = throw UnsupportedOperationException("This SelectionSet cannot be rendered as a GraphQL fragment")
-
-    /**
      * Returns the schema field coordinates selected directly at this selection set's current level.
      *
      * Field order, aliases, and repeated selections do not affect the returned set. Coordinates
@@ -154,44 +144,6 @@ interface SelectionSet<T : CompositeOutput> {
      */
     fun <U : T, R : CompositeOutput> selectionSetFor(field: CompositeField<U, R>): SelectionSet<R>
 
-    /**
-     * Return a SelectionSet that is a projection of the selections on the provided type.
-     * The returned SelectionSet may include fields that are selected on a parent interface
-     * or union -- if you need to know if a projected SelectionSet contains non-inherited
-     * selections for a type, see [requestsType]
-     *
-     * **Examples**
-     *
-     * Given these type definitions:
-     * ```
-     *   interface Node { id: ID! }
-     *   type Foo implements Node { id: ID!, name: String }
-     *   type Bar implements Node { id: ID! }
-     * ```
-     * And these selections on Node:
-     * ```
-     *   id
-     *   ... on Foo { name }
-     * ```
-     *
-     * Then `selectionSetFor` will have the following behavior:
-     * - `selectionSetFor(Node)` returns the current SelectionSet because the
-     *   provided type is the same as the current type
-     * - `selectionSetFor(Foo)` returns a SelectionSet<Foo> with selections `id name`,
-     *   because the projection for type Foo includes the selections on the parent
-     *   interface Node and the inline fragment selections on Foo
-     * - `selectionSetFor(Bar)` returns a SelectionSet<Bar> with selections on `id`,
-     *   because the projection for type Bar includes the selections on the parent
-     *   interface Node
-     */
-    fun <U : T> selectionSetFor(type: Type<U>): SelectionSet<U>
-
-    /**
-     * Returns true if this SelectionSet contains no fields for any valid type
-     * projection.
-     */
-    fun isEmpty(): Boolean
-
     /** the type condition of this SelectionSet */
     val type: Type<T>
 
@@ -207,17 +159,6 @@ interface SelectionSet<T : CompositeOutput> {
                 override fun <U : T> requestsType(type: Type<U>): Boolean = false
 
                 override fun <U : T, R : CompositeOutput> selectionSetFor(field: CompositeField<U, R>): SelectionSet<R> = empty(field.type)
-
-                override fun <U : T> selectionSetFor(type: Type<U>): SelectionSet<U> = empty(type)
-
-                override fun isEmpty(): Boolean = true
-
-                override fun toFragment(): OutputSelectionFragment =
-                    OutputSelectionFragment(
-                        name = "Main",
-                        document = "fragment Main on ${type.name} { __typename }",
-                        variables = emptyMap(),
-                    )
 
                 override val type: Type<T> = type
             }
@@ -237,11 +178,6 @@ interface SelectionSet<T : CompositeOutput> {
 
         override fun <U : CompositeOutput.NotComposite, R : CompositeOutput> selectionSetFor(field: CompositeField<U, R>): SelectionSet<R> =
             throw UnsupportedOperationException("NoSelections does not support extracting subselections for a field")
-
-        override fun <U : CompositeOutput.NotComposite> selectionSetFor(type: Type<U>): SelectionSet<U> =
-            throw UnsupportedOperationException("NoSelections does not support extracting subselections for a field")
-
-        override fun isEmpty(): Boolean = true
 
         override val type = object : Type<CompositeOutput.NotComposite> {
             override val name: String = "__NotComposite"

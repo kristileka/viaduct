@@ -8,12 +8,10 @@ import viaduct.api.reflect.CompositeField
 import viaduct.api.reflect.Field
 import viaduct.api.reflect.Type
 import viaduct.api.select.FieldCoordinate
-import viaduct.api.select.OutputSelectionFragment
 import viaduct.api.select.SelectionSet
 import viaduct.api.types.CompositeOutput
 import viaduct.apiannotations.ExperimentalApi
 import viaduct.engine.api.EngineSelectionSet
-import viaduct.graphql.utils.SelectionsParserUtils.EntryPointFragmentName
 
 /**
  * Provides a type-safe interface for manipulating an untyped [EngineSelectionSetImpl]
@@ -25,7 +23,6 @@ class SelectionSetImpl<T : CompositeOutput>(
     private val structure by lazy(LazyThreadSafetyMode.PUBLICATION) {
         engineSelectionSet.structure()
     }
-    private val fragment by lazy(engineSelectionSet::toFragment)
 
     override fun selectedFieldCoordinates(): Set<FieldCoordinate> =
         engineSelectionSet.selections().mapTo(linkedSetOf()) { selection ->
@@ -40,24 +37,6 @@ class SelectionSetImpl<T : CompositeOutput>(
         SelectionSetImpl(
             field.type,
             engineSelectionSet.selectionSetForField(field.containingType.name, field.name)
-        )
-
-    override fun <U : T> selectionSetFor(type: Type<U>): SelectionSet<U> =
-        SelectionSetImpl(
-            type,
-            engineSelectionSet.selectionSetForType(type.name)
-        )
-
-    override fun isEmpty(): Boolean = engineSelectionSet.isTransitivelyEmpty()
-
-    override fun toFragment(): OutputSelectionFragment =
-        OutputSelectionFragment(
-            name = EntryPointFragmentName,
-            document =
-                fragment.document.ifEmpty {
-                    "fragment $EntryPointFragmentName on ${type.name} { __typename }"
-                },
-            variables = if (fragment.document.isEmpty()) emptyMap() else fragment.variables.asMap(),
         )
 
     override fun equals(other: Any?): Boolean =

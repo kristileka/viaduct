@@ -16,30 +16,15 @@ class SelectionSetTest {
         open class Foo : Object
         val fooType = Type.ofClass(Foo::class)
 
-        class Bar : Foo()
-        val barType = Type.ofClass(Bar::class)
-
         val ss = SelectionSet.empty(fooType)
         assertEquals(fooType, ss.type)
-        assertTrue(ss.isEmpty())
         assertTrue(ss.selectedFieldCoordinates().isEmpty())
         assertFalse(ss.requestsType(fooType))
-        assertTrue(ss.selectionSetFor(fooType).isEmpty())
-        assertTrue(ss.selectionSetFor(barType).isEmpty())
-        assertEquals(
-            OutputSelectionFragment(
-                name = "Main",
-                document = "fragment Main on Foo { __typename }",
-                variables = emptyMap(),
-            ),
-            ss.toFragment(),
-        )
     }
 
     @Test
     fun noSelections() {
         val ss = SelectionSet.NoSelections
-        assertTrue(ss.isEmpty())
         assertTrue(ss.selectedFieldCoordinates().isEmpty())
         assertFalse(ss.requestsType(ss.type))
         assertTrue(ss.type.name.startsWith("__"))

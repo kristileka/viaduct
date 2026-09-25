@@ -35,6 +35,7 @@ import viaduct.engine.api.spi.ShadowFieldExecutionResults
 import viaduct.engine.runtime.Cell
 import viaduct.engine.runtime.EngineExecutionContextExtensions.dispatcherRegistry
 import viaduct.engine.runtime.EngineExecutionContextExtensions.fieldRssOriginFilteringKillSwitchEnabled
+import viaduct.engine.runtime.EngineExecutionContextExtensions.materializedFieldValueReader
 import viaduct.engine.runtime.EngineExecutionContextImpl
 import viaduct.engine.runtime.FetchedValueWithExtensions
 import viaduct.engine.runtime.FieldResolutionResult
@@ -143,8 +144,8 @@ class FieldResolver(
      *
      * This method:
      * 1. Runs CollectFields on the current uncollected selection set
-     * 2. Fires off field fetches for each merged object selection, in parallel when [serialDispatch] is
-     *   false. When [serialDispatch] is true, a fetch is only initiated when the previous selection has
+     * 2. Fires off field fetches for each merged object selection, in parallel when [executionMode] is
+     *   [ExecutionMode.Normal]. With [ExecutionMode.Serial], a fetch is only initiated when the previous selection has
      *   completed fetching (either successfully or exceptionally)
      *
      * Note on return value: This method returns `Value<Unit>` instead of `Value<Map<String, FieldResolutionResult>>`
@@ -157,16 +158,16 @@ class FieldResolver(
      * method should check for exceptional completion and handle it appropriately.
      *
      * @param parameters ExecutionParameters containing the execution context and selection set
-     * @param serialDispatch Whether the selected fields must be resolved one at a time, in selection order
+     * @param executionMode Whether fields may be resolved in parallel or must be resolved one at a time, in selection order
      * @throws Exception Only if there's a fatal error in the supervisorScope itself
      */
     fun fetchObject(
         objectType: GraphQLObjectType,
         parameters: ExecutionParameters,
-        serialDispatch: Boolean = false,
+        executionMode: ExecutionMode = ExecutionMode.Normal,
     ): Value<Unit> =
         prepareLedgerReader(parameters).flatMap { ledgerReader ->
-            fetchObjectInternal(objectType, parameters, ledgerReader, serialDispatch)
+            fetchObjectInternal(objectType, parameters, ledgerReader, executionMode)
         }
 
     @Suppress("UNUSED_EXPRESSION") // onCompleted calls are side-effects inside map/recover
@@ -174,7 +175,7 @@ class FieldResolver(
         objectType: GraphQLObjectType,
         parameters: ExecutionParameters,
         ledgerReader: LedgerReader?,
-        serialDispatch: Boolean,
+        executionMode: ExecutionMode,
     ): Value<Unit> {
         val instrumentationParameters =
             InstrumentationExecutionStrategyParameters(parameters.executionContextWithLocalContext, parameters.gjParameters)
@@ -187,10 +188,9 @@ class FieldResolver(
         resolveObjectCtx.onDispatched()
         try {
             val fields = collectFields(objectType, parameters).collectedFieldsMap.values
-            val dispatch = if (serialDispatch) {
-                dispatchFieldsSerially(objectType, parameters, fields, ledgerReader)
-            } else {
-                dispatchFieldsInParallel(objectType, parameters, fields, ledgerReader)
+            val dispatch = when (executionMode) {
+                ExecutionMode.Serial -> dispatchFieldsSerially(objectType, parameters, fields, ledgerReader)
+                ExecutionMode.Normal -> dispatchFieldsInParallel(objectType, parameters, fields, ledgerReader)
             }
 
             val currentOER = parameters.currentObjectEngineResult
@@ -426,7 +426,8 @@ class FieldResolver(
             )
             val planParameters = parameters.forChildPlan(plan, variables, target)
             val objectType = planParameters.currentObjectEngineResult.type
-            fetchObject(objectType, planParameters, serialDispatch = isMutationNamespace(planParameters, objectType))
+            val executionMode = if (isMutationNamespace(planParameters, objectType)) ExecutionMode.Serial else ExecutionMode.Normal
+            fetchObject(objectType, planParameters, executionMode = executionMode)
         }
     }
 
@@ -902,7 +903,8 @@ class FieldResolver(
                         matParameters.ledger,
                         matParameters.path,
                         matParameters.requestedShape,
-                        matParameters.rootNodeId,
+                        fieldValueReader = parameters.engineExecutionContext.materializedFieldValueReader,
+                        rootNodeId = matParameters.rootNodeId,
                     )
                 )
             } catch (e: CancellationException) {
@@ -919,10 +921,17 @@ class FieldResolver(
     private suspend fun mkFieldMatLedgerSource(
         parameters: ExecutionParameters,
         effectiveData: EngineObjectData,
+        resolutionPolicy: ResolutionPolicy,
         memberIndices: List<Int>,
     ): MatSource {
         val ossFilter = FieldOutputSelectionSetFilter(
-            HasResolver.fromRegistry(parameters.engineExecutionContext.dispatcherRegistry)
+            // parent managed values always own their entire subtree, meaning they have
+            // an unbounded output selection set
+            if (resolutionPolicy == ResolutionPolicy.PARENT_MANAGED) {
+                HasResolver.Never
+            } else {
+                HasResolver.fromRegistry(parameters.engineExecutionContext.dispatcherRegistry)
+            }
         )
         val mat = FieldMatImpl(
             parameters,
@@ -940,7 +949,7 @@ class FieldResolver(
         )
         val ledger = MatLedgerImpl(mat)
         ledger.initialize(mat.resultFromInitialFetch(effectiveData))
-        return MatSource.Ledger(ledger, ossFilter)
+        return MatSource.Ledger(ledger, ossFilter, fieldResolutionPolicy = resolutionPolicy)
     }
 
     private fun mkOER(
@@ -980,15 +989,15 @@ class FieldResolver(
                     parameters = parameters,
                     fieldType = fieldType,
                     effectiveData = effectiveData as EngineObjectData,
+                    resolutionPolicy = resolutionPolicy,
                     memberIndices = memberIndices,
                 )
 
-            // Resolver-less objects may inherit an embedded Mat from their parent.
             else ->
                 Value.fromValue(
                     ObjectEngineResultImpl.newForType(
                         fieldType,
-                        mkEmbeddedMatSource(parameters, field, fieldType, memberIndices),
+                        mkEmbeddedMatSource(parameters, field, fieldType, memberIndices, resolutionPolicy = resolutionPolicy),
                     )
                 )
         }
@@ -999,6 +1008,7 @@ class FieldResolver(
         parameters: ExecutionParameters,
         fieldType: GraphQLObjectType,
         effectiveData: EngineObjectData,
+        resolutionPolicy: ResolutionPolicy,
         memberIndices: List<Int>,
     ): Value<ObjectEngineResultImpl> {
         val deferred = CompletableDeferred<ObjectEngineResultImpl>()
@@ -1007,7 +1017,7 @@ class FieldResolver(
                 deferred.complete(
                     ObjectEngineResultImpl.newForType(
                         fieldType,
-                        mkFieldMatLedgerSource(parameters, effectiveData, memberIndices),
+                        mkFieldMatLedgerSource(parameters, effectiveData, resolutionPolicy = resolutionPolicy, memberIndices = memberIndices),
                     )
                 )
             } catch (e: CancellationException) {
@@ -1304,7 +1314,8 @@ class FieldResolver(
                     } else {
                         parameters.forObjectTraversal(field, oer, fieldResolutionResult.localContext, fieldResolutionResult.originalSource, fieldResolutionResult.resolutionPolicy)
                     }
-                fetchObject(oer.type, traversalParameters, serialDispatch = isMutationNamespace(parameters, oer.type))
+                val executionMode = if (isMutationNamespace(parameters, oer.type)) ExecutionMode.Serial else ExecutionMode.Normal
+                fetchObject(oer.type, traversalParameters, executionMode = executionMode)
             }
         }
     }

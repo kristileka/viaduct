@@ -26,6 +26,7 @@ import viaduct.engine.api.SubqueryExecutionException
 import viaduct.engine.api.instrumentation.resolver.ResolverInstrumentationContext
 import viaduct.engine.api.spi.FieldResolverExecutor
 import viaduct.engine.api.spi.FieldSelectivityProvider
+import viaduct.engine.api.spi.MaterializedFieldValueReader
 import viaduct.engine.api.spi.NodeResolverExecutor
 import viaduct.engine.runtime.result.ObjectEngineResult
 import viaduct.engine.runtime.select.EngineSelectionSetFactoryImpl
@@ -57,6 +58,7 @@ class EngineExecutionContextFactory(
     private val meterRegistry: MeterRegistry?,
     fieldSelectivityProvider: FieldSelectivityProvider = FieldSelectivityProvider.Never,
     private val resolverErrorReporter: ErrorReporter = ErrorReporter.NOOP,
+    private val materializedFieldValueReader: MaterializedFieldValueReader,
 ) {
     // Constructing this is expensive, so do it just once per schema-version
     private val engineSelectionSetFactory: EngineSelectionSet.Factory = EngineSelectionSetFactoryImpl(fullSchema)
@@ -80,7 +82,6 @@ class EngineExecutionContextFactory(
             resolverInstrumentation,
             ConcurrentHashMap<FieldDataLoaderKey, FieldDataLoader>(),
             ConcurrentHashMap<String, NodeDataLoader>(),
-            flagManager.isEnabled(FlagManager.Flags.ENABLE_CACHE_KEY_LOOKUP_PARTITIONING),
             flagManager.isEnabled(FlagManager.Flags.KILLSWITCH_FIELD_RSS_ORIGIN_FILTERING),
             flagManager.isEnabled(FlagManager.Flags.ENABLE_MAT_RESOLUTION),
             resolverErrorReporter,
@@ -90,6 +91,8 @@ class EngineExecutionContextFactory(
             meterRegistry,
             isResolverSelective,
             ownedSelectionProjector,
+            materializedFieldValueReader,
+            incrementalExecutionEnabled = flagManager.isEnabled(FlagManager.Flags.ENABLE_INCREMENTAL_EXECUTION),
         )
     }
 }
@@ -125,7 +128,6 @@ class EngineExecutionContextImpl internal constructor(
     val resolverInstrumentation: Instrumentation,
     internal val fieldDataLoaders: ConcurrentHashMap<FieldDataLoaderKey, FieldDataLoader>,
     internal val nodeDataLoaders: ConcurrentHashMap<String, NodeDataLoader>,
-    internal val cacheKeyLookupPartitioningEnabled: Boolean,
     val fieldRssOriginFilteringKillSwitchEnabled: Boolean,
     val matResolutionEnabled: Boolean,
     val resolverOutputMissingFieldReporter: ErrorReporter,
@@ -135,12 +137,14 @@ class EngineExecutionContextImpl internal constructor(
     private val meterRegistry: MeterRegistry?,
     val isResolverSelective: IsResolverSelective,
     private val ownedSelectionProjector: ResolverSelectionProjector,
+    internal val materializedFieldValueReader: MaterializedFieldValueReader,
     var dataFetchingEnvironment: DataFetchingEnvironment? = null,
     override val activeSchema: EngineSchema = fullSchema,
     internal val fieldScopeSupplier: Supplier<out EngineExecutionContext.FieldExecutionScope> = FpKit.intraThreadMemoize { FieldExecutionScopeImpl() },
     executionHandle: EngineExecutionContext.ExecutionHandle? = null,
     internal val matBatchDepth: Int = 0,
     internal val currentResolver: Caller? = null,
+    val incrementalExecutionEnabled: Boolean = false,
 ) : InternalEngineExecutionContext {
     public override val impl: EngineExecutionContextImpl get() = this
 
@@ -323,7 +327,7 @@ class EngineExecutionContextImpl internal constructor(
      */
     internal fun nodeDataLoader(resolver: NodeResolverExecutor): NodeDataLoader =
         nodeDataLoaders.computeIfAbsent(resolver.typeName) {
-            NodeDataLoader(resolver, cacheKeyLookupPartitioningEnabled)
+            NodeDataLoader(resolver)
         }
 
     /**
@@ -363,7 +367,6 @@ class EngineExecutionContextImpl internal constructor(
             resolverInstrumentation = this.resolverInstrumentation,
             fieldDataLoaders = this.fieldDataLoaders,
             nodeDataLoaders = this.nodeDataLoaders,
-            cacheKeyLookupPartitioningEnabled = this.cacheKeyLookupPartitioningEnabled,
             fieldRssOriginFilteringKillSwitchEnabled = fieldRssOriginFilteringKillSwitchEnabled,
             matResolutionEnabled = matResolutionEnabled,
             resolverOutputMissingFieldReporter = this.resolverOutputMissingFieldReporter,
@@ -373,11 +376,13 @@ class EngineExecutionContextImpl internal constructor(
             meterRegistry = this.meterRegistry,
             isResolverSelective = this.isResolverSelective,
             ownedSelectionProjector = this.ownedSelectionProjector,
+            materializedFieldValueReader = this.materializedFieldValueReader,
             dataFetchingEnvironment = dataFetchingEnvironment,
             fieldScopeSupplier = fieldScopeSupplier,
             executionHandle = executionHandle,
             matBatchDepth = matBatchDepth ?: this.matBatchDepth,
             currentResolver = currentResolver,
+            incrementalExecutionEnabled = this.incrementalExecutionEnabled,
         )
     }
 
@@ -399,7 +404,6 @@ class EngineExecutionContextImpl internal constructor(
             resolverInstrumentation = resolverInstrumentation,
             fieldDataLoaders = ConcurrentHashMap(),
             nodeDataLoaders = ConcurrentHashMap(),
-            cacheKeyLookupPartitioningEnabled = cacheKeyLookupPartitioningEnabled,
             fieldRssOriginFilteringKillSwitchEnabled = fieldRssOriginFilteringKillSwitchEnabled,
             matResolutionEnabled = matResolutionEnabled,
             resolverOutputMissingFieldReporter = resolverOutputMissingFieldReporter,
@@ -409,7 +413,9 @@ class EngineExecutionContextImpl internal constructor(
             meterRegistry = meterRegistry,
             isResolverSelective = isResolverSelective,
             ownedSelectionProjector = ownedSelectionProjector,
+            materializedFieldValueReader = materializedFieldValueReader,
             matBatchDepth = 0,
+            incrementalExecutionEnabled = incrementalExecutionEnabled,
         )
 }
 

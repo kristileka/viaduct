@@ -52,6 +52,7 @@ import viaduct.engine.api.instrumentation.resolver.ResolverInstrumentationContex
 import viaduct.engine.runtime.EngineExecutionContextExtensions.copy
 import viaduct.engine.runtime.EngineExecutionContextExtensions.dispatcherRegistry
 import viaduct.engine.runtime.EngineExecutionContextExtensions.fieldRssOriginFilteringKillSwitchEnabled
+import viaduct.engine.runtime.EngineExecutionContextExtensions.incrementalExecutionEnabled
 import viaduct.engine.runtime.EngineExecutionContextExtensions.matResolutionEnabled
 import viaduct.engine.runtime.EngineResultLocalContext
 import viaduct.engine.runtime.FetchedValueWithExtensions
@@ -193,7 +194,7 @@ object FieldExecutionHelpers {
      *
      * The original field still contains the child selections from its first run. A materialization
      * may request different child fields, so this updates both stored forms of those selections
-     * while keeping the field's name, arguments, directives, and other details.
+     * while preserving argument and directive values from the original variable scope.
      */
     internal fun withMaterializationSelectionSet(
         originalField: CollectedField,
@@ -204,7 +205,8 @@ object FieldExecutionHelpers {
             originalParameters.executionStepInfo.fieldDefinition.type,
             selectionSet,
         )
-        val occurrences = originalField.occurrences.map { details ->
+        val fieldWithResolvedVariables = VariableInliner(originalParameters).shallowInline(originalField)
+        val occurrences = fieldWithResolvedVariables.occurrences.map { details ->
             details.copy(
                 field = details.field.copy(
                     selectionSet = selectionSet,
@@ -212,7 +214,7 @@ object FieldExecutionHelpers {
                 ),
             )
         }
-        return originalField.withOccurrences(occurrences)
+        return fieldWithResolvedVariables.withOccurrences(occurrences)
     }
 
     internal fun materializationSelectionSet(
@@ -576,6 +578,7 @@ object FieldExecutionHelpers {
             parameters.queryPlan.fragments,
             fieldRssOriginFilteringKillSwitchEnabled =
                 parameters.engineExecutionContext.fieldRssOriginFilteringKillSwitchEnabled,
+            incrementalExecutionEnabled = parameters.engineExecutionContext.incrementalExecutionEnabled,
         )
 
     /**

@@ -1,6 +1,12 @@
+@file:Suppress("ForbiddenImport")
+
 package viaduct.tenant.runtime.bootstrap
 
+import io.mockk.every
+import io.mockk.mockk
+import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.assertThrows
 import viaduct.api.FieldResolverBase
@@ -12,6 +18,7 @@ import viaduct.api.bootstrap.test.grts.TestNode
 import viaduct.api.context.BaseFieldExecutionContext
 import viaduct.api.context.FieldExecutionContext
 import viaduct.api.context.NodeExecutionContext
+import viaduct.api.context.VariablesProviderContext
 import viaduct.api.internal.BaseBatchedFieldResolver
 import viaduct.api.internal.BaseBatchedNodeResolver
 import viaduct.api.internal.BaseUnbatchedFieldResolver
@@ -19,6 +26,8 @@ import viaduct.api.internal.BaseUnbatchedNodeResolver
 import viaduct.api.internal.InternalContext
 import viaduct.api.internal.NodeResolverFor
 import viaduct.api.resolver.Resolver
+import viaduct.api.resolver.Variables
+import viaduct.api.resolver.VariablesProvider
 import viaduct.api.types.Arguments
 import viaduct.api.types.CompositeOutput
 import viaduct.api.types.Object
@@ -30,11 +39,13 @@ import viaduct.bootstrap.NodeEntryConfig
 import viaduct.bootstrap.ProviderVariablesAPIData
 import viaduct.bootstrap.SelectionsBlockConfig
 import viaduct.bootstrap.VariableProviderEntryConfig
-import viaduct.engine.api.TenantModuleMetadata
+import viaduct.engine.api.EngineExecutionContext
 import viaduct.engine.api.mocks.MockSchema
+import viaduct.engine.api.mocks.createEngineObjectData
 import viaduct.engine.api.spi.FieldResolverExecutor
 import viaduct.engine.api.spi.NodeResolverExecutor
 import viaduct.service.api.spi.CodeInjector
+import viaduct.service.api.spi.globalid.GlobalIDCodecDefault
 
 @Suppress("USELESS_IS_CHECK", "UNCHECKED_CAST")
 class ViaductModernExecutorFactoryTest {
@@ -58,6 +69,15 @@ class ViaductModernExecutorFactoryTest {
         override suspend fun resolve(ctx: Context): String = "hello"
     }
 
+    class TestFieldResolverWithVariables : TestFieldResolverBase() {
+        override suspend fun resolve(ctx: Context): String = "hello"
+
+        @Variables("provided: Boolean!")
+        class Provider : VariablesProvider<Arguments.NoArguments> {
+            override suspend fun provide(context: VariablesProviderContext<Arguments.NoArguments>): Map<String, Any?> = mapOf("provided" to true)
+        }
+    }
+
     abstract class TestBatchFieldResolverBase :
         ResolverBase<String>,
         FieldResolverBase<Object, Query, Arguments.NoArguments, String>,
@@ -76,6 +96,15 @@ class ViaductModernExecutorFactoryTest {
 
     class TestBatchFieldResolver : TestBatchFieldResolverBase() {
         override suspend fun batchResolve(ctxs: List<Context>): List<FieldValue<String>> = emptyList()
+    }
+
+    class TestBatchFieldResolverWithVariables : TestBatchFieldResolverBase() {
+        override suspend fun batchResolve(ctxs: List<Context>): List<FieldValue<String>> = emptyList()
+
+        @Variables("provided: Boolean!")
+        class Provider : VariablesProvider<Arguments.NoArguments> {
+            override suspend fun provide(context: VariablesProviderContext<Arguments.NoArguments>): Map<String, Any?> = mapOf("provided" to true)
+        }
     }
 
     @NodeResolverFor(typeName = "TestNode", isSelective = false, isBatching = false)
@@ -121,12 +150,11 @@ class ViaductModernExecutorFactoryTest {
 
     private val pkg = ViaductModernExecutorFactoryTest::class.java.name
 
-    private fun factory(tenantPackageFinder: TenantPackageFinder = TenantPackageFinder { emptySet() }) =
+    private fun factory() =
         ViaductModernExecutorFactory(
             codeInjector = CodeInjector.Naive,
             grtPackagePrefix = "viaduct.api.bootstrap.test.grts",
             registry = ExecutionRegistryConfigFile(version = "1", executorFactory = ViaductModernExecutorFactory::class.java.name),
-            tenantPackageFinder = tenantPackageFinder,
         )
 
     private fun fieldEntry(
@@ -139,6 +167,7 @@ class ViaductModernExecutorFactoryTest {
         queryTypeName: String = "Query",
         objectSelections: SelectionsBlockConfig? = null,
         querySelections: SelectionsBlockConfig? = null,
+        tenantMetadata: Map<String, Any?> = emptyMap(),
     ) = FieldEntryConfig(
         typeName = typeName,
         fieldName = fieldName,
@@ -148,6 +177,7 @@ class ViaductModernExecutorFactoryTest {
         objectSelections = objectSelections,
         querySelections = querySelections,
         tenantAPIData = mapOf(
+            "tenantMetadata" to tenantMetadata,
             "resolverClass" to "$pkg\$$resolverSimpleName",
             "resolverBaseClass" to "$pkg\$$resolverBaseSimpleName",
             "hasArguments" to hasArguments,
@@ -160,12 +190,14 @@ class ViaductModernExecutorFactoryTest {
         resolverSimpleName: String,
         resolverBaseSimpleName: String,
         isBatching: Boolean = false,
+        tenantMetadata: Map<String, Any?> = emptyMap(),
     ) = NodeEntryConfig(
         typeName = typeName,
         isBatching = isBatching,
         isSelective = false,
         attribution = typeName,
         tenantAPIData = mapOf(
+            "tenantMetadata" to tenantMetadata,
             "resolverClass" to "$pkg\$$resolverSimpleName",
             "resolverBaseClass" to "$pkg\$$resolverBaseSimpleName",
         ),
@@ -271,41 +303,50 @@ class ViaductModernExecutorFactoryTest {
     }
 
     @Test
-    fun `createFieldResolverExecutor - resolver metadata carries tenant metadata for the resolver's package`() {
-        val tenantPackageFinder = TenantPackageFinder {
-            setOf(TenantPackageInfo(packageName = ViaductModernExecutorFactoryTest::class.java.packageName, metadata = TenantModuleMetadata(name = "viaduct-data-test")))
-        }
-        val executor = factory(tenantPackageFinder).createFieldResolverExecutor(
-            fieldEntry(resolverSimpleName = "TestFieldResolver", resolverBaseSimpleName = "TestFieldResolverBase"),
+    fun `generated field ownership is used without tenant discovery`() {
+        val executor = factory().createFieldResolverExecutor(
+            fieldEntry(
+                resolverSimpleName = "TestFieldResolver",
+                resolverBaseSimpleName = "TestFieldResolverBase",
+                tenantMetadata = mapOf("name" to "viaduct-data-test"),
+            ),
             schema,
         )
         assertEquals("viaduct-data-test", executor.metadata.tenantMetadata?.name)
     }
 
     @Test
-    fun `createFieldResolverExecutor - resolver metadata uses the most specific of multiple matching tenant packages`() {
-        val resolverPackage = ViaductModernExecutorFactoryTest::class.java.packageName
-        val outerPackage = resolverPackage.substringBeforeLast(".")
-        val tenantPackageFinder = TenantPackageFinder {
-            setOf(
-                TenantPackageInfo(packageName = outerPackage, metadata = TenantModuleMetadata(name = "viaduct-data-outer")),
-                TenantPackageInfo(packageName = resolverPackage, metadata = TenantModuleMetadata(name = "viaduct-data-inner")),
-            )
-        }
-        val executor = factory(tenantPackageFinder).createFieldResolverExecutor(
-            fieldEntry(resolverSimpleName = "TestFieldResolver", resolverBaseSimpleName = "TestFieldResolverBase"),
-            schema,
-        )
-        assertEquals("viaduct-data-inner", executor.metadata.tenantMetadata?.name)
-    }
-
-    @Test
-    fun `createFieldResolverExecutor - no matching tenant package leaves tenant metadata null`() {
+    fun `explicit unknown ownership remains null without tenant discovery`() {
         val executor = factory().createFieldResolverExecutor(
             fieldEntry(resolverSimpleName = "TestFieldResolver", resolverBaseSimpleName = "TestFieldResolverBase"),
             schema,
         )
         assertEquals(null, executor.metadata.tenantMetadata)
+    }
+
+    @Test
+    fun `missing generated ownership fails instead of discovering tenants`() {
+        val entry = fieldEntry(resolverSimpleName = "TestFieldResolver", resolverBaseSimpleName = "TestFieldResolverBase")
+        val error = assertThrows<IllegalArgumentException> {
+            factory().createFieldResolverExecutor(entry.copy(tenantAPIData = entry.tenantAPIData - "tenantMetadata"), schema)
+        }
+        assertEquals(
+            "Missing or invalid generated tenantMetadata for ${TestFieldResolver::class.java.name}; regenerate the tenant module config",
+            error.message,
+        )
+    }
+
+    @Test
+    fun `malformed generated ownership fails instead of discovering tenants`() {
+        val entry = fieldEntry(resolverSimpleName = "TestFieldResolver", resolverBaseSimpleName = "TestFieldResolverBase")
+        assertThrows<IllegalArgumentException> {
+            factory().createFieldResolverExecutor(entry.copy(tenantAPIData = entry.tenantAPIData + ("tenantMetadata" to "owner")), schema)
+        }
+        listOf(mapOf("name" to ""), mapOf("name" to 12), mapOf("owner" to "incorrect-key")).forEach { metadata ->
+            assertThrows<IllegalArgumentException> {
+                factory().createFieldResolverExecutor(entry.copy(tenantAPIData = entry.tenantAPIData + ("tenantMetadata" to metadata)), schema)
+            }
+        }
     }
 
     // ── Node resolver ─────────────────────────────────────────────────────────
@@ -321,15 +362,20 @@ class ViaductModernExecutorFactoryTest {
     }
 
     @Test
-    fun `createNodeResolverExecutor - resolver metadata carries tenant metadata for the resolver's package`() {
-        val tenantPackageFinder = TenantPackageFinder {
-            setOf(TenantPackageInfo(packageName = ViaductModernExecutorFactoryTest::class.java.packageName, metadata = TenantModuleMetadata(name = "viaduct-data-test")))
-        }
-        val executor = factory(tenantPackageFinder).createNodeResolverExecutor(
-            nodeEntry("TestNode", "TestNodeResolver", "TestNodeResolverBase"),
+    fun `generated node ownership is used without tenant discovery`() {
+        val executor = factory().createNodeResolverExecutor(
+            nodeEntry("TestNode", "TestNodeResolver", "TestNodeResolverBase", tenantMetadata = mapOf("name" to "viaduct-data-test")),
             schema,
         )
         assertEquals("viaduct-data-test", executor.metadata.tenantMetadata?.name)
+    }
+
+    @Test
+    fun `missing generated node ownership fails instead of discovering tenants`() {
+        val entry = nodeEntry("TestNode", "TestNodeResolver", "TestNodeResolverBase")
+        assertThrows<IllegalArgumentException> {
+            factory().createNodeResolverExecutor(entry.copy(tenantAPIData = entry.tenantAPIData - "tenantMetadata"), schema)
+        }
     }
 
     @Test
@@ -385,6 +431,15 @@ class ViaductModernExecutorFactoryTest {
     // Fragment: flagField provides variable $x; testBatchField conditionally included using it.
     private val fragmentWithVariable = "fragment _ on Query { flagField, testBatchField @include(if: \$x) }"
 
+    private fun variableProvider(
+        name: String,
+        source: String,
+        path: String
+    ) = VariableProviderEntryConfig(
+        providedVariables = mapOf(name to "Boolean!"),
+        providerVariablesAPIData = ProviderVariablesAPIData(type = source, path = path),
+    )
+
     private fun fieldEntryWithQuerySelections(selections: SelectionsBlockConfig) =
         fieldEntry(
             typeName = "Query",
@@ -410,7 +465,10 @@ class ViaductModernExecutorFactoryTest {
             ),
             schema,
         )
-        assert(executor is FieldResolverExecutor)
+        assertEquals(mapOf("x" to "flagField"), executor.argumentVariables.variables)
+        assertEquals(emptyMap<String, String>(), executor.objectFieldVariables.variables)
+        assertEquals(emptyMap<String, String>(), executor.queryFieldVariables.variables)
+        assertNull(executor.variablesFromFunctionProvider)
     }
 
     @Test
@@ -433,7 +491,10 @@ class ViaductModernExecutorFactoryTest {
             ),
             schema,
         )
-        assert(executor is FieldResolverExecutor)
+        assertEquals(emptyMap<String, String>(), executor.argumentVariables.variables)
+        assertEquals(mapOf("x" to "flagField"), executor.objectFieldVariables.variables)
+        assertEquals(emptyMap<String, String>(), executor.queryFieldVariables.variables)
+        assertNull(executor.variablesFromFunctionProvider)
     }
 
     @Test
@@ -452,8 +513,116 @@ class ViaductModernExecutorFactoryTest {
             ),
             schema,
         )
-        assert(executor is FieldResolverExecutor)
+        assertEquals(emptyMap<String, String>(), executor.argumentVariables.variables)
+        assertEquals(emptyMap<String, String>(), executor.objectFieldVariables.variables)
+        assertEquals(mapOf("x" to "flagField"), executor.queryFieldVariables.variables)
+        assertNull(executor.variablesFromFunctionProvider)
     }
+
+    @Test
+    fun `createFieldResolverExecutor - variable maps collect both selection blocks in both resolver modes`() {
+        val objectSelections = SelectionsBlockConfig(
+            selections = """
+                fragment _ on Query {
+                    flagField
+                    a: testBatchField @include(if: ${'$'}objectArgument)
+                    b: testBatchField @skip(if: ${'$'}objectFieldFromObject)
+                    c: testBatchField @include(if: ${'$'}queryFieldFromQuery)
+                }
+            """.trimIndent(),
+            variablesProviders = listOf(
+                variableProvider("objectArgument", "fromArgument", "first.flag"),
+                variableProvider("objectFieldFromObject", "fromObjectField", "flagField"),
+                variableProvider("queryFieldFromObject", "fromQueryField", "flagField"),
+            ),
+        )
+        val querySelections = SelectionsBlockConfig(
+            selections = """
+                fragment _ on Query {
+                    flagField
+                    a: testBatchField @include(if: ${'$'}queryArgument)
+                    b: testBatchField @skip(if: ${'$'}objectFieldFromQuery)
+                    c: testBatchField @include(if: ${'$'}queryFieldFromObject)
+                }
+            """.trimIndent(),
+            variablesProviders = listOf(
+                variableProvider("queryArgument", "fromArgument", "second.flag"),
+                variableProvider("objectFieldFromQuery", "fromObjectField", "flagField"),
+                variableProvider("queryFieldFromQuery", "fromQueryField", "flagField"),
+            ),
+        )
+
+        for ((resolverSimpleName, resolverBaseSimpleName, isBatching) in listOf(
+            Triple("TestFieldResolver", "TestFieldResolverBase", false),
+            Triple("TestBatchFieldResolver", "TestBatchFieldResolverBase", true),
+        )) {
+            val executor = factory().createFieldResolverExecutor(
+                fieldEntry(
+                    typeName = "Query",
+                    resolverSimpleName = resolverSimpleName,
+                    resolverBaseSimpleName = resolverBaseSimpleName,
+                    isBatching = isBatching,
+                    objectSelections = objectSelections,
+                    querySelections = querySelections,
+                ),
+                schema,
+            )
+            assertEquals(isBatching, executor.isBatching)
+            assertEquals(
+                mapOf("objectArgument" to "first.flag", "queryArgument" to "second.flag"),
+                executor.argumentVariables.variables,
+            )
+            assertEquals(
+                mapOf("objectFieldFromObject" to "flagField", "objectFieldFromQuery" to "flagField"),
+                executor.objectFieldVariables.variables,
+            )
+            assertEquals(
+                mapOf("queryFieldFromObject" to "flagField", "queryFieldFromQuery" to "flagField"),
+                executor.queryFieldVariables.variables,
+            )
+            assertNull(executor.variablesFromFunctionProvider)
+        }
+    }
+
+    @Test
+    fun `createFieldResolverExecutor - VariablesProvider runs directly in both resolver modes`(): Unit =
+        runBlocking {
+            val selections = SelectionsBlockConfig("fragment _ on Query { testBatchField @include(if: \$provided) }")
+            val context = mockk<EngineExecutionContext> {
+                every { fullSchema } returns schema
+                every { requestContext } returns null
+                every { globalIDCodec } returns GlobalIDCodecDefault
+            }
+            for ((resolverSimpleName, resolverBaseSimpleName, isBatching) in listOf(
+                Triple("TestFieldResolverWithVariables", "TestFieldResolverBase", false),
+                Triple("TestBatchFieldResolverWithVariables", "TestBatchFieldResolverBase", true),
+            )) {
+                val executor = factory().createFieldResolverExecutor(
+                    fieldEntry(
+                        typeName = "Query",
+                        resolverSimpleName = resolverSimpleName,
+                        resolverBaseSimpleName = resolverBaseSimpleName,
+                        isBatching = isBatching,
+                        querySelections = selections,
+                    ),
+                    schema,
+                )
+                assertEquals(isBatching, executor.isBatching)
+                val provider = requireNotNull(executor.variablesFromFunctionProvider)
+                assertEquals(setOf("provided"), provider.variableNames)
+                assertEquals(
+                    mapOf("provided" to true),
+                    provider.provideVariables(
+                        createEngineObjectData(schema.schema.queryType, emptyMap()),
+                        emptyMap(),
+                        context,
+                    ),
+                )
+                assertEquals(emptyMap<String, String>(), executor.argumentVariables.variables)
+                assertEquals(emptyMap<String, String>(), executor.objectFieldVariables.variables)
+                assertEquals(emptyMap<String, String>(), executor.queryFieldVariables.variables)
+            }
+        }
 
     @Test
     fun `createFieldResolverExecutor - unknown variable provider type throws`() {
@@ -486,6 +655,9 @@ class ViaductModernExecutorFactoryTest {
             ),
             schema,
         )
-        assert(executor is FieldResolverExecutor)
+        assertEquals(emptyMap<String, String>(), executor.argumentVariables.variables)
+        assertEquals(emptyMap<String, String>(), executor.objectFieldVariables.variables)
+        assertEquals(emptyMap<String, String>(), executor.queryFieldVariables.variables)
+        assertNull(executor.variablesFromFunctionProvider)
     }
 }

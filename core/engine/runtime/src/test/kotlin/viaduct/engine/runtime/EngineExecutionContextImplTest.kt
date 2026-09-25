@@ -13,6 +13,7 @@ import viaduct.engine.api.EngineSchema
 import viaduct.engine.api.mocks.MockFieldUnbatchedResolverExecutor
 import viaduct.engine.api.mocks.MockSchema
 import viaduct.engine.api.spi.FieldSelectivityProvider
+import viaduct.engine.api.spi.MaterializedFieldValueReader
 import viaduct.engine.api.spi.NodeResolverExecutor
 import viaduct.engine.runtime.mocks.ContextMocks
 import viaduct.engine.runtime.mocks.createDispatcherRegistry
@@ -93,18 +94,32 @@ class EngineExecutionContextImplTest {
     }
 
     @Test
-    fun `cache key lookup partitioning flag is latched per request`() {
+    fun `incremental execution flag is latched per request and preserved in copies and shadow executions`() {
         var enabled = true
         val flagManager = object : FlagManager {
-            override fun isEnabled(flag: FlagManager.Flag): Boolean = flag == FlagManager.Flags.ENABLE_CACHE_KEY_LOOKUP_PARTITIONING && enabled
+            override fun isEnabled(flag: FlagManager.Flag): Boolean = flag == FlagManager.Flags.ENABLE_INCREMENTAL_EXECUTION && enabled
         }
         val enabledContext = engineExecutionContext(flagManager)
 
         enabled = false
 
-        assertTrue(enabledContext.cacheKeyLookupPartitioningEnabled)
-        assertTrue(enabledContext.copy().cacheKeyLookupPartitioningEnabled)
-        assertFalse(engineExecutionContext(flagManager).cacheKeyLookupPartitioningEnabled)
+        assertTrue(enabledContext.incrementalExecutionEnabled)
+        assertTrue(enabledContext.copy().incrementalExecutionEnabled)
+        assertTrue(enabledContext.forkForShadowExecution().incrementalExecutionEnabled)
+        val disabledContext = engineExecutionContext(flagManager)
+        assertFalse(disabledContext.incrementalExecutionEnabled)
+        assertFalse(disabledContext.copy().incrementalExecutionEnabled)
+        assertFalse(disabledContext.forkForShadowExecution().incrementalExecutionEnabled)
+    }
+
+    @Test
+    fun `custom materialized reader is preserved in copies and shadow executions`() {
+        val reader = MaterializedFieldValueReader { _, _, _ -> error("Unexpected field read") }
+        val context = engineExecutionContext(MockFlagManager.Disabled, fieldValueReader = reader)
+
+        assertSame(reader, context.materializedFieldValueReader)
+        assertSame(reader, context.copy().materializedFieldValueReader)
+        assertSame(reader, context.forkForShadowExecution().materializedFieldValueReader)
     }
 
     private fun engineExecutionContext(
@@ -112,6 +127,7 @@ class EngineExecutionContextImplTest {
         fullSchema: EngineSchema = this.fullSchema,
         globalIDCodec: GlobalIDCodec = GlobalIDCodecDefault,
         dispatcherRegistry: DispatcherRegistry = DispatcherRegistry.Empty,
+        fieldValueReader: MaterializedFieldValueReader = MaterializedFieldValueReader.Default,
     ): EngineExecutionContextImpl {
         val factory =
             EngineExecutionContextFactory(
@@ -122,6 +138,7 @@ class EngineExecutionContextImplTest {
                 mockk<Engine>(),
                 globalIDCodec,
                 meterRegistry = null,
+                materializedFieldValueReader = fieldValueReader,
                 fieldSelectivityProvider = FieldSelectivityProvider { coordinate ->
                     coordinate == providerSelectiveCoordinate
                 },
